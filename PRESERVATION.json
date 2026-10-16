@@ -1,0 +1,13 @@
+{
+  "captured": "2026-10-16",
+  "original": "/Users/avespoli/code/secretsjetbrains/source",
+  "originalHead": "17b27369ccb38a0647f149ea1e10cbd37e836b52",
+  "originalBranch": "codex/recover-backend-source",
+  "kind": "Working-copy source snapshot; may include unfinished or conflicted edits",
+  "excluded": [
+    {
+      "path": "secretbridge-0.1.0.zip",
+      "reason": "private configuration or opaque data"
+    }
+  ]
+}

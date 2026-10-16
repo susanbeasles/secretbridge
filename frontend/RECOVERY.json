@@ -1,0 +1,26 @@
+{
+  "origin": "reconstructed from user-owned shipped bytecode; not original source",
+  "jarSHA256": "319c196fc7d1d0622f3cac126f3b8e8d7af5b96b3044679ce6fa303dbc70ffd9",
+  "decompiler": "CFR 0.152",
+  "decompilerURL": "https://github.com/leibnitz27/cfr/releases/tag/0.152",
+  "decompilerSHA256": "f686e8f3ded377d7bc87d216a90e9e9512df4156e75b06c655a16648ae8765b2",
+  "sdk": "WebStorm 2026.2.3 installed libraries, bundled JBR 25.0.4",
+  "targetJava": 21,
+  "repairs": [
+    "anonymous-class synthetic owner references and constructors",
+    "nested settings Data type qualification",
+    "anonymous document-listener outer Panel reference",
+    "AWS JsonObject local variable type",
+    "generated null-check format selection",
+    "stream read try-with-resources reconstruction"
+  ],
+  "sources": {
+    "BridgeSettings.java": "bcdf0ee3d01a8879fdf39b05e4e56fce6e40448477802df8e8d07491309f3f11",
+    "BridgeSettingsConfigurable.java": "1f87d5bc00f27509f1bc6fe3eb993c30ab51579d1bb49d79f0a3a2c5766f5971",
+    "Engine.java": "db2136e402ba830c56c9f2d7d9eacd202e27458a9881365ed1b0af8c3f158808",
+    "ReferenceCompletion.java": "c0766d52fe47d82e82966e71e22686c37c111821f204e19847c27038256c49a4",
+    "SecretRunConfiguration.java": "aabd202e6efa2dd5b08cc211c0b83b406e6a75040c9ea6895339f550cc0b974b",
+    "SecretRunType.java": "9d7181de1c34bf89df4d39189a7e311de3d235ece1b524aacf4d22ba539fc03c",
+    "SecretsToolWindow.java": "85ad9ffa6d33ee0dd61ecaa14b585c521dc879a2b86ae45578979072a4b263ef"
+  }
+}
