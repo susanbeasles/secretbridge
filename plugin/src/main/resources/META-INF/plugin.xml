@@ -1,0 +1,36 @@
+<idea-plugin>
+    <id>me.vespoli.secretbridge</id>
+    <name>SecretBridge for 1Password</name>
+    <vendor url="https://github.com/susanbeasles/secretbridge">Anthony Vespoli</vendor>
+
+    <description><![CDATA[
+    Zero-trust 1Password secret orchestration for JetBrains IDEs, backed by an isolated
+    Linux microVM Rust enclave over AF_VSOCK and Noise_IK transport encryption.
+    <ul>
+      <li>Browse 1Password Service Account vault, item, and field metadata without exposing plaintext values to the JVM heap.</li>
+      <li>Generate secrets via in-enclave CSPRNG or capture external secrets with a 15-second single-shot Armed Copy Hijack.</li>
+      <li>Preview and apply cryptographically signed sync plans between 1Password, AWS Secrets Manager, and GitHub Actions.</li>
+      <li>Render deterministic .env, GitHub Actions workflow, Terraform, AWS CDK, and CloudFormation secret reference templates.</li>
+    </ul>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationConfigurable
+            parentId="tools"
+            instance="me.vespoli.secretbridge.BridgeSettingsConfigurable"
+            id="me.vespoli.secretbridge.settings"
+            displayName="SecretBridge for 1Password"/>
+
+        <toolWindow
+            id="SecretBridge"
+            anchor="right"
+            secondary="false"
+            factoryClass="me.vespoli.secretbridge.SecretsToolWindowFactory"/>
+
+        <completion.contributor
+            language="any"
+            implementationClass="me.vespoli.secretbridge.ReferenceCompletionContributor"/>
+    </extensions>
+</idea-plugin>
