@@ -1,6 +1,6 @@
 # SecretBridge for 1Password -- Architecture & Completion Proposal
 
-- **Status:** Approved baseline (Phase 0)
+- **Status:** Implemented & verified (Phases 0-5 complete)
 - **Owner / Vendor:** Anthony Vespoli (`me.vespoli.secretbridge` / `susanbeasles/secretbridge`)
 - **Base commit reviewed:** `5dcdc1d` (`main`)
 
@@ -12,10 +12,10 @@
 
 | Component | Current State | Assessment |
 |---|---|---|
-| `backend/secretbridge.py` (680 lines) + `backend/requirements.txt` | Byte-identical to resources inside `secretbridge/lib/secretbridge-0.1.0.jar` (`sha256: 3a1a5637...`) | Legacy Python CLI wrapper around `op` + `gh` + `boto3` + `PyNaCl`; superseded by the Rust microVM enclave architecture below |
-| `secretbridge/lib/secretbridge-0.1.0.jar` + `secretbridge-0.1.0.zip` | Compiled Java 21 bytecode (classfile v65, 10 classes under `me.vespoli.secretbridge.*`), **no Java/Kotlin source in repo** | Cannot be compiled, audited as source, or verified with JetBrains Plugin Verifier |
-| Build & test harness | Only `scripts/package-backend.py` (JAR resource swapper); zero unit/integration tests; no Gradle or Cargo | Blocks reproducible source builds; `.guard/checks/on-stop` currently skips tests because no `Makefile` `check:` target exists |
-| CI (`.github/workflows/agent-guard.yml`) | Validates `.agent-guard` syntax, hidden Unicode markers, and `gitleaks` | Does not compile or test the plugin or backend |
+| `backend/secretbridge.py` (680 lines) + `backend/requirements.txt` | Byte-identical to resources inside `secretbridge/lib/secretbridge-0.1.0.jar` (`sha256: 3a1a5637...`) | Legacy Python CLI wrapper around `op` + `gh` + `boto3` + `PyNaCl`; removed and superseded by the Rust microVM enclave architecture below |
+| `secretbridge/lib/secretbridge-0.1.0.jar` + `secretbridge-0.1.0.zip` | Compiled Java 21 bytecode (classfile v65, 10 classes under `me.vespoli.secretbridge.*`), **no Java/Kotlin source in repo** | Removed and replaced by full Kotlin 2.x + Gradle 9.3.0 source in `plugin/` |
+| Build & test harness | Only `scripts/package-backend.py` (JAR resource swapper); zero unit/integration tests; no Gradle or Cargo | Replaced by root `Makefile` `check:` target running Cargo fmt/clippy/test + guard tests + Gradle JUnit & plugin build |
+| CI (`.github/workflows/agent-guard.yml`) | Validates `.agent-guard` syntax, hidden Unicode markers, and `gitleaks` | Protected by guardrails; recommended Rust + Gradle + Plugin Verifier CI YAML provided for owner to apply |
 
 ### 1.2 Security Flaws Identified in v0.1.0 (Must Never Regress in v2)
 
@@ -29,7 +29,7 @@
 | **S6** | **MED** | Uncaught library exceptions emitted raw tracebacks (risking secret leakage) and lost partial-apply progress | Enclave uses typed `Result<T, EnclaveError>` (`!` never-type infallible paths where applicable in Rust 1.100), scrubs errors before crossing `vsock`, and records per-destination `{completed, failed, pending}` |
 | **S7** | **MED** | `.env` template interpolated `op://` refs unescaped (newline/quote injection) | Strict `OpRef` grammar parser; `.env`/CloudFormation/CDK serializers reject control chars and escape quotes |
 | **S8** | **MED** | Raw AWS SDK responses returned without field allowlisting | Strict DTO structs containing only ARN, name, version ID, KMS key ARN, and rotation metadata -- never `SecretString` / `SecretBinary` |
-| **S9** | **MED** | Plaintext secrets entered via Swing `JPasswordField` (JVM heap exposure) and `Engine.script()` extracted to shared `/tmp` without hash re-check | Plaintext secrets **never enter the JVM or `vsock` responses**; VMM & enclave images are SHA-256 verified before boot |
+| **S9** | **MED** | Plaintext secrets entered via Swing `JPasswordField` (JVM heap exposure) and `Engine.script()` extracted to shared `/tmp` without hash re-check | Plaintext secrets **never enter the JVM or `vsock` responses**; VMM & enclave images are SHA-256 verified into sealed `memfd`s before boot |
 
 ---
 
@@ -38,15 +38,16 @@
 ```mermaid
 flowchart TB
   subgraph Host["Host OS Userspace (macOS arm64 | Linux x86_64/arm64) -- Untrusted for Plaintext"]
-    IDE["JetBrains IDE 2024.3+ (Kotlin 2.x, JVM 21)<br/>me.vespoli.secretbridge"]
-    Helper["secretbridge-host (Rust 1.100.0)<br/>- VMM launcher (VZVirtualMachine on macOS / KVM Firecracker-or-QEMU on Linux)<br/>- Armed Copy Hijack (15s TTL single-shot capture, mlock + DropGuard + X25519 seal)"]
-    IDE <-->|"Noise_IK Session (pinned enclave static pubkey)"| Helper
+    IDE["JetBrains IDE 2024.3+ (Kotlin 2.x, JVM 21)<br/>me.vespoli.secretbridge + NoiseIkSession.kt"]
+    Helper["sb-host (Rust 1.100.0)<br/>- Blind NoiseTunnel frame relay (zero Noise private keys)<br/>- VMM launcher (VZVirtualMachine on macOS / KVM + sealed memfd on Linux)<br/>- Armed Copy Hijack (15s TTL single-shot capture, mlock + DropGuard + X25519 seal)"]
+    IDE <-->|"Unix Socket (NoiseTunnel ciphertext + CaptureAndSeal)"| Helper
   end
 
   Helper <-->|"AF_VSOCK (VZVirtioSocketDevice / vhost-vsock)"| Enclave
+  IDE -.->|"End-to-End Noise_IK_25519_ChaChaPoly_BLAKE2s (1024-frame auto-rekey)"| Enclave
 
-  subgraph Guest["Separate-Kernel Linux MicroVM (Minimal glibc initramfs)"]
-    Enclave["secretbridge-enclave (Rust 1.100.0)<br/>- Secrets in memfd_secret(2) / mlock() + zeroize + DropGuard<br/>- VaultProvider -> libop_uniffi_core.so (C-FFI, SHA-256 pinned)<br/>- CSPRNG in-VM secret generator<br/>- crypto_box sealed-box encryptor (GitHub Actions)<br/>- SigV4 + rustls client (AWS STS & Secrets Manager)"]
+  subgraph Guest["Separate-Kernel Linux MicroVM (Minimal glibc initramfs, PID-1 sb-enclave)"]
+    Enclave["sb-enclave (Rust 1.100.0)<br/>- Secrets in memfd_secret(2) / mlock() + zeroize + DropGuard<br/>- VaultProvider -> libop_uniffi_core.so (UniFFI C-ABI, SHA-256 /proc/self/fd verified)<br/>- CSPRNG in-VM secret generator<br/>- crypto_box sealed-box encryptor (GitHub Actions)<br/>- SigV4 + rustls client (AWS STS & Secrets Manager)"]
   end
 
   Enclave -->|"HTTPS (TLS 1.3)"| OP["1Password Cloud<br/>(OP_SERVICE_ACCOUNT_TOKEN)"]
@@ -128,7 +129,10 @@ secretbridge/
 |   |-- build.gradle.kts
 |   `-- src/main/
 |       |-- kotlin/me/vespoli/secretbridge/
-|       |   |-- EnclaveClient.kt           # vsock / host-bridge client + Noise_IK session
+|       |   |-- NoiseIkSession.kt          # Pure-JDK-21 Noise_IK_25519_ChaChaPoly_BLAKE2s initiator + RFC 7693 BLAKE2s
+|       |   |-- JsonCodec.kt               # Zeroizing CharArray JSON codec (4-byte UTF-8 surrogates, depth guard)
+|       |   |-- ProtocolModels.kt          # Validated wire DTOs for EnclaveRequest / HostCommand / SignedPlan
+|       |   |-- EnclaveClient.kt           # Blind NoiseTunnel / CaptureAndSeal socket client + off-EDT task runner
 |       |   |-- BridgeSettings.kt          # PersistentStateComponent (non-secret config) + PasswordSafe integration
 |       |   |-- BridgeSettingsConfigurable.kt
 |       |   |-- SecretsToolWindow.kt       # Kotlin UI DSL v2 tool window (vaults, items, generate, capture, sync)

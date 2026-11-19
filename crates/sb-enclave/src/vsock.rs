@@ -94,21 +94,37 @@ pub fn serve_unix_listener(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), EnclaveError> {
     if let Ok(meta) = std::fs::symlink_metadata(socket_path) {
-        if meta.file_type().is_symlink() {
+        use std::os::unix::fs::FileTypeExt;
+        if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
             return Err(EnclaveError::new(
                 ErrorCode::Validation,
-                "refusing to bind over symlinked socket path",
+                "refusing to unlink non-socket or symlinked path",
             ));
         }
-        let _ = std::fs::remove_file(socket_path);
+        std::fs::remove_file(socket_path).map_err(|e| {
+            EnclaveError::new(
+                ErrorCode::TransportFailure,
+                format!("failed removing stale unix socket: {e}"),
+            )
+        })?;
     }
 
-    let listener = std::os::unix::net::UnixListener::bind(socket_path).map_err(|e| {
-        EnclaveError::new(
-            ErrorCode::TransportFailure,
-            format!("failed to bind unix listener: {e}"),
-        )
-    })?;
+    let listener = {
+        // SAFETY: `umask` is async-signal-safe and always succeeds; restored immediately by DropGuard.
+        let prev_umask = unsafe { libc::umask(0o077) };
+        let _umask_guard = std::mem::DropGuard::new(prev_umask, |old| {
+            // SAFETY: Restores previous process umask unconditionally.
+            unsafe {
+                libc::umask(old);
+            }
+        });
+        std::os::unix::net::UnixListener::bind(socket_path).map_err(|e| {
+            EnclaveError::new(
+                ErrorCode::TransportFailure,
+                format!("failed to bind unix listener: {e}"),
+            )
+        })?
+    };
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);

@@ -119,10 +119,15 @@ impl PlannedOp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnsignedPlan {
+    pub plan_id: String,
     pub version: u32,
     pub environment: Slug,
     pub manifest_digest: String,
     pub source_revision_digest: String,
+    pub credentials_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws_identity: Option<AwsIdentitySummary>,
     pub issued_at_unix_secs: u64,
     pub operations: Vec<PlannedOp>,
@@ -132,27 +137,54 @@ pub struct UnsignedPlan {
 #[serde(deny_unknown_fields)]
 pub struct SignedPlan {
     pub plan: UnsignedPlan,
-    /// Ephemeral enclave HMAC-SHA256 binding `plan` to this enclave boot session (closes S4).
+    /// Ephemeral enclave HMAC-SHA256 binding `plan` to this enclave session (closes S4, H3).
     pub plan_mac: String,
 }
 
-/// Per-boot enclave HMAC signer preventing forged or stale plans from executing in `apply`.
-pub struct PlanSigner {
+const MAX_CONSUMED_PLAN_IDS: usize = 4_096;
+
+struct SignerInner {
     key: Zeroizing<[u8; 32]>,
+    consumed_plan_ids: std::collections::BTreeSet<String>,
+}
+
+/// Per-session enclave HMAC signer preventing forged, replayed, or stale plans from executing in `apply`.
+pub struct PlanSigner {
+    inner: std::sync::Mutex<SignerInner>,
     ttl_secs: u64,
 }
 
 impl PlanSigner {
     pub fn new(key: [u8; 32], ttl_secs: u64) -> Self {
         Self {
-            key: Zeroizing::new(key),
+            inner: std::sync::Mutex::new(SignerInner {
+                key: Zeroizing::new(key),
+                consumed_plan_ids: std::collections::BTreeSet::new(),
+            }),
             ttl_secs,
         }
     }
 
+    pub fn rotate_key(&self, new_key: [u8; 32]) -> Result<(), ProtoError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| ProtoError::Crypto("plan signer lock poisoned".into()))?;
+        guard.key = Zeroizing::new(new_key);
+        guard.consumed_plan_ids.clear();
+        Ok(())
+    }
+
     pub fn sign(&self, plan: UnsignedPlan) -> Result<SignedPlan, ProtoError> {
+        if plan.plan_id.trim().is_empty() {
+            return Err(ProtoError::Validation("plan_id must not be empty".into()));
+        }
         let canonical = canonical_json_bytes(&plan)?;
-        let mut mac = HmacSha256::new_from_slice(&*self.key)
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| ProtoError::Crypto("plan signer lock poisoned".into()))?;
+        let mut mac = HmacSha256::new_from_slice(&*guard.key)
             .map_err(|_| ProtoError::Crypto("invalid HMAC key".into()))?;
         mac.update(&canonical);
         let tag = hex::encode(mac.finalize().into_bytes());
@@ -162,11 +194,19 @@ impl PlanSigner {
         })
     }
 
-    pub fn verify(&self, signed: &SignedPlan, now_unix_secs: u64) -> Result<(), ProtoError> {
+    fn verify_locked(
+        &self,
+        guard: &SignerInner,
+        signed: &SignedPlan,
+        now_unix_secs: u64,
+    ) -> Result<(), ProtoError> {
+        if signed.plan.plan_id.trim().is_empty() || signed.plan.plan_id.len() > 128 {
+            return Err(ProtoError::StalePlan("invalid plan_id".into()));
+        }
         let tag_bytes = hex::decode(&signed.plan_mac)
             .map_err(|_| ProtoError::StalePlan("malformed plan_mac".into()))?;
         let canonical = canonical_json_bytes(&signed.plan)?;
-        let mut mac = HmacSha256::new_from_slice(&*self.key)
+        let mut mac = HmacSha256::new_from_slice(&*guard.key)
             .map_err(|_| ProtoError::Crypto("invalid HMAC key".into()))?;
         mac.update(&canonical);
         mac.verify_slice(&tag_bytes).map_err(|_| {
@@ -175,6 +215,11 @@ impl PlanSigner {
             )
         })?;
 
+        if guard.consumed_plan_ids.contains(&signed.plan.plan_id) {
+            return Err(ProtoError::StalePlan(
+                "plan has already been consumed; preview sync again before applying".into(),
+            ));
+        }
         if now_unix_secs < signed.plan.issued_at_unix_secs {
             return Err(ProtoError::StalePlan(
                 "plan timestamp is in the future".into(),
@@ -185,6 +230,34 @@ impl PlanSigner {
                 "plan has expired; preview sync again before applying".into(),
             ));
         }
+        Ok(())
+    }
+
+    pub fn verify(&self, signed: &SignedPlan, now_unix_secs: u64) -> Result<(), ProtoError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| ProtoError::Crypto("plan signer lock poisoned".into()))?;
+        self.verify_locked(&guard, signed, now_unix_secs)
+    }
+
+    /// Atomically verifies `signed` and marks `plan_id` consumed so it can never be replayed.
+    pub fn consume_verified(
+        &self,
+        signed: &SignedPlan,
+        now_unix_secs: u64,
+    ) -> Result<(), ProtoError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| ProtoError::Crypto("plan signer lock poisoned".into()))?;
+        self.verify_locked(&guard, signed, now_unix_secs)?;
+        if guard.consumed_plan_ids.len() >= MAX_CONSUMED_PLAN_IDS {
+            return Err(ProtoError::StalePlan(
+                "plan replay cache full; preview sync again".into(),
+            ));
+        }
+        guard.consumed_plan_ids.insert(signed.plan.plan_id.clone());
         Ok(())
     }
 }

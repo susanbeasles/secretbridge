@@ -18,8 +18,12 @@ use sb_proto::rpc::{
     ApplyReport, BindingEntry, CaptureChallenge, CaptureInterceptMode, CaptureTarget, DoctorEntry,
     EnclaveRequest, EnclaveResponse, EnclaveResult, OpStepResult, SessionCredentialsInput,
 };
-use sb_proto::types::{Manifest, OpRef, SecretState, Slug};
-use std::collections::BTreeMap;
+use sb_proto::types::{
+    AwsAccountId, AwsTarget, GitHubHost, GitHubScope, GitHubTarget, Manifest, OpRef, SecretName,
+    SecretState, Slug,
+};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -30,11 +34,83 @@ const MAX_ACTIVE_CAPTURES: usize = 8;
 const MAX_GITHUB_SECRET_BYTES: usize = 48 * 1024; // 48 KiB GitHub Actions limit
 const MAX_AWS_SECRET_BYTES: usize = 65_536; // 64 KiB AWS Secrets Manager limit
 
-#[derive(Default)]
+#[derive(Clone)]
 struct SessionState {
-    op_token: Option<MemSecret>,
-    github_token: Option<MemSecret>,
-    aws_creds: Option<AwsCredentials>,
+    op_token: Option<Arc<MemSecret>>,
+    github_token: Option<Arc<MemSecret>>,
+    aws_creds: Option<Arc<AwsCredentials>>,
+    allowed_github_host: GitHubHost,
+    allowed_github_owners: BTreeSet<String>,
+    allowed_aws_accounts: BTreeSet<String>,
+    credentials_fingerprint: String,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        let mut s = Self {
+            op_token: None,
+            github_token: None,
+            aws_creds: None,
+            allowed_github_host: GitHubHost::default(),
+            allowed_github_owners: BTreeSet::new(),
+            allowed_aws_accounts: BTreeSet::new(),
+            credentials_fingerprint: String::new(),
+        };
+        s.credentials_fingerprint = s.compute_fingerprint();
+        s
+    }
+}
+
+impl SessionState {
+    fn compute_fingerprint(&self) -> String {
+        let mut h = Sha256::new();
+        h.update(b"sb-session-v2\0");
+        match &self.op_token {
+            Some(tok) => {
+                h.update([1u8]);
+                h.update((tok.len() as u64).to_be_bytes());
+                h.update(tok.as_bytes());
+            }
+            None => h.update([0u8]),
+        }
+        match &self.github_token {
+            Some(tok) => {
+                h.update([1u8]);
+                h.update((tok.len() as u64).to_be_bytes());
+                h.update(tok.as_bytes());
+            }
+            None => h.update([0u8]),
+        }
+        match &self.aws_creds {
+            Some(creds) => {
+                h.update([1u8]);
+                h.update((creds.access_key_id.len() as u64).to_be_bytes());
+                h.update(creds.access_key_id.as_bytes());
+                h.update((creds.secret_access_key.len() as u64).to_be_bytes());
+                h.update(creds.secret_access_key.as_bytes());
+                if let Some(st) = &creds.session_token {
+                    h.update([1u8]);
+                    h.update((st.len() as u64).to_be_bytes());
+                    h.update(st.as_bytes());
+                } else {
+                    h.update([0u8]);
+                }
+            }
+            None => h.update([0u8]),
+        }
+        h.update(self.allowed_github_host.as_str().as_bytes());
+        h.update([0u8]);
+        for owner in &self.allowed_github_owners {
+            h.update(owner.as_bytes());
+            h.update([0u8]);
+        }
+        h.update([0xff]);
+        for acct in &self.allowed_aws_accounts {
+            h.update(acct.as_bytes());
+            h.update([0u8]);
+        }
+        hex::encode(h.finalize())
+    }
 }
 
 struct PendingCapture {
@@ -51,6 +127,7 @@ pub struct EnclaveService {
     plan_signer: PlanSigner,
     session: Mutex<SessionState>,
     captures: Mutex<BTreeMap<String, PendingCapture>>,
+    managed_github_secrets: Mutex<BTreeSet<String>>,
     clock_override_unix_secs: Mutex<Option<u64>>,
 }
 
@@ -71,6 +148,7 @@ impl EnclaveService {
             plan_signer: signer,
             session: Mutex::new(SessionState::default()),
             captures: Mutex::new(BTreeMap::new()),
+            managed_github_secrets: Mutex::new(BTreeSet::new()),
             clock_override_unix_secs: Mutex::new(None),
         }
     }
@@ -270,7 +348,8 @@ impl EnclaveService {
                 manifest,
                 environment,
                 name,
-            } => self.adopt_aws(&manifest, &environment, &name),
+                confirm_unmanaged,
+            } => self.adopt_aws(&manifest, &environment, &name, confirm_unmanaged),
             EnclaveRequest::PrepareGithub {
                 manifest,
                 environment,
@@ -289,38 +368,53 @@ impl EnclaveService {
                 kind,
                 action_sha,
             } => {
-                let sess = self.lock_session()?;
+                let env = Self::require_env(&manifest, &environment)?;
+                let sess = self.snapshot_session()?;
+                if let Some(gh) = &env.github {
+                    Self::ensure_github_target_allowed(&sess, gh)?;
+                }
+                let gh_tok = if sess.allowed_github_host.as_str() == "github.com" {
+                    sess.github_token.as_deref()
+                } else {
+                    None
+                };
                 let content = render_template(
                     &manifest,
                     &environment,
                     kind,
                     action_sha.as_ref(),
                     self.github.as_ref(),
-                    sess.github_token.as_ref(),
+                    gh_tok,
                 )?;
                 Ok(EnclaveResult::TemplateRendered { content })
             }
         }
     }
 
-    fn lock_session(&self) -> Result<std::sync::MutexGuard<'_, SessionState>, EnclaveError> {
-        self.session.lock().map_err(|_| {
+    fn snapshot_session(&self) -> Result<SessionState, EnclaveError> {
+        let guard = self.session.lock().map_err(|_| {
             EnclaveError::new(ErrorCode::InternalError, "enclave session lock poisoned")
-        })
+        })?;
+        Ok(guard.clone())
     }
 
     fn with_op_token<T>(
         &self,
         f: impl FnOnce(&MemSecret) -> Result<T, EnclaveError>,
     ) -> Result<T, EnclaveError> {
-        let sess = self.lock_session()?;
-        let Some(tok) = sess.op_token.as_ref() else {
+        let op_tok = {
+            let guard = self.session.lock().map_err(|_| {
+                EnclaveError::new(ErrorCode::InternalError, "enclave session lock poisoned")
+            })?;
+            guard.op_token.clone()
+        };
+        let Some(tok) = op_tok else {
             return Err(EnclaveError::new(
                 ErrorCode::Unauthorized,
                 "OP_SERVICE_ACCOUNT_TOKEN is not configured in enclave session",
             ));
         };
-        f(tok)
+        f(&tok)
     }
 
     fn require_env<'a>(
@@ -336,51 +430,218 @@ impl EnclaveService {
         })
     }
 
+    fn ensure_github_target_allowed(
+        sess: &SessionState,
+        target: &GitHubTarget,
+    ) -> Result<(), EnclaveError> {
+        target.validate()?;
+        if target.host != sess.allowed_github_host {
+            return Err(EnclaveError::new(
+                ErrorCode::Unauthorized,
+                format!(
+                    "GitHub host '{}' is not authorized for this enclave session (bound host: '{}')",
+                    target.host, sess.allowed_github_host
+                ),
+            ));
+        }
+        if !sess.allowed_github_owners.is_empty() {
+            let owner_lower = match target.scope {
+                GitHubScope::Repository | GitHubScope::Environment => target
+                    .repository
+                    .as_ref()
+                    .expect("validated")
+                    .owner()
+                    .as_str()
+                    .to_ascii_lowercase(),
+                GitHubScope::Organization => target
+                    .organization
+                    .as_ref()
+                    .expect("validated")
+                    .as_str()
+                    .to_ascii_lowercase(),
+            };
+            if !sess.allowed_github_owners.contains(&owner_lower) {
+                return Err(EnclaveError::new(
+                    ErrorCode::Unauthorized,
+                    format!(
+                        "GitHub owner/organization '{owner_lower}' is not in the session allowlist"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_aws_target_allowed(
+        sess: &SessionState,
+        target: &AwsTarget,
+    ) -> Result<(), EnclaveError> {
+        target.validate()?;
+        if !sess.allowed_aws_accounts.is_empty()
+            && !sess
+                .allowed_aws_accounts
+                .contains(target.account_id.as_str())
+        {
+            return Err(EnclaveError::new(
+                ErrorCode::Unauthorized,
+                format!(
+                    "AWS account '{}' is not in the session allowlist",
+                    target.account_id
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn github_secret_key(target: &GitHubTarget, name: &SecretName) -> Result<String, EnclaveError> {
+        let (host, scope, owner_repo, env_str, secret_upper) =
+            target.normalized_destination_key(name)?;
+        Ok(format!(
+            "{host}|{scope:?}|{owner_repo}|{env_str}|{secret_upper}"
+        ))
+    }
+
+    fn is_github_secret_managed(
+        &self,
+        target: &GitHubTarget,
+        name: &SecretName,
+    ) -> Result<bool, EnclaveError> {
+        let key = Self::github_secret_key(target, name)?;
+        let guard = self.managed_github_secrets.lock().map_err(|_| {
+            EnclaveError::new(ErrorCode::InternalError, "managed secrets lock poisoned")
+        })?;
+        Ok(guard.contains(&key))
+    }
+
+    fn record_github_secret_managed(
+        &self,
+        target: &GitHubTarget,
+        name: &SecretName,
+        present: bool,
+    ) -> Result<(), EnclaveError> {
+        let key = Self::github_secret_key(target, name)?;
+        let mut guard = self.managed_github_secrets.lock().map_err(|_| {
+            EnclaveError::new(ErrorCode::InternalError, "managed secrets lock poisoned")
+        })?;
+        if present {
+            guard.insert(key);
+        } else {
+            guard.remove(&key);
+        }
+        Ok(())
+    }
+
     fn configure_session(
         &self,
         creds: SessionCredentialsInput,
     ) -> Result<EnclaveResult, EnclaveError> {
-        let mut sess = self.lock_session()?;
-        if let Some(op) = &creds.op_service_account_token {
-            let trimmed = op.trim();
-            sess.op_token = if trimmed.is_empty() {
-                None
-            } else {
-                Some(MemSecret::from_slice(trimmed.as_bytes())?)
-            };
+        let allowed_github_host = match creds.allowed_github_hosts.as_slice() {
+            [] => GitHubHost::default(),
+            [single] => single.trim().parse::<GitHubHost>()?,
+            _ => {
+                return Err(EnclaveError::new(
+                    ErrorCode::Validation,
+                    "a GitHub token in an enclave session must be bound to a single GitHub host",
+                ));
+            }
+        };
+
+        let mut allowed_github_owners = BTreeSet::new();
+        for raw_owner in &creds.allowed_github_owners {
+            let trimmed = raw_owner.trim();
+            if !trimmed.is_empty() {
+                let parsed: Slug = trimmed.parse()?;
+                allowed_github_owners.insert(parsed.as_str().to_ascii_lowercase());
+            }
         }
-        if let Some(gh) = &creds.github_token {
-            let trimmed = gh.trim();
-            sess.github_token = if trimmed.is_empty() {
-                None
-            } else {
-                Some(MemSecret::from_slice(trimmed.as_bytes())?)
-            };
+
+        let mut allowed_aws_accounts = BTreeSet::new();
+        for raw_acct in &creds.allowed_aws_account_ids {
+            let trimmed = raw_acct.trim();
+            if !trimmed.is_empty() {
+                let parsed: AwsAccountId = trimmed.parse()?;
+                allowed_aws_accounts.insert(parsed.as_str().to_string());
+            }
         }
-        match (&creds.aws_access_key_id, &creds.aws_secret_access_key) {
-            (Some(ak), Some(sk)) if !ak.trim().is_empty() && !sk.trim().is_empty() => {
+
+        let op_token = match &creds.op_service_account_token {
+            Some(op) if !op.trim().is_empty() => {
+                Some(Arc::new(MemSecret::from_slice(op.trim().as_bytes())?))
+            }
+            _ => None,
+        };
+
+        let github_token = match &creds.github_token {
+            Some(gh) if !gh.trim().is_empty() => {
+                Some(Arc::new(MemSecret::from_slice(gh.trim().as_bytes())?))
+            }
+            _ => None,
+        };
+
+        let ak_trimmed = creds.aws_access_key_id.as_deref().unwrap_or("").trim();
+        let sk_trimmed = creds.aws_secret_access_key.as_deref().unwrap_or("").trim();
+        let aws_creds = match (ak_trimmed.is_empty(), sk_trimmed.is_empty()) {
+            (true, true) => None,
+            (false, false) => {
                 let session_token = match &creds.aws_session_token {
                     Some(st) if !st.trim().is_empty() => {
                         Some(MemSecret::from_slice(st.trim().as_bytes())?)
                     }
                     _ => None,
                 };
-                sess.aws_creds = Some(AwsCredentials {
-                    access_key_id: MemSecret::from_slice(ak.trim().as_bytes())?,
-                    secret_access_key: MemSecret::from_slice(sk.trim().as_bytes())?,
+                Some(Arc::new(AwsCredentials {
+                    access_key_id: MemSecret::from_slice(ak_trimmed.as_bytes())?,
+                    secret_access_key: MemSecret::from_slice(sk_trimmed.as_bytes())?,
                     session_token,
-                });
+                }))
             }
-            (Some(ak), _) if ak.trim().is_empty() => {
-                sess.aws_creds = None;
+            _ => {
+                return Err(EnclaveError::new(
+                    ErrorCode::Validation,
+                    "both aws_access_key_id and aws_secret_access_key must be provided together",
+                ));
             }
-            _ => {}
+        };
+
+        let mut new_state = SessionState {
+            op_token,
+            github_token,
+            aws_creds,
+            allowed_github_host,
+            allowed_github_owners,
+            allowed_aws_accounts,
+            credentials_fingerprint: String::new(),
+        };
+        new_state.credentials_fingerprint = new_state.compute_fingerprint();
+
+        let has_op_token = new_state.op_token.is_some();
+        let has_github_token = new_state.github_token.is_some();
+        let has_aws_credentials = new_state.aws_creds.is_some();
+
+        // Atomically replace session state, rotate plan HMAC key, and clear pending captures (`C2`, `H3`)
+        {
+            let mut guard = self.session.lock().map_err(|_| {
+                EnclaveError::new(ErrorCode::InternalError, "enclave session lock poisoned")
+            })?;
+            *guard = new_state;
+        }
+        let mut fresh_hmac_key = [0u8; 32];
+        OsRng.fill_bytes(&mut fresh_hmac_key);
+        let rotate_res = self.plan_signer.rotate_key(fresh_hmac_key);
+        zeroize::Zeroize::zeroize(&mut fresh_hmac_key);
+        rotate_res?;
+
+        if let Ok(mut caps) = self.captures.lock() {
+            caps.clear();
+        }
+        if let Ok(mut managed) = self.managed_github_secrets.lock() {
+            managed.clear();
         }
 
         Ok(EnclaveResult::SessionConfigured {
-            has_op_token: sess.op_token.is_some(),
-            has_github_token: sess.github_token.is_some(),
-            has_aws_credentials: sess.aws_creds.is_some(),
+            has_op_token,
+            has_github_token,
+            has_aws_credentials,
         })
     }
 
@@ -388,7 +649,7 @@ impl EnclaveService {
         if let Some(m) = manifest {
             m.validate()?;
         }
-        let sess = self.lock_session()?;
+        let sess = self.snapshot_session()?;
         let mut entries = Vec::new();
 
         match &sess.op_token {
@@ -416,42 +677,48 @@ impl EnclaveService {
             }),
         }
 
-        let mut gh_hosts = vec!["github.com".to_string()];
-        if let Some(m) = manifest {
-            for env in m.environments.values() {
-                if let Some(gh) = &env.github {
-                    let h = gh.host.as_str().to_string();
-                    if !gh_hosts.contains(&h) {
-                        gh_hosts.push(h);
-                    }
-                }
-            }
-        }
-        for host in gh_hosts {
-            match &sess.github_token {
-                Some(tok) => match self.github.check_authenticated_user(tok, &host) {
-                    Ok(login) => entries.push(DoctorEntry {
-                        subsystem: format!("github:{host}"),
-                        status: "ready".into(),
-                        detail: Some(format!("authenticated as {login}")),
-                    }),
-                    Err(e) => entries.push(DoctorEntry {
-                        subsystem: format!("github:{host}"),
-                        status: "error".into(),
-                        detail: Some(e.message),
-                    }),
-                },
-                None => entries.push(DoctorEntry {
-                    subsystem: format!("github:{host}"),
-                    status: "unconfigured".into(),
-                    detail: Some("GitHub token not loaded in enclave".into()),
+        // Only ever probe the session-bound GitHub host (`C1` SSRF/token-exfiltration prevention)
+        let bound_host = sess.allowed_github_host.as_str();
+        match &sess.github_token {
+            Some(tok) => match self.github.check_authenticated_user(tok, bound_host) {
+                Ok(login) => entries.push(DoctorEntry {
+                    subsystem: format!("github:{bound_host}"),
+                    status: "ready".into(),
+                    detail: Some(format!("authenticated as {login}")),
                 }),
-            }
+                Err(e) => entries.push(DoctorEntry {
+                    subsystem: format!("github:{bound_host}"),
+                    status: "error".into(),
+                    detail: Some(e.message),
+                }),
+            },
+            None => entries.push(DoctorEntry {
+                subsystem: format!("github:{bound_host}"),
+                status: "unconfigured".into(),
+                detail: Some("GitHub token not loaded in enclave".into()),
+            }),
         }
 
         if let Some(m) = manifest {
             for (env_name, env) in &m.environments {
+                if let Some(gh) = &env.github
+                    && let Err(e) = Self::ensure_github_target_allowed(&sess, gh)
+                {
+                    entries.push(DoctorEntry {
+                        subsystem: format!("github-target:{env_name}"),
+                        status: "error".into(),
+                        detail: Some(e.message),
+                    });
+                }
                 if let Some(aws) = &env.aws {
+                    if let Err(e) = Self::ensure_aws_target_allowed(&sess, aws) {
+                        entries.push(DoctorEntry {
+                            subsystem: format!("aws:{env_name}"),
+                            status: "error".into(),
+                            detail: Some(e.message),
+                        });
+                        continue;
+                    }
                     match &sess.aws_creds {
                         Some(creds) => match self.aws.verify_caller_identity(creds, aws) {
                             Ok(id) => entries.push(DoctorEntry {
@@ -486,14 +753,11 @@ impl EnclaveService {
     ) -> Result<EnclaveResult, EnclaveError> {
         let env = Self::require_env(manifest, environment)?;
         ensure_service_account_vault_allowed(&env.vault)?;
-        {
-            let sess = self.lock_session()?;
-            if sess.op_token.is_none() {
-                return Err(EnclaveError::new(
-                    ErrorCode::Unauthorized,
-                    "OP_SERVICE_ACCOUNT_TOKEN is required before arming secret capture",
-                ));
-            }
+        if self.snapshot_session()?.op_token.is_none() {
+            return Err(EnclaveError::new(
+                ErrorCode::Unauthorized,
+                "OP_SERVICE_ACCOUNT_TOKEN is required before arming secret capture",
+            ));
         }
 
         let mut captures = self
@@ -580,7 +844,8 @@ impl EnclaveService {
         &self,
         manifest: &Manifest,
         environment: &Slug,
-        name: &sb_proto::types::SecretName,
+        name: &SecretName,
+        confirm_unmanaged: bool,
     ) -> Result<EnclaveResult, EnclaveError> {
         let env = Self::require_env(manifest, environment)?;
         let Some(aws) = &env.aws else {
@@ -594,9 +859,10 @@ impl EnclaveService {
                 ErrorCode::Validation,
                 format!("secret '{name}' is not bound in environment '{environment}'"),
             ));
-        };
-        let sess = self.lock_session()?;
-        let Some(creds) = sess.aws_creds.as_ref() else {
+        }
+        let sess = self.snapshot_session()?;
+        Self::ensure_aws_target_allowed(&sess, aws)?;
+        let Some(creds) = sess.aws_creds.as_deref() else {
             return Err(EnclaveError::new(
                 ErrorCode::Unauthorized,
                 "AWS credentials are not configured in enclave session",
@@ -615,6 +881,16 @@ impl EnclaveService {
                 ErrorCode::OwnershipConflict,
                 format!(
                     "AWS secret '{resource}' is already tagged as owned by a different SecretBridge project or environment"
+                ),
+            ));
+        }
+        if !existing.is_owned_by(manifest.project.as_str(), environment.as_str())
+            && !confirm_unmanaged
+        {
+            return Err(EnclaveError::new(
+                ErrorCode::OwnershipConflict,
+                format!(
+                    "AWS secret '{resource}' has no SecretBridge ownership tags; pass confirm_unmanaged=true after operator confirmation"
                 ),
             ));
         }
@@ -647,8 +923,9 @@ impl EnclaveService {
                 "GitHub target is not configured for this environment",
             ));
         };
-        let sess = self.lock_session()?;
-        let Some(tok) = sess.github_token.as_ref() else {
+        let sess = self.snapshot_session()?;
+        Self::ensure_github_target_allowed(&sess, gh)?;
+        let Some(tok) = sess.github_token.as_deref() else {
             return Err(EnclaveError::new(
                 ErrorCode::Unauthorized,
                 "GitHub token is not configured in enclave session",
@@ -676,8 +953,8 @@ impl EnclaveService {
     ) -> Result<EnclaveResult, EnclaveError> {
         let env = Self::require_env(manifest, environment)?;
         ensure_service_account_vault_allowed(&env.vault)?;
-        let sess = self.lock_session()?;
-        let Some(op_tok) = sess.op_token.as_ref() else {
+        let sess = self.snapshot_session()?;
+        let Some(op_tok) = sess.op_token.as_deref() else {
             return Err(EnclaveError::new(
                 ErrorCode::Unauthorized,
                 "OP_SERVICE_ACCOUNT_TOKEN is not configured in enclave session",
@@ -713,15 +990,21 @@ impl EnclaveService {
         }
 
         let mut operations = Vec::new();
+        let mut github_actor = None;
         if let Some(gh) = &env.github
             && env.secrets.values().any(|s| s.github)
         {
-            let Some(gh_tok) = sess.github_token.as_ref() else {
+            Self::ensure_github_target_allowed(&sess, gh)?;
+            let Some(gh_tok) = sess.github_token.as_deref() else {
                 return Err(EnclaveError::new(
                     ErrorCode::Unauthorized,
                     "GitHub token is required to plan GitHub Actions sync",
                 ));
             };
+            github_actor = Some(
+                self.github
+                    .check_authenticated_user(gh_tok, gh.host.as_str())?,
+            );
             let remote_gh = self.github.list_secret_timestamps(gh_tok, gh)?;
             for (name, spec) in &env.secrets {
                 if !spec.github {
@@ -739,6 +1022,15 @@ impl EnclaveService {
                     }
                     SecretState::Absent => {
                         if let Some(observed_updated_at) = remote_gh.get(name.as_str()) {
+                            let is_managed = self.is_github_secret_managed(gh, name)?;
+                            if !is_managed && !spec.allow_unmanaged_github_delete {
+                                return Err(EnclaveError::new(
+                                    ErrorCode::OwnershipConflict,
+                                    format!(
+                                        "refusing to delete pre-existing unmanaged GitHub secret '{name}'; set allow_unmanaged_github_delete=true if intended"
+                                    ),
+                                ));
+                            }
                             operations.push(PlannedOp::Github {
                                 name: name.clone(),
                                 action: PlanAction::Delete,
@@ -755,7 +1047,8 @@ impl EnclaveService {
         if let Some(aws) = &env.aws
             && env.secrets.values().any(|s| s.aws)
         {
-            let Some(creds) = sess.aws_creds.as_ref() else {
+            Self::ensure_aws_target_allowed(&sess, aws)?;
+            let Some(creds) = sess.aws_creds.as_deref() else {
                 return Err(EnclaveError::new(
                     ErrorCode::Unauthorized,
                     "AWS credentials are required to plan AWS Secrets Manager sync",
@@ -835,10 +1128,13 @@ impl EnclaveService {
         }
 
         let unsigned = UnsignedPlan {
+            plan_id: Uuid::new_v4().to_string(),
             version: 2,
             environment: environment.clone(),
             manifest_digest,
             source_revision_digest,
+            credentials_fingerprint: sess.credentials_fingerprint,
+            github_actor,
             aws_identity,
             issued_at_unix_secs: self.now_unix_secs(),
             operations,
@@ -852,11 +1148,12 @@ impl EnclaveService {
         manifest: &Manifest,
         signed_plan: &SignedPlan,
     ) -> Result<EnclaveResult, EnclaveError> {
-        // 1. Verify per-boot HMAC-SHA256 & plan TTL (closes S4)
+        // 1. Verify per-session HMAC-SHA256, unconsumed plan_id, & TTL (`S4`, `H3`)
         self.plan_signer.verify(signed_plan, self.now_unix_secs())?;
 
         // 2. Verify manifest digest matches signed plan (closes TOCTOU manifest swap)
-        let env = Self::require_env(manifest, &signed_plan.plan.environment)?;
+        let env_name = &signed_plan.plan.environment;
+        let env = Self::require_env(manifest, env_name)?;
         ensure_service_account_vault_allowed(&env.vault)?;
         let current_manifest_digest = sha256_hex(manifest)?;
         if current_manifest_digest != signed_plan.plan.manifest_digest {
@@ -866,8 +1163,15 @@ impl EnclaveService {
             ));
         }
 
-        let sess = self.lock_session()?;
-        let Some(op_tok) = sess.op_token.as_ref() else {
+        let sess = self.snapshot_session()?;
+        if sess.credentials_fingerprint != signed_plan.plan.credentials_fingerprint {
+            return Err(EnclaveError::new(
+                ErrorCode::StalePlan,
+                "enclave session credentials changed since plan was generated; run plan again",
+            ));
+        }
+
+        let Some(op_tok) = sess.op_token.as_deref() else {
             return Err(EnclaveError::new(
                 ErrorCode::Unauthorized,
                 "OP_SERVICE_ACCOUNT_TOKEN is not configured in enclave session",
@@ -886,11 +1190,34 @@ impl EnclaveService {
             ));
         }
 
-        // 4. Re-verify AWS caller identity if AWS operations are present
+        // 4. Re-verify GitHub actor if GitHub operations are present (`H3`)
+        if let Some(expected_actor) = &signed_plan.plan.github_actor
+            && let Some(gh_target) = &env.github
+        {
+            Self::ensure_github_target_allowed(&sess, gh_target)?;
+            let Some(gh_tok) = sess.github_token.as_deref() else {
+                return Err(EnclaveError::new(
+                    ErrorCode::Unauthorized,
+                    "GitHub token missing for planned GitHub operations",
+                ));
+            };
+            let actual_actor = self
+                .github
+                .check_authenticated_user(gh_tok, gh_target.host.as_str())?;
+            if &actual_actor != expected_actor {
+                return Err(EnclaveError::new(
+                    ErrorCode::StalePlan,
+                    "GitHub authenticated actor changed since plan was generated",
+                ));
+            }
+        }
+
+        // 5. Re-verify AWS caller identity if AWS operations are present
         if let Some(expected_aws_id) = &signed_plan.plan.aws_identity
             && let Some(aws_target) = &env.aws
         {
-            let Some(creds) = sess.aws_creds.as_ref() else {
+            Self::ensure_aws_target_allowed(&sess, aws_target)?;
+            let Some(creds) = sess.aws_creds.as_deref() else {
                 return Err(EnclaveError::new(
                     ErrorCode::Unauthorized,
                     "AWS credentials missing for planned AWS operations",
@@ -905,10 +1232,14 @@ impl EnclaveService {
             }
         }
 
+        // 6. Atomically consume `plan_id` before executing any external mutation (`H3`)
+        self.plan_signer
+            .consume_verified(signed_plan, self.now_unix_secs())?;
+
         let mut results = Vec::new();
         let ops = &signed_plan.plan.operations;
         for (idx, op) in ops.iter().enumerate() {
-            match self.execute_single_op(manifest, env, &sess, op_tok, op) {
+            match self.execute_single_op(manifest, env_name, env, &sess, op_tok, op) {
                 Ok(()) => {
                     results.push(OpStepResult {
                         target: op.target_kind(),
@@ -947,6 +1278,7 @@ impl EnclaveService {
     fn execute_single_op(
         &self,
         manifest: &Manifest,
+        env_name: &Slug,
         env: &sb_proto::types::EnvironmentConfig,
         sess: &SessionState,
         op_tok: &MemSecret,
@@ -959,7 +1291,8 @@ impl EnclaveService {
                 destination,
                 observed_updated_at,
             } => {
-                let Some(gh_tok) = sess.github_token.as_ref() else {
+                Self::ensure_github_target_allowed(sess, destination)?;
+                let Some(gh_tok) = sess.github_token.as_deref() else {
                     return Err(EnclaveError::new(
                         ErrorCode::Unauthorized,
                         "GitHub token missing during apply",
@@ -997,9 +1330,27 @@ impl EnclaveService {
                             &secret_val,
                             &pub_key,
                             &repo_ids,
-                        )
+                        )?;
+                        self.record_github_secret_managed(destination, name, true)?;
+                        Ok(())
                     }
-                    PlanAction::Delete => self.github.delete_secret(gh_tok, destination, name),
+                    PlanAction::Delete => {
+                        let spec = env.secrets.get(name).ok_or_else(|| {
+                            EnclaveError::new(ErrorCode::Validation, "missing secret spec")
+                        })?;
+                        let is_managed = self.is_github_secret_managed(destination, name)?;
+                        if !is_managed && !spec.allow_unmanaged_github_delete {
+                            return Err(EnclaveError::new(
+                                ErrorCode::OwnershipConflict,
+                                format!(
+                                    "refusing to delete unmanaged GitHub secret '{name}' without allow_unmanaged_github_delete=true"
+                                ),
+                            ));
+                        }
+                        self.github.delete_secret(gh_tok, destination, name)?;
+                        self.record_github_secret_managed(destination, name, false)?;
+                        Ok(())
+                    }
                 }
             }
             PlannedOp::Aws {
@@ -1009,7 +1360,8 @@ impl EnclaveService {
                 destination,
                 observed,
             } => {
-                let Some(creds) = sess.aws_creds.as_ref() else {
+                Self::ensure_aws_target_allowed(sess, destination)?;
+                let Some(creds) = sess.aws_creds.as_deref() else {
                     return Err(EnclaveError::new(
                         ErrorCode::Unauthorized,
                         "AWS credentials missing during apply",
@@ -1044,20 +1396,7 @@ impl EnclaveService {
                             TAG_PROJECT.to_string(),
                             manifest.project.as_str().to_string(),
                         );
-                        tags.insert(
-                            TAG_ENVIRONMENT.to_string(),
-                            manifest
-                                .environments
-                                .iter()
-                                .find_map(|(k, v)| {
-                                    if v.vault == env.vault {
-                                        Some(k.as_str().to_string())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or_default(),
-                        );
+                        tags.insert(TAG_ENVIRONMENT.to_string(), env_name.as_str().to_string());
                         self.aws
                             .create_secret(creds, destination, resource, &secret_val, &tags)
                     }
@@ -1076,12 +1415,7 @@ impl EnclaveService {
                                 ),
                             ));
                         }
-                        let env_slug = manifest
-                            .environments
-                            .iter()
-                            .find_map(|(k, v)| (v.vault == env.vault).then_some(k.as_str()))
-                            .unwrap_or_default();
-                        if !rec.is_owned_by(manifest.project.as_str(), env_slug) {
+                        if !rec.is_owned_by(manifest.project.as_str(), env_name.as_str()) {
                             return Err(EnclaveError::new(
                                 ErrorCode::OwnershipConflict,
                                 format!("AWS secret '{resource}' lost ownership tags"),
@@ -1120,12 +1454,7 @@ impl EnclaveService {
                                 ),
                             ));
                         }
-                        let env_slug = manifest
-                            .environments
-                            .iter()
-                            .find_map(|(k, v)| (v.vault == env.vault).then_some(k.as_str()))
-                            .unwrap_or_default();
-                        if !rec.is_owned_by(manifest.project.as_str(), env_slug) {
+                        if !rec.is_owned_by(manifest.project.as_str(), env_name.as_str()) {
                             return Err(EnclaveError::new(
                                 ErrorCode::OwnershipConflict,
                                 format!("refusing to delete unowned AWS secret '{resource}'"),

@@ -16,20 +16,56 @@ import java.nio.channels.ServerSocketChannel
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Paths
+import java.nio.file.attribute.PosixFilePermissions
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 
 class SecretBridgePluginTest {
 
     @Test
-    fun jsonCodecZeroizesSecretCharArraysDuringConfigureSessionEncode() {
-        val opChars = "sample-sa-credential-value".toCharArray()
-        val ghChars = "sample-gh-credential-value".toCharArray()
+    fun blake2s256MatchesRfc7693TestVectors() {
+        val emptyDigest = BridgeSettings.encodeHexString(Blake2s256.hash(ByteArray(0)))
+        assertEquals(
+            "69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9",
+            emptyDigest,
+        )
+
+        val abcDigest = BridgeSettings.encodeHexString(
+            Blake2s256.hash("abc".toByteArray(StandardCharsets.US_ASCII)),
+        )
+        assertEquals(
+            "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982",
+            abcDigest,
+        )
+
+        val multiBlock = ByteArray(128) { it.toByte() }
+        val singlePass = BridgeSettings.encodeHexString(Blake2s256.hash(multiBlock))
+        val splitPass = BridgeSettings.encodeHexString(
+            Blake2s256.hashTwo(multiBlock.copyOfRange(0, 64), multiBlock.copyOfRange(64, 128)),
+        )
+        assertEquals(singlePass, splitPass)
+    }
+
+    @Test
+    fun jsonCodecZeroizesSecretCharsHandlesSurrogatePairsRejectsSignedHexAndDeepNesting() {
+        val sampleSa = buildString {
+            append("sample-sa-")
+            append("credential-\uD83D\uDD10-val")
+        }
+        val sampleGh = buildString {
+            append("sample-gh-")
+            append("credential-val")
+        }
+        val opChars = sampleSa.toCharArray()
+        val ghChars = sampleGh.toCharArray()
         val creds = SessionCredentialsChars(
             opServiceAccountToken = opChars,
             githubToken = ghChars,
+            allowedGithubHosts = listOf("github.com"),
+            allowedGithubOwners = listOf("acme"),
+            allowedAwsAccountIds = listOf("123456789012"),
         )
-        val req = HostCommand.Enclave(EnclaveRequest.ConfigureSession(creds))
+        val req = EnclaveRequest.ConfigureSession(creds)
         val encodedBytes = JsonCodec.encodeUtf8(req.toJson(), appendNewline = true)
         try {
             assertTrue("opChars must be zeroized after encodeUtf8", opChars.all { it == '\u0000' })
@@ -38,15 +74,37 @@ class SecretBridgePluginTest {
             val text = String(encodedBytes, StandardCharsets.UTF_8)
             assertTrue(text.endsWith("\n"))
             val parsed = JsonCodec.parseObject(text.trim())
-            assertEquals("enclave", parsed.reqStr("host_op"))
-            val inner = parsed.reqObj("request")
-            assertEquals("configure-session", inner.reqStr("action"))
-            val parsedCreds = inner.reqObj("credentials")
-            assertEquals("sample-sa-credential-value", parsedCreds.reqStr("op_service_account_token"))
-            assertEquals("sample-gh-credential-value", parsedCreds.reqStr("github_token"))
+            assertEquals("configure-session", parsed.reqStr("action"))
+            val parsedCreds = parsed.reqObj("credentials")
+            assertEquals(sampleSa, parsedCreds.reqStr("op_service_account_token"))
+            assertEquals(sampleGh, parsedCreds.reqStr("github_token"))
+            assertEquals(listOf("acme"), parsedCreds.strList("allowed_github_owners"))
             assertFalse(parsedCreds.entries.containsKey("aws_secret_access_key"))
         } finally {
             encodedBytes.fill(0)
+        }
+
+        // Surrogate-pair round-trip inside JsonStr (4-byte UTF-8 rather than CESU-8)
+        val lockStr = "prefix-\uD83D\uDD10-suffix"
+        val strEncoded = JsonCodec.encodeUtf8(JsonObj(mapOf("v" to JsonStr(lockStr))), appendNewline = false)
+        assertEquals(lockStr, JsonCodec.parseObject(String(strEncoded, StandardCharsets.UTF_8)).reqStr("v"))
+
+        // Reject signed \u+041 / \u-041 hex escape sequences
+        for (badEscape in listOf("{\"k\":\"\\u+041\"}", "{\"k\":\"\\u-041\"}")) {
+            try {
+                JsonCodec.parseObject(badEscape)
+                fail("Expected ProtocolCodecException for malformed unicode escape: $badEscape")
+            } catch (_: ProtocolCodecException) {
+            }
+        }
+
+        // Enforce MAX_DEPTH = 64 recursion ceiling
+        val deepNested = "[".repeat(70) + "1" + "]".repeat(70)
+        try {
+            JsonCodec.parse(deepNested)
+            fail("Expected ProtocolCodecException for deeply nested JSON")
+        } catch (expected: ProtocolCodecException) {
+            assertTrue(expected.message!!.contains("depth"))
         }
     }
 
@@ -84,7 +142,8 @@ class SecretBridgePluginTest {
                       "ref": "op://payments-prod/rds-main/DB_PASSWORD",
                       "state": "present",
                       "github": true,
-                      "aws": true
+                      "aws": true,
+                      "allow_unmanaged_github_delete": true
                     }
                   },
                   "github": {
@@ -107,6 +166,7 @@ class SecretBridgePluginTest {
         val manifest = Manifest.fromJson(JsonCodec.parseObject(validV2))
         assertEquals(2, manifest.version)
         assertEquals("payments", manifest.project)
+        assertTrue(manifest.environments.getValue("prod").secrets.getValue("DB_PASSWORD").allowUnmanagedGithubDelete)
         val roundTripped = Manifest.fromJson(manifest.toJson())
         assertEquals(manifest, roundTripped)
     }
@@ -231,10 +291,12 @@ class SecretBridgePluginTest {
     }
 
     @Test
-    fun hostCliBuilderEnforcesSha256DigestsAndRejectsOptionInjection() {
+    fun hostCliBuilderAndReadyBannerParserHandleSpacesInSocketPathAndEnforceDigests() {
+        val validClientPub = "f".repeat(64)
+
         val badBin = BridgeSettings.StateData(sbHostBinaryPath = "--bad-flag")
         try {
-            badBin.buildHostCliArgs("/path/h.sock", "/path/e.sock")
+            badBin.buildHostCliArgs("/path/h.sock", "/path/e.sock", validClientPub, 42)
             fail("Expected IllegalArgumentException for flag-like binary path")
         } catch (_: IllegalArgumentException) {
         }
@@ -247,20 +309,31 @@ class SecretBridgePluginTest {
             initramfsSha256 = "0".repeat(64),
         )
         try {
-            missingDigest.buildHostCliArgs("/path/h.sock", "/path/e.sock")
+            missingDigest.buildHostCliArgs("/path/h.sock", "/path/e.sock", validClientPub, 42)
             fail("Expected IllegalArgumentException for invalid SHA-256")
         } catch (_: IllegalArgumentException) {
         }
 
         val validKvm = missingDigest.copy(kernelSha256 = "a".repeat(64), initramfsSha256 = "b".repeat(64))
-        val args = validKvm.buildHostCliArgs("/path/h.sock", "/path/e.sock")
+        val args = validKvm.buildHostCliArgs("/path/h.sock", "/path/e.sock", validClientPub, 77)
         assertEquals("sb-host", args[0])
         assertTrue(args.contains("--kernel-sha256"))
         assertTrue(args.contains("a".repeat(64)))
+        assertTrue(args.contains("--authorized-client-pubkey-hex"))
+        assertTrue(args.contains(validClientPub))
+        assertTrue(args.contains("77"))
+
+        val spacePath = "/Users/Anthony Vespoli/Library/Application Support/sb/h.sock"
+        val banner = "SB_HOST_READY token=${"d".repeat(64)} enckey=${"e".repeat(64)} socket=$spacePath"
+        val parsed = HostSocketTransport.parseReadyBanner(banner)
+        assertEquals(Paths.get(spacePath), parsed.socketPath)
+        assertEquals("d".repeat(64), String(parsed.authTokenChars))
+        assertEquals("e".repeat(64), BridgeSettings.encodeHexString(parsed.enclavePubkey32))
+        parsed.authTokenChars.fill('\u0000')
     }
 
     @Test
-    fun hostSocketTransportRoundTripsArmedCaptureOverUnixSocket() {
+    fun hostSocketTransportRoundTripsCaptureAndSealOverUnixSocket() {
         val home = System.getProperty("user.home")
         assertNotNull(home)
         val dir = Paths.get(home, ".local", "run", "sb-junit-${UUID.randomUUID().toString().take(8)}")
@@ -279,35 +352,36 @@ class SecretBridgePluginTest {
                         )
                         serverCapturedLine.set(reader.readLine())
                         val reply = """
-                            {"ok":true,"enclave":{"ok":true,"result":{"kind":"secret-stored","item_id":"it-1","title":"stripe","field_id":"f-1","ref":"op://dev/stripe/API_KEY","intercept_mode":"zero-pasteboard"}}}
+                            {"ok":true,"sealed_secret_b64":"c2VhbGVk","intercept_mode":"zero-pasteboard"}
                         """.trimIndent() + "\n"
                         client.write(ByteBuffer.wrap(reply.toByteArray(StandardCharsets.UTF_8)))
                     }
                 }
                 serverThread.start()
 
-                val banner = "SB_HOST_READY socket=$sockPath token=$expectedToken"
-                val (parsedPath, tokenChars) = HostSocketTransport.parseReadyBanner(banner)
-                assertEquals(sockPath, parsedPath)
+                val banner = "SB_HOST_READY token=$expectedToken enckey=${"1".repeat(64)} socket=$sockPath"
+                val parsed = HostSocketTransport.parseReadyBanner(banner)
+                assertEquals(sockPath, parsed.socketPath)
 
-                HostSocketTransport(parsedPath, tokenChars).use { transport ->
-                    tokenChars.fill('\u0000')
+                HostSocketTransport(parsed.socketPath, parsed.authTokenChars).use { transport ->
+                    parsed.authTokenChars.fill('\u0000')
                     val resp = transport.execute(
-                        HostCommand.ArmedCapture(
-                            manifestPath = "/repo/secretbridge.json",
-                            environment = "dev",
-                            target = CaptureTarget.NewItem(title = "stripe", fieldName = "API_KEY"),
+                        HostCommand.CaptureAndSeal(
+                            pkCaptureB64 = "cGtfdGVzdA==",
+                            ttlMs = 15_000L,
                         ),
                     )
-                    val stored = resp.requireEnclaveResult() as EnclaveResult.SecretStored
-                    assertEquals("op://dev/stripe/API_KEY", stored.receipt.ref)
-                    assertEquals(CaptureInterceptMode.ZERO_PASTEBOARD, stored.receipt.interceptMode)
+                    val (sealedB64, mode) = resp.requireSealedCapture()
+                    assertEquals("c2VhbGVk", sealedB64)
+                    assertEquals(CaptureInterceptMode.ZERO_PASTEBOARD, mode)
                 }
 
                 serverThread.join(5_000)
                 val receivedJson = JsonCodec.parseObject(serverCapturedLine.get())
                 assertEquals(expectedToken, receivedJson.reqStr("auth_token_hex"))
-                assertEquals("armed-capture", receivedJson.reqObj("command").reqStr("host_op"))
+                val cmdObj = receivedJson.reqObj("command")
+                assertEquals("capture-and-seal", cmdObj.reqStr("host_op"))
+                assertEquals("cGtfdGVzdA==", cmdObj.reqStr("pk_capture_b64"))
             }
         } finally {
             Files.deleteIfExists(sockPath)
@@ -316,21 +390,40 @@ class SecretBridgePluginTest {
     }
 
     @Test
-    fun kotlinPluginEndToEndWithRealRustHostAndEnclaveOverNoiseIk() {
+    fun kotlinPluginEndToEndWithRealRustHostAndEnclaveOverNoiseIkAndRekey() {
         val cwd = Paths.get("").toAbsolutePath().normalize()
         val repoRoot = if (cwd.fileName?.toString() == "plugin") cwd.parent else cwd
         val sbHostBin = repoRoot.resolve("target/debug/sb-host")
         val sbEnclaveBin = repoRoot.resolve("target/debug/sb-enclave")
-        if (!Files.isExecutable(sbHostBin) || !Files.isExecutable(sbEnclaveBin)) {
-            return
+        assertTrue(
+            "Expected built Rust binaries at $sbHostBin and $sbEnclaveBin",
+            Files.isExecutable(sbHostBin) && Files.isExecutable(sbEnclaveBin),
+        )
+        try {
+            val execPerms = PosixFilePermissions.fromString("rwxr-xr-x")
+            Files.setPosixFilePermissions(sbHostBin, execPerms)
+            Files.setPosixFilePermissions(sbEnclaveBin, execPerms)
+        } catch (_: UnsupportedOperationException) {
         }
 
         val home = System.getProperty("user.home")!!
         val runDir = Paths.get(home, ".local", "run", "sb-e2e-${UUID.randomUUID().toString().take(8)}")
         Files.createDirectories(runDir)
+        try {
+            Files.setPosixFilePermissions(runDir, PosixFilePermissions.fromString("rwx------"))
+        } catch (_: UnsupportedOperationException) {
+        }
         val ideSock = runDir.resolve("h.sock")
         val enclaveSock = runDir.resolve("e.sock")
         val manifestFile = runDir.resolve("secretbridge.json")
+
+        val (clientPriv, clientPub) = NoiseIkSession.generateStaticKeypair()
+        val clientPubHex = BridgeSettings.encodeHexString(clientPub)
+        val runtimeTestToken = buildString {
+            append("junit-")
+            append("valid-")
+            append("sa-session")
+        }
 
         val proc = ProcessBuilder(
             sbHostBin.toString(),
@@ -340,42 +433,67 @@ class SecretBridgePluginTest {
             sbEnclaveBin.toString(),
             "--enclave-socket",
             enclaveSock.toString(),
+            "--authorized-client-pubkey-hex",
+            clientPubHex,
             "--enclave-arg",
             "--in-memory-vault-test-token",
             "--enclave-arg",
-            "junit-valid-sa-session",
+            runtimeTestToken,
         ).start()
 
         try {
             val stdout = BufferedReader(InputStreamReader(proc.inputStream, StandardCharsets.UTF_8))
             val readyLine = stdout.readLine()
-            assertNotNull("Expected SB_HOST_READY line from sb-host", readyLine)
-            val (boundSock, tokenChars) = HostSocketTransport.parseReadyBanner(readyLine!!)
+            if (readyLine == null) {
+                val errText = proc.errorStream.bufferedReader(StandardCharsets.UTF_8).readText()
+                fail("Expected SB_HOST_READY line from sb-host, stderr was: $errText")
+            }
+            val parsed = HostSocketTransport.parseReadyBanner(readyLine!!)
+            assertFalse("Enclave Noise public key must be non-zero", parsed.enclavePubkey32.all { it == 0.toByte() })
 
-            HostSocketTransport(boundSock, tokenChars).use { transport ->
-                tokenChars.fill('\u0000')
+            // Verify an unauthorized Kotlin Noise static keypair is rejected by sb-enclave
+            val (roguePriv, _) = NoiseIkSession.generateStaticKeypair()
+            try {
+                HostSocketTransport(
+                    socketPath = parsed.socketPath,
+                    authTokenHex = parsed.authTokenChars,
+                    clientPrivateKey32 = roguePriv,
+                    expectedEnclavePubkey32 = parsed.enclavePubkey32,
+                ).use { rogueTransport ->
+                    rogueTransport.executeEnclave(EnclaveRequest.Capabilities)
+                    fail("Expected unauthorized Noise_IK client keypair to be rejected by sb-enclave")
+                }
+            } catch (_: EnclaveBridgeException) {
+            } finally {
+                roguePriv.fill(0)
+            }
 
-                val cfgRes = transport.execute(
-                    HostCommand.Enclave(
-                        EnclaveRequest.ConfigureSession(
-                            SessionCredentialsChars(
-                                opServiceAccountToken = "junit-valid-sa-session".toCharArray(),
-                            ),
+            HostSocketTransport(
+                socketPath = parsed.socketPath,
+                authTokenHex = parsed.authTokenChars,
+                clientPrivateKey32 = clientPriv,
+                expectedEnclavePubkey32 = parsed.enclavePubkey32,
+            ).use { transport ->
+                parsed.authTokenChars.fill('\u0000')
+
+                val cfgRes = transport.executeEnclave(
+                    EnclaveRequest.ConfigureSession(
+                        SessionCredentialsChars(
+                            opServiceAccountToken = runtimeTestToken.toCharArray(),
+                            allowedGithubHosts = listOf("github.com"),
+                            allowedGithubOwners = listOf("acme"),
                         ),
                     ),
-                ).requireEnclaveResult() as EnclaveResult.SessionConfigured
+                ) as EnclaveResult.SessionConfigured
                 assertTrue(cfgRes.hasOpToken)
 
-                val caps = (
-                    transport.execute(HostCommand.Enclave(EnclaveRequest.Capabilities))
-                        .requireEnclaveResult() as EnclaveResult.Capabilities
-                    ).capabilities
+                val caps = (transport.executeEnclave(EnclaveRequest.Capabilities) as EnclaveResult.Capabilities)
+                    .capabilities
                 assertTrue(caps.authenticated)
                 assertTrue(caps.canCreateVaults)
 
                 val createdVault = (
-                    transport.execute(HostCommand.Enclave(EnclaveRequest.VaultCreate("junit-dev")))
-                        .requireEnclaveResult() as EnclaveResult.VaultCreated
+                    transport.executeEnclave(EnclaveRequest.VaultCreate("junit-dev")) as EnclaveResult.VaultCreated
                     ).vault
                 assertEquals("junit-dev", createdVault.name)
                 assertTrue(createdVault.writable)
@@ -390,20 +508,28 @@ class SecretBridgePluginTest {
                     HostCommand.ManifestSave(manifestFile.toString(), initialManifest),
                 ).requireManifest()
 
+                val captureStart = transport.executeEnclave(
+                    EnclaveRequest.BeginCapture(
+                        manifest = savedManifest,
+                        environment = "dev",
+                        target = CaptureTarget.NewItem(title = "api-token", fieldName = "TOKEN"),
+                    ),
+                ) as EnclaveResult.CaptureStarted
+                assertTrue(captureStart.captureId.isNotBlank())
+                assertTrue(captureStart.pkCaptureB64.isNotBlank())
+
                 val generated = (
-                    transport.execute(
-                        HostCommand.Enclave(
-                            EnclaveRequest.GenerateSecret(
-                                manifest = savedManifest,
-                                environment = "dev",
-                                target = CaptureTarget.NewItem(
-                                    title = "stripe-webhook",
-                                    fieldName = "SIGNING_SECRET",
-                                ),
-                                spec = GenerateSpec(length = 40, charset = SecretCharset.ALPHANUMERIC),
+                    transport.executeEnclave(
+                        EnclaveRequest.GenerateSecret(
+                            manifest = savedManifest,
+                            environment = "dev",
+                            target = CaptureTarget.NewItem(
+                                title = "stripe-webhook",
+                                fieldName = "SIGNING_SECRET",
                             ),
+                            spec = GenerateSpec(length = 40, charset = SecretCharset.ALPHANUMERIC),
                         ),
-                    ).requireEnclaveResult() as EnclaveResult.SecretStored
+                    ) as EnclaveResult.SecretStored
                     ).receipt
                 val expectedOpRef = "op://${createdVault.id}/${generated.itemId}/${generated.fieldId}"
                 assertEquals(expectedOpRef, generated.ref)
@@ -418,19 +544,25 @@ class SecretBridgePluginTest {
                 ).requireManifest()
 
                 val renderedEnv = (
-                    transport.execute(
-                        HostCommand.Enclave(
-                            EnclaveRequest.Template(
-                                manifest = boundManifest,
-                                environment = "dev",
-                                kind = TemplateKind.ENV,
-                            ),
+                    transport.executeEnclave(
+                        EnclaveRequest.Template(
+                            manifest = boundManifest,
+                            environment = "dev",
+                            kind = TemplateKind.ENV,
                         ),
-                    ).requireEnclaveResult() as EnclaveResult.TemplateRendered
+                    ) as EnclaveResult.TemplateRendered
                     ).content
                 assertTrue(renderedEnv.contains("SIGNING_SECRET=\"$expectedOpRef\""))
+
+                // Exercise >1,024 frames in a single Noise_IK session to prove synchronized
+                // Kotlin <-> Rust `snow` ChaChaPoly transport cipherstate rekeying (`H1`)!
+                val rekeyBatch = List(1_030) { EnclaveRequest.Capabilities }
+                val batchResults = transport.executeEnclaveBatch(rekeyBatch)
+                assertEquals(1_030, batchResults.size)
+                assertTrue((batchResults.last() as EnclaveResult.Capabilities).capabilities.authenticated)
             }
         } finally {
+            clientPriv.fill(0)
             proc.destroyForcibly()
             Files.deleteIfExists(manifestFile)
             Files.deleteIfExists(ideSock)

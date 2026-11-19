@@ -135,6 +135,7 @@ data class SecretSpec(
     val group: String? = null,
     val github: Boolean = true,
     val aws: Boolean = true,
+    val allowUnmanagedGithubDelete: Boolean = false,
 ) {
     fun toJson(): JsonObj {
         val m = LinkedHashMap<String, JsonValue>()
@@ -143,6 +144,9 @@ data class SecretSpec(
         if (group != null) m["group"] = JsonStr(group)
         m["github"] = JsonBool(github)
         m["aws"] = JsonBool(aws)
+        if (allowUnmanagedGithubDelete) {
+            m["allow_unmanaged_github_delete"] = JsonBool(true)
+        }
         return JsonObj(m)
     }
 
@@ -153,6 +157,7 @@ data class SecretSpec(
             group = obj.str("group"),
             github = obj.bool("github") ?: true,
             aws = obj.bool("aws") ?: true,
+            allowUnmanagedGithubDelete = obj.bool("allow_unmanaged_github_delete") ?: false,
         )
     }
 }
@@ -305,7 +310,7 @@ data class Manifest(
 }
 
 /**
- * Write-only bootstrap credentials backed by mutable [CharArray]s.
+ * Write-only bootstrap credentials and destination allowlists backed by mutable [CharArray]s.
  * Every array is zeroized during JSON serialization or [wipe].
  */
 class SessionCredentialsChars(
@@ -314,6 +319,9 @@ class SessionCredentialsChars(
     val awsAccessKeyId: CharArray? = null,
     val awsSecretAccessKey: CharArray? = null,
     val awsSessionToken: CharArray? = null,
+    val allowedGithubHosts: List<String> = emptyList(),
+    val allowedGithubOwners: List<String> = emptyList(),
+    val allowedAwsAccountIds: List<String> = emptyList(),
 ) {
     fun isEmpty(): Boolean =
         (opServiceAccountToken == null || opServiceAccountToken.isEmpty()) &&
@@ -348,6 +356,15 @@ class SessionCredentialsChars(
             m["aws_session_token"] = JsonSecretChars(awsSessionToken)
         } else {
             awsSessionToken?.fill('\u0000')
+        }
+        if (allowedGithubHosts.isNotEmpty()) {
+            m["allowed_github_hosts"] = JsonArr(allowedGithubHosts.map(::JsonStr))
+        }
+        if (allowedGithubOwners.isNotEmpty()) {
+            m["allowed_github_owners"] = JsonArr(allowedGithubOwners.map(::JsonStr))
+        }
+        if (allowedAwsAccountIds.isNotEmpty()) {
+            m["allowed_aws_account_ids"] = JsonArr(allowedAwsAccountIds.map(::JsonStr))
         }
         return JsonObj(m)
     }
@@ -450,6 +467,36 @@ sealed interface EnclaveRequest {
         )
     }
 
+    data class BeginCapture(
+        val manifest: Manifest,
+        val environment: String,
+        val target: CaptureTarget,
+    ) : EnclaveRequest {
+        override fun toJson(): JsonObj = JsonObj(
+            linkedMapOf(
+                "action" to JsonStr("begin-capture"),
+                "manifest" to manifest.toJson(),
+                "environment" to JsonStr(environment),
+                "target" to target.toJson(),
+            ),
+        )
+    }
+
+    data class CompleteCapture(
+        val captureId: String,
+        val sealedSecretB64: String,
+        val mode: CaptureInterceptMode,
+    ) : EnclaveRequest {
+        override fun toJson(): JsonObj = JsonObj(
+            linkedMapOf(
+                "action" to JsonStr("complete-capture"),
+                "capture_id" to JsonStr(captureId),
+                "sealed_secret_b64" to JsonStr(sealedSecretB64),
+                "mode" to JsonStr(mode.wireName),
+            ),
+        )
+    }
+
     data class EditMetadata(
         val manifest: Manifest,
         val environment: String,
@@ -481,9 +528,11 @@ sealed interface EnclaveRequest {
                 "action" to JsonStr("archive"),
                 "manifest" to manifest.toJson(),
                 "environment" to JsonStr(environment),
-                "item" to JsonStr(item),
             ),
         )
+            .let { base ->
+                JsonObj(base.entries + ("item" to JsonStr(item)))
+            }
     }
 
     data class Move(
@@ -517,6 +566,7 @@ sealed interface EnclaveRequest {
         val manifest: Manifest,
         val environment: String,
         val name: String,
+        val confirmUnmanaged: Boolean = false,
     ) : EnclaveRequest {
         override fun toJson(): JsonObj = JsonObj(
             linkedMapOf(
@@ -524,6 +574,7 @@ sealed interface EnclaveRequest {
                 "manifest" to manifest.toJson(),
                 "environment" to JsonStr(environment),
                 "name" to JsonStr(name),
+                "confirm_unmanaged" to JsonBool(confirmUnmanaged),
             ),
         )
     }
@@ -579,28 +630,31 @@ sealed interface EnclaveRequest {
 sealed interface HostCommand {
     fun toJson(): JsonObj
 
-    data class Enclave(val request: EnclaveRequest) : HostCommand {
+    data object NoiseTunnel : HostCommand {
         override fun toJson(): JsonObj = JsonObj(
-            linkedMapOf(
-                "host_op" to JsonStr("enclave"),
-                "request" to request.toJson(),
-            ),
+            linkedMapOf("host_op" to JsonStr("noise-tunnel")),
         )
     }
 
-    data class ArmedCapture(
-        val manifestPath: String,
-        val environment: String,
-        val target: CaptureTarget,
-    ) : HostCommand {
+    data object Status : HostCommand {
         override fun toJson(): JsonObj = JsonObj(
-            linkedMapOf(
-                "host_op" to JsonStr("armed-capture"),
-                "manifest_path" to JsonStr(manifestPath),
-                "environment" to JsonStr(environment),
-                "target" to target.toJson(),
-            ),
+            linkedMapOf("host_op" to JsonStr("status")),
         )
+    }
+
+    data class CaptureAndSeal(
+        val pkCaptureB64: String,
+        val ttlMs: Long? = null,
+    ) : HostCommand {
+        override fun toJson(): JsonObj {
+            val m = LinkedHashMap<String, JsonValue>()
+            m["host_op"] = JsonStr("capture-and-seal")
+            m["pk_capture_b64"] = JsonStr(pkCaptureB64)
+            if (ttlMs != null) {
+                m["ttl_ms"] = JsonNum(ttlMs)
+            }
+            return JsonObj(m)
+        }
     }
 
     data class ManifestLoad(val manifestPath: String) : HostCommand {
@@ -922,6 +976,11 @@ sealed interface EnclaveResult {
     data class VaultCreated(val vault: VaultSummary) : EnclaveResult
     data class Items(val items: List<ItemSummary>) : EnclaveResult
     data class Fields(val itemFields: ItemFieldsResponse) : EnclaveResult
+    data class CaptureStarted(
+        val captureId: String,
+        val pkCaptureB64: String,
+        val expiresInMs: Long,
+    ) : EnclaveResult
     data class SecretStored(val receipt: SecretMutationReceipt) : EnclaveResult
     data class ItemUpdated(val id: String, val title: String) : EnclaveResult
     data class ItemArchived(val archived: String) : EnclaveResult
@@ -967,6 +1026,11 @@ sealed interface EnclaveResult {
                 },
             )
             "fields" -> Fields(ItemFieldsResponse.fromJson(obj))
+            "capture-started" -> CaptureStarted(
+                captureId = obj.reqStr("capture_id"),
+                pkCaptureB64 = obj.reqStr("pk_capture_b64"),
+                expiresInMs = obj.reqLong("expires_in_ms"),
+            )
             "secret-stored" -> SecretStored(SecretMutationReceipt.fromJson(obj))
             "item-updated" -> ItemUpdated(id = obj.reqStr("id"), title = obj.reqStr("title"))
             "item-archived" -> ItemArchived(archived = obj.reqStr("archived"))
@@ -1002,6 +1066,14 @@ data class EnclaveResponse(
     val result: EnclaveResult?,
     val error: SanitizedError?,
 ) {
+    fun requireResult(): EnclaveResult {
+        if (!ok) {
+            val err = error ?: SanitizedError("unknown", "Enclave request failed")
+            throw EnclaveBridgeException.fromSanitized(err)
+        }
+        return result ?: throw EnclaveBridgeException("transport_failure", "Missing enclave result")
+    }
+
     companion object {
         fun fromJson(obj: JsonObj): EnclaveResponse = EnclaveResponse(
             ok = obj.reqBool("ok"),
@@ -1013,21 +1085,28 @@ data class EnclaveResponse(
 
 data class HostResponse(
     val ok: Boolean,
-    val enclave: EnclaveResponse?,
+    val enclavePubkeyHex: String?,
+    val sealedSecretB64: String?,
+    val interceptMode: CaptureInterceptMode?,
     val manifest: Manifest?,
     val error: SanitizedError?,
 ) {
-    fun requireEnclaveResult(): EnclaveResult {
+    fun requireTunnelEnclavePubkeyHex(): String {
         if (!ok) {
-            val err = error ?: enclave?.error ?: SanitizedError("unknown", "Host bridge command failed")
+            val err = error ?: SanitizedError("transport_failure", "Host Noise tunnel handshake failed")
             throw EnclaveBridgeException.fromSanitized(err)
         }
-        val enc = enclave ?: throw EnclaveBridgeException("transport_failure", "Missing enclave payload")
-        if (!enc.ok) {
-            val err = enc.error ?: SanitizedError("unknown", "Enclave request failed")
+        return enclavePubkeyHex ?: throw EnclaveBridgeException("transport_failure", "Missing enclave_pubkey_hex")
+    }
+
+    fun requireSealedCapture(): Pair<String, CaptureInterceptMode> {
+        if (!ok) {
+            val err = error ?: SanitizedError("capture_unavailable", "Host armed capture failed")
             throw EnclaveBridgeException.fromSanitized(err)
         }
-        return enc.result ?: throw EnclaveBridgeException("transport_failure", "Missing enclave result")
+        val ct = sealedSecretB64 ?: throw EnclaveBridgeException("transport_failure", "Missing sealed_secret_b64")
+        val mode = interceptMode ?: throw EnclaveBridgeException("transport_failure", "Missing intercept_mode")
+        return ct to mode
     }
 
     fun requireManifest(): Manifest {
@@ -1041,7 +1120,9 @@ data class HostResponse(
     companion object {
         fun fromJson(obj: JsonObj): HostResponse = HostResponse(
             ok = obj.reqBool("ok"),
-            enclave = obj.obj("enclave")?.let(EnclaveResponse::fromJson),
+            enclavePubkeyHex = obj.str("enclave_pubkey_hex"),
+            sealedSecretB64 = obj.str("sealed_secret_b64"),
+            interceptMode = obj.str("intercept_mode")?.let(CaptureInterceptMode::fromWire),
             manifest = obj.obj("manifest")?.let(Manifest::fromJson),
             error = obj.obj("error")?.let(SanitizedError::fromJson),
         )

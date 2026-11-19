@@ -1,11 +1,13 @@
 package me.vespoli.secretbridge
 
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
@@ -65,11 +67,12 @@ class SecretsToolWindowFactory : ToolWindowFactory, DumbAware {
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
         val panel = SecretsToolWindowPanel(project)
         val content = ContentFactory.getInstance().createContent(panel, "", false)
+        Disposer.register(content, panel)
         toolWindow.contentManager.addContent(content)
     }
 }
 
-class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout()) {
+class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout()), Disposable {
     private val envCombo = ComboBox<String>()
     private val statusBanner = JBLabel("Click Refresh to load secretbridge.json and query enclave.")
     private val captureCountdownLabel = JBLabel("")
@@ -177,7 +180,7 @@ class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout
 
         val syncActionRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply {
             add(JButton("Mark Absent").apply { addActionListener { markSelectedBindingAbsent() } })
-            add(JButton("Adopt AWS").apply { addActionListener { adoptSelectedAwsSecret() } })
+            add(JButton("Adopt AWS").apply { addActionListener { adoptSelectedAwsSecret(confirmUnmanaged = false) } })
             add(JButton("Prepare GitHub").apply { addActionListener { prepareGithubTarget() } })
             add(JButton("Preview & Sync...").apply { addActionListener { previewAndApplyPlan() } })
             add(JButton("Render Template...").apply { addActionListener { promptRenderTemplate() } })
@@ -198,6 +201,10 @@ class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout
         add(mainVerticalSplitter, BorderLayout.CENTER)
     }
 
+    override fun dispose() {
+        stopCaptureCountdownBanner()
+    }
+
     private fun selectedEnvironment(): String? = envCombo.selectedItem as? String
 
     private fun updateVaultButtonState(caps: ServiceAccountCapabilities?) {
@@ -213,7 +220,7 @@ class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout
     }
 
     private fun reloadManifestAndVaultState() {
-        statusBanner.text = "Loading secretbridge.json and querying enclave..."
+        statusBanner.text = "Loading secretbridge.json and querying enclave over E2E Noise_IK..."
         EnclaveClient.runBackgroundTask(
             project = project,
             title = "Refreshing SecretBridge State",
@@ -466,6 +473,10 @@ class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout
     }
 
     private fun promptArmedCapture() {
+        val manifest = currentManifest ?: run {
+            Messages.showInfoMessage(project, "Initialize or load secretbridge.json first.", "SecretBridge")
+            return
+        }
         val env = selectedEnvironment() ?: return
         val titleField = JBTextField(itemList.selectedValue?.title ?: "")
         val secretNameField = JBTextField("EXTERNAL_API_KEY")
@@ -503,33 +514,24 @@ class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout
             title = "Armed Copy Capture (15s TTL)",
             work = {
                 val client = EnclaveClient.getInstance(project)
-                val manifestPath = client.requireManifestPath()
-                val res = client.executeHostCommandOffEdt(
-                    HostCommand.ArmedCapture(
-                        manifestPath = manifestPath,
-                        environment = env,
-                        target = target,
-                    ),
-                ).requireEnclaveResult()
-                val stored = res as? EnclaveResult.SecretStored
-                    ?: throw EnclaveBridgeException("internal_error", "Unexpected armed-capture result")
+                val receipt = client.executeArmedCaptureOffEdt(manifest, env, target)
                 if (shouldBind) {
                     client.executeHostCommandOffEdt(
                         HostCommand.ManifestBind(
-                            manifestPath = manifestPath,
+                            manifestPath = client.requireManifestPath(),
                             environment = env,
                             name = secName,
-                            ref = stored.receipt.ref,
+                            ref = receipt.ref,
                         ),
                     ).requireManifest()
                 }
-                stored.receipt
+                receipt
             },
             onSuccessEdt = { receipt ->
                 stopCaptureCountdownBanner()
                 refreshVfsManifest()
                 val badge = receipt.interceptMode?.badgeText ?: "Sealed X25519 Capture"
-                captureCountdownLabel.text = "Captured [${badge}] -> ${receipt.ref}"
+                captureCountdownLabel.text = "Captured [$badge] -> ${receipt.ref}"
                 reloadManifestAndVaultState()
             },
             onErrorEdt = { err ->
@@ -665,7 +667,7 @@ class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout
         )
     }
 
-    private fun adoptSelectedAwsSecret() {
+    private fun adoptSelectedAwsSecret(confirmUnmanaged: Boolean) {
         val manifest = currentManifest ?: return
         val env = selectedEnvironment() ?: return
         val selected = bindingsTableModel.rowAt(bindingsTable.selectedRow) ?: return
@@ -673,14 +675,32 @@ class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout
             project = project,
             title = "Adopting AWS Secret (${selected.name})",
             work = {
-                EnclaveClient.getInstance(project)
-                    .executeEnclaveOffEdt(EnclaveRequest.AdoptAws(manifest, env, selected.name))
+                EnclaveClient.getInstance(project).executeEnclaveOffEdt(
+                    EnclaveRequest.AdoptAws(
+                        manifest = manifest,
+                        environment = env,
+                        name = selected.name,
+                        confirmUnmanaged = confirmUnmanaged,
+                    ),
+                )
             },
             onSuccessEdt = { res ->
                 val msg = (res as? EnclaveResult.AwsAdopted)?.notice ?: "Adopted AWS secret ${selected.name}."
                 statusBanner.text = msg
             },
             onErrorEdt = { err ->
+                if (!confirmUnmanaged && err is EnclaveBridgeException && err.code == "conflict") {
+                    val choice = Messages.showYesNoDialog(
+                        project,
+                        "${err.message}\n\nConfirm adopting unmanaged AWS secret '${selected.name}' under SecretBridge management?",
+                        "Confirm Unmanaged AWS Secret Adoption",
+                        Messages.getWarningIcon(),
+                    )
+                    if (choice == Messages.YES) {
+                        adoptSelectedAwsSecret(confirmUnmanaged = true)
+                    }
+                    return@runBackgroundTask
+                }
                 Messages.showErrorDialog(project, err.message ?: "AWS adopt failed", "SecretBridge Error")
             },
         )

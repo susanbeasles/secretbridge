@@ -1,4 +1,5 @@
 use crate::error::EnclaveError;
+use crate::github::{PublicIpOnlyResolver, read_bounded_string};
 use crate::mem_secret::MemSecret;
 use hmac::{Hmac, Mac};
 use sb_proto::error::ErrorCode;
@@ -7,11 +8,11 @@ use sb_proto::types::AwsTarget;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::mem::DropGuard;
+use std::io::Read;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -151,11 +152,15 @@ impl Default for SigV4AwsClient {
 
 impl SigV4AwsClient {
     pub fn new(endpoint_override: Option<String>) -> Self {
-        let agent = ureq::AgentBuilder::new()
+        let mut builder = ureq::AgentBuilder::new()
+            .redirects(0)
             .timeout_connect(Duration::from_secs(15))
             .timeout_read(Duration::from_secs(30))
-            .timeout_write(Duration::from_secs(30))
-            .build();
+            .timeout_write(Duration::from_secs(30));
+        if endpoint_override.is_none() {
+            builder = builder.resolver(PublicIpOnlyResolver);
+        }
+        let agent = builder.build();
         Self {
             agent,
             endpoint_override,
@@ -222,7 +227,7 @@ impl SigV4AwsClient {
             );
         }
 
-        let auth_header = sign_aws_v4(
+        let auth_header = Zeroizing::new(sign_aws_v4(
             creds,
             "POST",
             "/",
@@ -233,7 +238,7 @@ impl SigV4AwsClient {
             &date_stamp,
             region,
             "secretsmanager",
-        )?;
+        )?);
 
         let mut req = self
             .agent
@@ -249,14 +254,13 @@ impl SigV4AwsClient {
 
         match req.send_bytes(body_bytes) {
             Ok(resp) => {
-                let text = resp.into_string().map_err(|_| {
-                    EnclaveError::new(ErrorCode::UpstreamFailure, "AWS response read failed")
-                })?;
+                let text = read_bounded_string(resp, "AWS response read failed")?;
                 Ok(Some(text))
             }
             Err(ureq::Error::Status(status, resp)) => {
-                let err_body = resp.into_string().unwrap_or_default();
-                let parsed_code = serde_json::from_str::<AwsErrorWireDto>(&err_body)
+                let mut err_buf = Vec::with_capacity(512);
+                let _ = resp.into_reader().take(65_536).read_to_end(&mut err_buf);
+                let parsed_code = serde_json::from_slice::<AwsErrorWireDto>(&err_buf)
                     .ok()
                     .and_then(|d| d.error_type)
                     .unwrap_or_default();
@@ -315,7 +319,7 @@ impl AwsClient for SigV4AwsClient {
             );
         }
 
-        let auth_header = sign_aws_v4(
+        let auth_header = Zeroizing::new(sign_aws_v4(
             creds,
             "POST",
             "/",
@@ -326,7 +330,7 @@ impl AwsClient for SigV4AwsClient {
             &date_stamp,
             region,
             "sts",
-        )?;
+        )?);
 
         let mut req = self
             .agent
@@ -343,18 +347,13 @@ impl AwsClient for SigV4AwsClient {
             req = req.set("X-Amz-Security-Token", tok.as_str()?);
         }
 
-        let resp_text = req
-            .send_bytes(body)
-            .map_err(|_| {
-                EnclaveError::new(
-                    ErrorCode::UpstreamFailure,
-                    "AWS STS GetCallerIdentity failed",
-                )
-            })?
-            .into_string()
-            .map_err(|_| {
-                EnclaveError::new(ErrorCode::UpstreamFailure, "AWS STS body read failed")
-            })?;
+        let resp = req.send_bytes(body).map_err(|_| {
+            EnclaveError::new(
+                ErrorCode::UpstreamFailure,
+                "AWS STS GetCallerIdentity failed",
+            )
+        })?;
+        let resp_text = read_bounded_string(resp, "AWS STS body read failed")?;
 
         let (account, arn) = extract_sts_account_and_arn(&resp_text).ok_or_else(|| {
             EnclaveError::new(
@@ -445,23 +444,34 @@ impl AwsClient for SigV4AwsClient {
             .iter()
             .map(|(k, v)| serde_json::json!({ "Key": k, "Value": v }))
             .collect();
-        let mut obj = serde_json::json!({
+        let mut meta_obj = serde_json::json!({
             "Name": name,
-            "SecretString": secret_str,
             "ClientRequestToken": Uuid::new_v4().to_string(),
             "Tags": wire_tags,
         });
         if let Some(kms) = &target.kms_key_id {
-            obj["KmsKeyId"] = serde_json::Value::String(kms.clone());
+            meta_obj["KmsKeyId"] = serde_json::Value::String(kms.clone());
         }
-        let body = serde_json::to_vec(&obj)
+        let meta_bytes = serde_json::to_vec(&meta_obj)
             .map_err(|_| EnclaveError::new(ErrorCode::InternalError, "json encode failed"))?;
-        let body_guard = DropGuard::new(body, |mut b| b.zeroize());
+        let prefix = meta_bytes
+            .strip_suffix(b"}")
+            .ok_or_else(|| EnclaveError::new(ErrorCode::InternalError, "unexpected json object"))?;
+        let cap = secret_str
+            .len()
+            .saturating_mul(6)
+            .saturating_add(prefix.len() + 64);
+        let locked_body = MemSecret::write_with(cap, |cur| {
+            cur.write_bytes(prefix)?;
+            cur.write_str(",\"SecretString\":")?;
+            cur.write_json_string(secret_str)?;
+            cur.write_str("}")
+        })?;
         self.call_secrets_manager(
             creds,
             target.region.as_str(),
             "secretsmanager.CreateSecret",
-            &body_guard,
+            locked_body.as_bytes(),
             false,
         )?;
         Ok(())
@@ -475,22 +485,33 @@ impl AwsClient for SigV4AwsClient {
         value: &MemSecret,
     ) -> Result<(), EnclaveError> {
         let secret_str = value.as_str()?;
-        let mut obj = serde_json::json!({
+        let mut meta_obj = serde_json::json!({
             "SecretId": secret_id,
-            "SecretString": secret_str,
             "ClientRequestToken": Uuid::new_v4().to_string(),
         });
         if let Some(kms) = &target.kms_key_id {
-            obj["KmsKeyId"] = serde_json::Value::String(kms.clone());
+            meta_obj["KmsKeyId"] = serde_json::Value::String(kms.clone());
         }
-        let body = serde_json::to_vec(&obj)
+        let meta_bytes = serde_json::to_vec(&meta_obj)
             .map_err(|_| EnclaveError::new(ErrorCode::InternalError, "json encode failed"))?;
-        let body_guard = DropGuard::new(body, |mut b| b.zeroize());
+        let prefix = meta_bytes
+            .strip_suffix(b"}")
+            .ok_or_else(|| EnclaveError::new(ErrorCode::InternalError, "unexpected json object"))?;
+        let cap = secret_str
+            .len()
+            .saturating_mul(6)
+            .saturating_add(prefix.len() + 64);
+        let locked_body = MemSecret::write_with(cap, |cur| {
+            cur.write_bytes(prefix)?;
+            cur.write_str(",\"SecretString\":")?;
+            cur.write_json_string(secret_str)?;
+            cur.write_str("}")
+        })?;
         self.call_secrets_manager(
             creds,
             target.region.as_str(),
             "secretsmanager.UpdateSecret",
-            &body_guard,
+            locked_body.as_bytes(),
             false,
         )?;
         Ok(())

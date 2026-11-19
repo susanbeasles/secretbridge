@@ -4,17 +4,21 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
-import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.io.InputStreamReader
 import java.net.StandardProtocolFamily
 import java.net.UnixDomainSocketAddress
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.SelectionKey
+import java.nio.channels.Selector
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
@@ -24,18 +28,32 @@ import java.nio.file.Paths
 import java.nio.file.attribute.PosixFilePermissions
 import java.util.ArrayDeque
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import javax.swing.SwingUtilities
 
+data class ParsedHostBanner(
+    val socketPath: Path,
+    val authTokenChars: CharArray,
+    val enclavePubkey32: ByteArray,
+)
+
 /**
- * Stateless per-call Unix domain socket client speaking newline-delimited
- * [AuthenticatedHostEnvelope] frames to `sb-host`.
+ * Unix domain socket client speaking authenticated [HostCommand] frames to `sb-host` and
+ * terminating end-to-end `Noise_IK_25519_ChaChaPoly_BLAKE2s` sessions directly with `sb-enclave`
+ * over [HostCommand.NoiseTunnel] (`C2`, `H8`).
  */
 class HostSocketTransport(
     val socketPath: Path,
-     authTokenHex: CharArray,
+    authTokenHex: CharArray,
+    private val clientPrivateKey32: ByteArray = ByteArray(0),
+    private val expectedEnclavePubkey32: ByteArray = ByteArray(0),
+    private val ioTimeoutMs: Long = DEFAULT_IO_TIMEOUT_MS,
 ) : AutoCloseable {
     private val tokenChars: CharArray = authTokenHex.copyOf()
+    private val clientPrivCopy: ByteArray = clientPrivateKey32.copyOf()
+    private val enclavePubCopy: ByteArray = expectedEnclavePubkey32.copyOf()
 
     @Synchronized
     fun execute(command: HostCommand): HostResponse {
@@ -43,15 +61,9 @@ class HostSocketTransport(
         val envelope = AuthenticatedHostEnvelope(tokenChars, command)
         val requestBytes = JsonCodec.encodeUtf8(envelope.toJson(), appendNewline = true)
         try {
-            val address = UnixDomainSocketAddress.of(socketPath)
-            SocketChannel.open(StandardProtocolFamily.UNIX).use { channel ->
-                channel.connect(address)
-                val writeBuf = ByteBuffer.wrap(requestBytes)
-                while (writeBuf.hasRemaining()) {
-                    channel.write(writeBuf)
-                }
-
-                val responseLine = readSingleUtf8Line(channel, MAX_RESPONSE_BYTES)
+            openTimedUnixChannel(socketPath, ioTimeoutMs).use { io ->
+                io.writeFully(requestBytes)
+                val responseLine = io.readUtf8Line(MAX_RESPONSE_BYTES)
                 if (responseLine.isBlank()) {
                     throw EnclaveBridgeException(
                         "transport_failure",
@@ -66,53 +78,252 @@ class HostSocketTransport(
         }
     }
 
+    /**
+     * Opens a blind [HostCommand.NoiseTunnel] through `sb-host`, verifies `enclave_pubkey_hex` in
+     * constant time, performs a fresh `Noise_IK` handshake directly with `sb-enclave`, and executes
+     * [request] with zero plaintext exposure to `sb-host` (`C2`).
+     */
+    @Synchronized
+    fun executeEnclave(request: EnclaveRequest): EnclaveResult {
+        return executeEnclaveBatch(listOf(request)).single()
+    }
+
+    @Synchronized
+    fun executeEnclaveBatch(requests: List<EnclaveRequest>): List<EnclaveResult> {
+        check(tokenChars.isNotEmpty()) { "HostSocketTransport has already been closed" }
+        require(clientPrivCopy.size == 32 && enclavePubCopy.size == 32) {
+            "HostSocketTransport requires 32-byte client Noise private key and enclave public key for E2E tunnel"
+        }
+        if (requests.isEmpty()) return emptyList()
+
+        val tunnelEnvelope = AuthenticatedHostEnvelope(tokenChars, HostCommand.NoiseTunnel)
+        val tunnelBytes = JsonCodec.encodeUtf8(tunnelEnvelope.toJson(), appendNewline = true)
+        try {
+            openTimedUnixChannel(socketPath, ioTimeoutMs).use { io ->
+                io.writeFully(tunnelBytes)
+                val readyLine = io.readUtf8Line(MAX_RESPONSE_BYTES)
+                if (readyLine.isBlank()) {
+                    throw EnclaveBridgeException(
+                        "transport_failure",
+                        "Empty tunnel handshake response from sb-host",
+                    )
+                }
+                val readyResp = HostResponse.fromJson(JsonCodec.parseObject(readyLine))
+                val reportedPubHex = readyResp.requireTunnelEnclavePubkeyHex()
+                val reportedPub32 = try {
+                    BridgeSettings.decodeHex32(reportedPubHex)
+                } catch (_: IllegalArgumentException) {
+                    throw EnclaveBridgeException("crypto_failure", "Malformed enclave_pubkey_hex in tunnel response")
+                }
+                if (!NoiseIkSession.constantTimeEquals(reportedPub32, enclavePubCopy)) {
+                    throw EnclaveBridgeException(
+                        "unauthorized",
+                        "Enclave Noise static public key mismatch on tunnel handshake",
+                    )
+                }
+
+                NoiseIkSession.connectInitiator(
+                    writeRawFrame = io::writeNoiseFrame,
+                    readRawFrame = io::readNoiseFrame,
+                    clientPrivate32 = clientPrivCopy,
+                    expectedEnclavePubkey32 = enclavePubCopy,
+                ).use { noise ->
+                    val out = ArrayList<EnclaveResult>(requests.size)
+                    for (req in requests) {
+                        val reqBytes = JsonCodec.encodeUtf8(req.toJson(), appendNewline = false)
+                        val respBytes = try {
+                            noise.sendMessage(io::writeNoiseFrame, reqBytes)
+                            noise.recvMessage(io::readNoiseFrame)
+                        } finally {
+                            reqBytes.fill(0)
+                        }
+                        val parsed = try {
+                            val respStr = String(respBytes, StandardCharsets.UTF_8)
+                            EnclaveResponse.fromJson(JsonCodec.parseObject(respStr))
+                        } finally {
+                            respBytes.fill(0)
+                        }
+                        out.add(parsed.requireResult())
+                    }
+                    return out
+                }
+            }
+        } finally {
+            tunnelBytes.fill(0)
+        }
+    }
+
     override fun close() {
         tokenChars.fill('\u0000')
+        clientPrivCopy.fill(0)
+        enclavePubCopy.fill(0)
     }
 
     companion object {
         private const val MAX_RESPONSE_BYTES = 1024 * 1024
+        private const val DEFAULT_IO_TIMEOUT_MS = 45_000L
+        private const val SELECT_SLICE_MS = 200L
+        private const val BANNER_PREFIX = "SB_HOST_READY "
 
-        fun parseReadyBanner(line: String): Pair<Path, CharArray> {
-            val trimmed = line.trim()
-            if (!trimmed.startsWith("SB_HOST_READY ")) {
-                throw EnclaveBridgeException(
-                    "transport_failure",
-                    "Unexpected sb-host startup banner",
-                )
+        /**
+         * Parses `SB_HOST_READY token=<64-hex> enckey=<64-hex> socket=<path-with-spaces>` directly
+         * from a [CharArray] so paths containing spaces parse cleanly and `token` never becomes a
+         * JVM [String] (`H8`).
+         */
+        fun parseReadyBannerChars(chars: CharArray): ParsedHostBanner {
+            var start = 0
+            var end = chars.size
+            while (start < end && chars[start].isWhitespace()) start++
+            while (end > start && chars[end - 1].isWhitespace()) end--
+
+            if (end - start <= BANNER_PREFIX.length || !regionStartsWith(chars, start, end, BANNER_PREFIX)) {
+                throw EnclaveBridgeException("transport_failure", "Unexpected sb-host startup banner")
             }
-            var socketRaw: String? = null
+            var cursor = start + BANNER_PREFIX.length
             var tokenChars: CharArray? = null
-            val parts = trimmed.removePrefix("SB_HOST_READY ").split(' ')
-            for (part in parts) {
+            var encKeyBytes: ByteArray? = null
+            var socketPathStr: String? = null
+
+            while (cursor < end) {
+                while (cursor < end && chars[cursor] == ' ') cursor++
+                if (cursor >= end) break
+
                 when {
-                    part.startsWith("socket=") -> {
-                        socketRaw = part.removePrefix("socket=").trim()
+                    regionStartsWith(chars, cursor, end, "socket=") -> {
+                        // `socket=` is emitted LAST so the remainder of the trimmed line is the full path
+                        // even when the user's home directory contains spaces!
+                        val pathStart = cursor + "socket=".length
+                        socketPathStr = String(chars, pathStart, end - pathStart).trim()
+                        cursor = end
                     }
-                    part.startsWith("token=") -> {
-                        val start = "token=".length
-                        tokenChars = CharArray(part.length - start) { idx -> part[start + idx] }
+                    regionStartsWith(chars, cursor, end, "token=") -> {
+                        val valStart = cursor + "token=".length
+                        var valEnd = valStart
+                        while (valEnd < end && chars[valEnd] != ' ') valEnd++
+                        tokenChars = chars.copyOfRange(valStart, valEnd)
+                        cursor = valEnd
+                    }
+                    regionStartsWith(chars, cursor, end, "enckey=") -> {
+                        val valStart = cursor + "enckey=".length
+                        var valEnd = valStart
+                        while (valEnd < end && chars[valEnd] != ' ') valEnd++
+                        val keyHexChars = chars.copyOfRange(valStart, valEnd)
+                        encKeyBytes = try {
+                            BridgeSettings.decodeHexChars32OrNull(keyHexChars)
+                                ?: throw EnclaveBridgeException(
+                                    "transport_failure",
+                                    "Invalid 64-hex enckey in SB_HOST_READY",
+                                )
+                        } finally {
+                            keyHexChars.fill('\u0000')
+                        }
+                        cursor = valEnd
+                    }
+                    else -> {
+                        while (cursor < end && chars[cursor] != ' ') cursor++
                     }
                 }
             }
-            val resolvedSocket = socketRaw?.takeIf { it.isNotEmpty() }
-                ?: throw EnclaveBridgeException("transport_failure", "Missing socket path in SB_HOST_READY")
-            val resolvedToken = tokenChars?.takeIf { it.size == 64 }
-                ?: throw EnclaveBridgeException("transport_failure", "Invalid 64-hex token in SB_HOST_READY")
-            return Paths.get(resolvedSocket) to resolvedToken
+
+            val resolvedSocket = socketPathStr?.takeIf { it.isNotEmpty() } ?: run {
+                tokenChars?.fill('\u0000')
+                throw EnclaveBridgeException("transport_failure", "Missing socket path in SB_HOST_READY")
+            }
+            val resolvedToken = tokenChars?.takeIf {
+                it.size == 64 && BridgeSettings.decodeHexChars32OrNull(it)?.also { b -> b.fill(0) } != null
+            } ?: run {
+                tokenChars?.fill('\u0000')
+                throw EnclaveBridgeException("transport_failure", "Invalid 64-hex token in SB_HOST_READY")
+            }
+            val resolvedEnclaveKey = encKeyBytes ?: ByteArray(32)
+            return ParsedHostBanner(Paths.get(resolvedSocket), resolvedToken, resolvedEnclaveKey)
         }
 
-        private fun readSingleUtf8Line(channel: SocketChannel, maxBytes: Int): String {
-            val out = ByteArrayOutputStream(512)
-            val single = ByteBuffer.allocate(4096)
+        fun parseReadyBanner(line: String): ParsedHostBanner {
+            val chars = line.toCharArray()
+            return try {
+                parseReadyBannerChars(chars)
+            } finally {
+                chars.fill('\u0000')
+            }
+        }
+
+        private fun regionStartsWith(chars: CharArray, offset: Int, limit: Int, prefix: String): Boolean {
+            if (offset + prefix.length > limit) return false
+            for (i in prefix.indices) {
+                if (chars[offset + i] != prefix[i]) return false
+            }
+            return true
+        }
+
+        private fun openTimedUnixChannel(socketPath: Path, timeoutMs: Long): TimedUnixChannel {
+            val channel = SocketChannel.open(StandardProtocolFamily.UNIX)
+            val selector = Selector.open()
+            var ok = false
+            try {
+                channel.configureBlocking(false)
+                val connected = channel.connect(UnixDomainSocketAddress.of(socketPath))
+                if (!connected) {
+                    val key = channel.register(selector, SelectionKey.OP_CONNECT)
+                    val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+                    while (!channel.finishConnect()) {
+                        checkIdeCanceled()
+                        val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+                        if (remainingMs <= 0L) {
+                            throw EnclaveBridgeException("transport_failure", "Timed out connecting to sb-host socket")
+                        }
+                        selector.select(minOf(SELECT_SLICE_MS, remainingMs))
+                        selector.selectedKeys().clear()
+                    }
+                    key.interestOps(0)
+                }
+                ok = true
+                return TimedUnixChannel(channel, selector, timeoutMs)
+            } finally {
+                if (!ok) {
+                    try {
+                        selector.close()
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        channel.close()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+
+        private fun checkIdeCanceled() {
+            if (ApplicationManager.getApplication() != null) {
+                ProgressManager.checkCanceled()
+            }
+        }
+    }
+
+    private class TimedUnixChannel(
+        private val channel: SocketChannel,
+        private val selector: Selector,
+        private val timeoutMs: Long,
+    ) : AutoCloseable {
+        private val readBuf = ByteBuffer.allocate(8192).apply { flip() }
+
+        fun writeFully(bytes: ByteArray) {
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+            val src = ByteBuffer.wrap(bytes)
+            while (src.hasRemaining()) {
+                checkIdeCanceled()
+                val n = channel.write(src)
+                if (n > 0) continue
+                waitReady(SelectionKey.OP_WRITE, deadline, "write")
+            }
+        }
+
+        fun readUtf8Line(maxBytes: Int): String {
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+            val out = ByteArrayOutputStream(256)
             while (true) {
-                single.clear()
-                val n = channel.read(single)
-                if (n < 0) break
-                if (n == 0) continue
-                single.flip()
-                while (single.hasRemaining()) {
-                    val b = single.get()
+                while (readBuf.hasRemaining()) {
+                    val b = readBuf.get()
                     if (b == '\n'.code.toByte()) {
                         return String(out.toByteArray(), StandardCharsets.UTF_8)
                     }
@@ -124,16 +335,100 @@ class HostSocketTransport(
                     }
                     out.write(b.toInt() and 0xFF)
                 }
+                if (!fillReadBuffer(deadline)) {
+                    break
+                }
             }
             return String(out.toByteArray(), StandardCharsets.UTF_8)
+        }
+
+        fun writeNoiseFrame(payload: ByteArray) {
+            if (payload.isEmpty() || payload.size > NoiseIkSession.MAX_WIRE_FRAME_BYTES) {
+                throw EnclaveBridgeException("transport_failure", "Invalid Noise wire frame size")
+            }
+            val framed = ByteArray(4 + payload.size)
+            try {
+                ByteBuffer.wrap(framed, 0, 4).order(ByteOrder.BIG_ENDIAN).putInt(payload.size)
+                System.arraycopy(payload, 0, framed, 4, payload.size)
+                writeFully(framed)
+            } finally {
+                framed.fill(0)
+            }
+        }
+
+        fun readNoiseFrame(): ByteArray {
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+            val hdr = readExactBytes(4, deadline)
+            val len = ByteBuffer.wrap(hdr).order(ByteOrder.BIG_ENDIAN).int
+            if (len <= 0 || len > NoiseIkSession.MAX_WIRE_FRAME_BYTES) {
+                throw EnclaveBridgeException("transport_failure", "Noise wire frame length out of bounds: $len")
+            }
+            return readExactBytes(len, deadline)
+        }
+
+        private fun readExactBytes(count: Int, deadline: Long): ByteArray {
+            val out = ByteArray(count)
+            var pos = 0
+            while (pos < count) {
+                if (readBuf.hasRemaining()) {
+                    val take = minOf(count - pos, readBuf.remaining())
+                    readBuf.get(out, pos, take)
+                    pos += take
+                    continue
+                }
+                if (!fillReadBuffer(deadline)) {
+                    throw EnclaveBridgeException("transport_failure", "Unexpected EOF reading Noise_IK frame")
+                }
+            }
+            return out
+        }
+
+        private fun fillReadBuffer(deadline: Long): Boolean {
+            readBuf.clear()
+            while (true) {
+                checkIdeCanceled()
+                val n = channel.read(readBuf)
+                if (n < 0) {
+                    readBuf.flip()
+                    return false
+                }
+                if (n > 0) {
+                    readBuf.flip()
+                    return true
+                }
+                waitReady(SelectionKey.OP_READ, deadline, "read")
+            }
+        }
+
+        private fun waitReady(ops: Int, deadline: Long, label: String) {
+            val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+            if (remainingMs <= 0L) {
+                throw EnclaveBridgeException("transport_failure", "Timed out waiting for socket $label")
+            }
+            val key = channel.keyFor(selector) ?: channel.register(selector, ops)
+            key.interestOps(ops)
+            selector.select(minOf(SELECT_SLICE_MS, remainingMs))
+            selector.selectedKeys().clear()
+            key.interestOps(0)
+        }
+
+        override fun close() {
+            try {
+                selector.close()
+            } catch (_: Exception) {
+            }
+            try {
+                channel.close()
+            } catch (_: Exception) {
+            }
         }
     }
 }
 
 @Service(Service.Level.PROJECT)
 class EnclaveClient(private val project: Project) : Disposable {
-    private val logger = Logger.getInstance(EnclaveClient::class.java)
     private val lock = Any()
+    private val projectGuestCid: Int = BridgeSettings.getInstance().allocateProjectGuestCid()
     private var managedProcess: ManagedHostProcess? = null
 
     fun manifestPathOrNull(): Path? {
@@ -152,8 +447,45 @@ class EnclaveClient(private val project: Project) : Disposable {
     }
 
     fun executeEnclaveOffEdt(request: EnclaveRequest): EnclaveResult {
-        val response = executeHostCommandOffEdt(HostCommand.Enclave(request))
-        return response.requireEnclaveResult()
+        assertOffEdt()
+        val session = ensureRunningSession()
+        return session.transport.executeEnclave(request)
+    }
+
+    /**
+     * Executes the 3-step zero-trust Armed Copy Hijack (`C2`, `H2`):
+     * 1. `BeginCapture` over E2E `Noise_IK` -> receives ephemeral `pk_capture_b64`
+     * 2. `HostCommand.CaptureAndSeal` on `sb-host` (`mlock` -> X25519 seal -> ciphertext only)
+     * 3. `CompleteCapture` over E2E `Noise_IK` -> guest enclave unseals & writes to 1Password
+     */
+    fun executeArmedCaptureOffEdt(
+        manifest: Manifest,
+        environment: String,
+        target: CaptureTarget,
+    ): SecretMutationReceipt {
+        assertOffEdt()
+        val session = ensureRunningSession()
+        val started = session.transport.executeEnclave(
+            EnclaveRequest.BeginCapture(manifest, environment, target),
+        ) as? EnclaveResult.CaptureStarted
+            ?: throw EnclaveBridgeException("internal_error", "Unexpected BeginCapture response")
+
+        val (sealedB64, mode) = session.transport.execute(
+            HostCommand.CaptureAndSeal(
+                pkCaptureB64 = started.pkCaptureB64,
+                ttlMs = started.expiresInMs,
+            ),
+        ).requireSealedCapture()
+
+        val stored = session.transport.executeEnclave(
+            EnclaveRequest.CompleteCapture(
+                captureId = started.captureId,
+                sealedSecretB64 = sealedB64,
+                mode = mode,
+            ),
+        ) as? EnclaveResult.SecretStored
+            ?: throw EnclaveBridgeException("internal_error", "Unexpected CompleteCapture response")
+        return stored.receipt
     }
 
     fun reconfigureCredentialsOffEdt() {
@@ -164,10 +496,9 @@ class EnclaveClient(private val project: Project) : Disposable {
 
     fun restartSessionOffEdt() {
         assertOffEdt()
-        synchronized(lock) {
-            stopLocked()
-            ensureRunningSession()
-        }
+        val detached = synchronized(lock) { detachLocked() }
+        teardownProcessOffEdt(detached)
+        ensureRunningSession()
     }
 
     private fun ensureRunningSession(): ManagedHostProcess {
@@ -176,15 +507,27 @@ class EnclaveClient(private val project: Project) : Disposable {
             if (existing != null && existing.process.isAlive) {
                 return existing
             }
-            stopLocked()
+            val stale = detachLocked()
+            teardownProcessOffEdt(stale)
+
+            val settings = BridgeSettings.getInstance()
+            val settingsState = settings.state
+            val (clientPriv32, clientPub32) = settings.loadOrCreateClientNoiseKeypairOffEdt()
+            val clientPubHex = BridgeSettings.encodeHexString(clientPub32)
 
             val runtimeDir = createPrivateSocketDirectory()
             val ideSock = runtimeDir.resolve("h.sock")
             val localEncSock = runtimeDir.resolve("e.sock")
-            val settingsState = BridgeSettings.getInstance().state
+
             val cliArgs = try {
-                settingsState.buildHostCliArgs(ideSock.toString(), localEncSock.toString())
+                settingsState.buildHostCliArgs(
+                    ideSocketPath = ideSock.toString(),
+                    localEnclaveSocketPath = localEncSock.toString(),
+                    authorizedClientPubkeyHex = clientPubHex,
+                    effectiveGuestCid = projectGuestCid,
+                )
             } catch (e: IllegalArgumentException) {
+                clientPriv32.fill(0)
                 cleanupRuntimeDir(runtimeDir)
                 throw EnclaveBridgeException("validation", e.message ?: "Invalid SecretBridge host settings")
             }
@@ -203,6 +546,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             val proc = try {
                 pb.start()
             } catch (e: Exception) {
+                clientPriv32.fill(0)
                 cleanupRuntimeDir(runtimeDir)
                 throw EnclaveBridgeException(
                     "transport_failure",
@@ -226,24 +570,58 @@ class EnclaveClient(private val project: Project) : Disposable {
                 start()
             }
 
-            val readyLine = readStartupLineWithTimeout(proc, STARTUP_TIMEOUT_MS)
-            if (readyLine == null) {
+            val readyChars = readStartupBannerCharsWithTimeout(proc.inputStream, STARTUP_TIMEOUT_MS)
+            if (readyChars == null) {
+                clientPriv32.fill(0)
                 proc.destroyForcibly()
                 cleanupRuntimeDir(runtimeDir)
                 val detail = stderrRing.snapshot().ifBlank { "timed out waiting for SB_HOST_READY" }
                 throw EnclaveBridgeException("transport_failure", "sb-host failed to start: $detail")
             }
 
-            val (boundSock, tokenChars) = try {
-                HostSocketTransport.parseReadyBanner(readyLine)
+            val parsedBanner = try {
+                HostSocketTransport.parseReadyBannerChars(readyChars)
             } catch (e: Exception) {
+                clientPriv32.fill(0)
                 proc.destroyForcibly()
                 cleanupRuntimeDir(runtimeDir)
                 throw e
+            } finally {
+                readyChars.fill('\u0000')
             }
 
-            val transport = HostSocketTransport(boundSock, tokenChars)
-            tokenChars.fill('\u0000')
+            // Enforce pinned enclave Noise pubkey when configured (or TOFU verify against banner key)
+            val pinnedHex = settingsState.pinnedEnclavePubkeyHex.trim()
+            if (pinnedHex.isNotEmpty()) {
+                val pinnedBytes = try {
+                    BridgeSettings.decodeHex32(pinnedHex)
+                } catch (_: IllegalArgumentException) {
+                    parsedBanner.authTokenChars.fill('\u0000')
+                    clientPriv32.fill(0)
+                    proc.destroyForcibly()
+                    cleanupRuntimeDir(runtimeDir)
+                    throw EnclaveBridgeException("validation", "Pinned enclave Noise pubkey must be 64-character hex")
+                }
+                if (!NoiseIkSession.constantTimeEquals(pinnedBytes, parsedBanner.enclavePubkey32)) {
+                    parsedBanner.authTokenChars.fill('\u0000')
+                    clientPriv32.fill(0)
+                    proc.destroyForcibly()
+                    cleanupRuntimeDir(runtimeDir)
+                    throw EnclaveBridgeException(
+                        "unauthorized",
+                        "Guest enclave Noise pubkey did not match configured pinned pubkey",
+                    )
+                }
+            }
+
+            val transport = HostSocketTransport(
+                socketPath = parsedBanner.socketPath,
+                authTokenHex = parsedBanner.authTokenChars,
+                clientPrivateKey32 = clientPriv32,
+                expectedEnclavePubkey32 = parsedBanner.enclavePubkey32,
+            )
+            parsedBanner.authTokenChars.fill('\u0000')
+            clientPriv32.fill(0)
 
             val session = ManagedHostProcess(
                 process = proc,
@@ -251,13 +629,15 @@ class EnclaveClient(private val project: Project) : Disposable {
                 runtimeDir = runtimeDir,
                 stderrThread = stderrThread,
             )
-            managedProcess = session
 
             try {
                 pushBootstrapCredentials(transport)
             } catch (e: Exception) {
-                logger.warn("Initial enclave session credential configuration failed: ${e.message}")
+                teardownProcessOffEdt(session)
+                throw e
             }
+
+            managedProcess = session
             return session
         }
     }
@@ -265,34 +645,47 @@ class EnclaveClient(private val project: Project) : Disposable {
     private fun pushBootstrapCredentials(transport: HostSocketTransport) {
         val creds = BridgeSettings.getInstance().loadBootstrapCredentialsOffEdt()
         try {
-            if (!creds.isEmpty()) {
-                transport.execute(HostCommand.Enclave(EnclaveRequest.ConfigureSession(creds)))
-            }
+            transport.executeEnclave(EnclaveRequest.ConfigureSession(creds))
         } finally {
             creds.wipe()
         }
     }
 
-    private fun stopLocked() {
-        val current = managedProcess ?: return
+    private fun detachLocked(): ManagedHostProcess? {
+        val current = managedProcess ?: return null
         managedProcess = null
         try {
             current.transport.close()
         } catch (_: Exception) {
         }
+        return current
+    }
+
+    private fun teardownProcessOffEdt(session: ManagedHostProcess?) {
+        if (session == null) return
         try {
-            current.process.destroy()
-            if (!current.process.waitFor(2, TimeUnit.SECONDS)) {
-                current.process.destroyForcibly()
+            session.transport.close()
+        } catch (_: Exception) {
+        }
+        try {
+            session.process.destroy()
+            if (!session.process.waitFor(2, TimeUnit.SECONDS)) {
+                session.process.destroyForcibly()
             }
         } catch (_: Exception) {
         }
-        cleanupRuntimeDir(current.runtimeDir)
+        cleanupRuntimeDir(session.runtimeDir)
     }
 
     override fun dispose() {
-        synchronized(lock) {
-            stopLocked()
+        val detached = synchronized(lock) { detachLocked() } ?: return
+        val app = ApplicationManager.getApplication()
+        if (app != null && SwingUtilities.isEventDispatchThread()) {
+            app.executeOnPooledThread {
+                teardownProcessOffEdt(detached)
+            }
+        } else {
+            teardownProcessOffEdt(detached)
         }
     }
 
@@ -317,7 +710,8 @@ class EnclaveClient(private val project: Project) : Disposable {
     }
 
     companion object {
-        private const val STARTUP_TIMEOUT_MS = 15_000L
+        private const val STARTUP_TIMEOUT_MS = 20_000L
+        private const val MAX_BANNER_LINE_BYTES = 4096
         private val ALLOWED_HOST_ENV_KEYS = listOf(
             "PATH",
             "HOME",
@@ -351,6 +745,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             onErrorEdt: (Throwable) -> Unit,
         ) {
             ProgressManager.getInstance().run(object : Task.Backgroundable(project, title, true) {
+                @Volatile
                 private var computedResult: T? = null
 
                 override fun run(indicator: ProgressIndicator) {
@@ -364,6 +759,7 @@ class EnclaveClient(private val project: Project) : Disposable {
                 }
 
                 override fun onThrowable(error: Throwable) {
+                    if (error is ProcessCanceledException) return
                     onErrorEdt(error)
                 }
             })
@@ -404,20 +800,57 @@ class EnclaveClient(private val project: Project) : Disposable {
             }
         }
 
-        private fun readStartupLineWithTimeout(proc: Process, timeoutMs: Long): String? {
-            var lineResult: String? = null
-            val readerThread = Thread({
+        /**
+         * Reads the `SB_HOST_READY` banner into a [CharArray] using a proper happens-before
+         * [CountDownLatch] + [AtomicReference], then continues draining [stream] in the daemon
+         * thread so `sb-host` never stalls on stdout (`H8`).
+         */
+        private fun readStartupBannerCharsWithTimeout(stream: InputStream, timeoutMs: Long): CharArray? {
+            val resultRef = AtomicReference<CharArray?>(null)
+            val latch = CountDownLatch(1)
+            Thread({
+                val lineBuf = ByteArray(MAX_BANNER_LINE_BYTES)
+                var len = 0
+                var emitted = false
+                val drainBuf = ByteArray(1024)
                 try {
-                    val reader = BufferedReader(InputStreamReader(proc.inputStream, StandardCharsets.UTF_8))
-                    lineResult = reader.readLine()
+                    while (!emitted) {
+                        val b = stream.read()
+                        if (b < 0) break
+                        if (b == '\n'.code) {
+                            val decoded = StandardCharsets.UTF_8.decode(ByteBuffer.wrap(lineBuf, 0, len))
+                            val chars = CharArray(decoded.remaining())
+                            decoded.get(chars)
+                            if (decoded.hasArray()) decoded.array().fill('\u0000')
+                            resultRef.set(chars)
+                            emitted = true
+                            break
+                        }
+                        if (len < MAX_BANNER_LINE_BYTES) {
+                            lineBuf[len++] = b.toByte()
+                        }
+                    }
                 } catch (_: Exception) {
+                } finally {
+                    lineBuf.fill(0)
+                    latch.countDown()
+                }
+                try {
+                    while (stream.read(drainBuf) >= 0) {
+                        // Drain subsequent stdout bytes to prevent pipe deadlock
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    drainBuf.fill(0)
                 }
             }, "sb-host-ready-reader").apply {
                 isDaemon = true
                 start()
             }
-            readerThread.join(timeoutMs)
-            return lineResult
+            if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                return null
+            }
+            return resultRef.getAndSet(null)
         }
     }
 }

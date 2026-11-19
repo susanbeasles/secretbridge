@@ -31,29 +31,28 @@ pub fn escape_dotenv_double_quoted(raw: &str) -> String {
     out
 }
 
-/// Escapes a string literal for Terraform HCL2, neutralizing `\` / `"` and `${` / `%{` directives.
-fn escape_hcl_string(raw: &str) -> String {
+/// Escapes a string literal for Terraform HCL2, neutralizing `\` / `"` and `${` / `%{` directives
+/// while preserving multi-byte UTF-8 characters intact (`M2`).
+pub fn escape_hcl_string(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 2);
     out.push('"');
-    let bytes = raw.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => out.push_str("\\\\"),
-            b'"' => out.push_str("\\\""),
-            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => {
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' if chars.peek() == Some(&'{') => {
+                let _ = chars.next();
                 out.push_str("$${");
-                i += 1;
             }
-            b'%' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => {
+            '%' if chars.peek() == Some(&'{') => {
+                let _ = chars.next();
                 out.push_str("%%{");
-                i += 1;
             }
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b => out.push(char::from(b)),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
         }
-        i += 1;
     }
     out.push('"');
     out
@@ -211,8 +210,17 @@ pub fn render_template(
                     let mut out = String::from(
                         "# Metadata only: fetching secret values with Terraform would put them in state.\n",
                     );
+                    let mut seen_idents = std::collections::BTreeSet::new();
                     for (name, resource) in aws_entries {
                         let tf_ident = name.as_str().to_ascii_lowercase();
+                        if !seen_idents.insert(tf_ident.clone()) {
+                            return Err(EnclaveError::new(
+                                ErrorCode::Validation,
+                                format!(
+                                    "case-insensitive Terraform identifier collision on '{tf_ident}'"
+                                ),
+                            ));
+                        }
                         out.push_str("data \"aws_secretsmanager_secret\" \"");
                         out.push_str(&tf_ident);
                         out.push_str("\" {\n  name = ");
@@ -225,8 +233,17 @@ pub fn render_template(
                     let mut out = String::from(
                         "import { Secret } from 'aws-cdk-lib/aws-secretsmanager';\n\n// Inside your stack constructor. Give runtime roles read access as needed.\n",
                     );
+                    let mut seen_idents = std::collections::BTreeSet::new();
                     for (name, resource) in aws_entries {
                         let ts_ident = name.as_str().to_ascii_lowercase();
+                        if !seen_idents.insert(ts_ident.clone()) {
+                            return Err(EnclaveError::new(
+                                ErrorCode::Validation,
+                                format!(
+                                    "case-insensitive CDK identifier collision on 'secret_{ts_ident}'"
+                                ),
+                            ));
+                        }
                         out.push_str("const secret_");
                         out.push_str(&ts_ident);
                         out.push_str(" = Secret.fromSecretNameV2(this, ");

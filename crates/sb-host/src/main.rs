@@ -4,19 +4,31 @@ use sb_host::HostBridge;
 use sb_host::capture::NativeOsCaptureProvider;
 use sb_host::manifest_io::HostError;
 use sb_host::vmm::{
-    DEFAULT_GUEST_CID, DEFAULT_VSOCK_PORT, EnclaveEndpoint, ManagedEnclaveHandle, MicroVmLaunchSpec,
+    DEFAULT_GUEST_CID, DEFAULT_VSOCK_PORT, EnclaveEndpoint, ManagedEnclaveHandle,
+    MicroVmLaunchSpec, default_vmm_binary_path,
 };
-use sb_proto::crypto::generate_noise_keypair;
 use sb_proto::error::ErrorCode;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use zeroize::{Zeroize, Zeroizing};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmBackendPreference {
+    Auto,
+    Kvm,
+    Vz,
+}
 
 enum BackendMode {
-    KvmMicroVm(MicroVmLaunchSpec),
+    NativeMicroVm {
+        backend: VmBackendPreference,
+        spec: MicroVmLaunchSpec,
+    },
     LocalEnclaveProcess {
         enclave_bin: PathBuf,
         enclave_socket: PathBuf,
+        authorized_client_pubkey: [u8; 32],
         extra_args: Vec<String>,
     },
     ExistingVsock {
@@ -48,11 +60,14 @@ fn parse_hex_32(hex_str: &str, label: &str) -> Result<[u8; 32], HostError> {
 
 fn parse_cli() -> Result<HostCli, HostError> {
     let mut ide_socket: Option<PathBuf> = None;
-    let mut vmm_binary = PathBuf::from("qemu-system-x86_64");
+    let mut backend = VmBackendPreference::Auto;
+    let mut vmm_binary = default_vmm_binary_path();
+    let mut vmm_sha256: Option<[u8; 32]> = None;
     let mut kernel_path: Option<PathBuf> = None;
     let mut kernel_sha256: Option<[u8; 32]> = None;
     let mut initramfs_path: Option<PathBuf> = None;
     let mut initramfs_sha256: Option<[u8; 32]> = None;
+    let mut authorized_client_pubkey: Option<[u8; 32]> = None;
     let mut guest_cid = DEFAULT_GUEST_CID;
     let mut vsock_port = DEFAULT_VSOCK_PORT;
     let mut memory_mib = 256u32;
@@ -69,10 +84,32 @@ fn parse_cli() -> Result<HostCli, HostError> {
                     HostError::new(ErrorCode::Validation, "missing --ide-socket path")
                 })?));
             }
+            "--backend" => {
+                let val = args.next().ok_or_else(|| {
+                    HostError::new(ErrorCode::Validation, "missing --backend value")
+                })?;
+                backend = match val.as_str() {
+                    "auto" => VmBackendPreference::Auto,
+                    "kvm" => VmBackendPreference::Kvm,
+                    "vz" => VmBackendPreference::Vz,
+                    other => {
+                        return Err(HostError::new(
+                            ErrorCode::Validation,
+                            format!("unsupported --backend '{other}'; expected auto, kvm, or vz"),
+                        ));
+                    }
+                };
+            }
             "--vmm-binary" => {
                 vmm_binary = PathBuf::from(args.next().ok_or_else(|| {
                     HostError::new(ErrorCode::Validation, "missing --vmm-binary path")
                 })?);
+            }
+            "--vmm-sha256" => {
+                let val = args.next().ok_or_else(|| {
+                    HostError::new(ErrorCode::Validation, "missing --vmm-sha256 hex")
+                })?;
+                vmm_sha256 = Some(parse_hex_32(&val, "vmm-sha256")?);
             }
             "--kernel" => {
                 kernel_path = Some(PathBuf::from(args.next().ok_or_else(|| {
@@ -95,6 +132,15 @@ fn parse_cli() -> Result<HostCli, HostError> {
                     HostError::new(ErrorCode::Validation, "missing --initramfs-sha256 hex")
                 })?;
                 initramfs_sha256 = Some(parse_hex_32(&val, "initramfs-sha256")?);
+            }
+            "--authorized-client-pubkey-hex" => {
+                let val = args.next().ok_or_else(|| {
+                    HostError::new(
+                        ErrorCode::Validation,
+                        "missing --authorized-client-pubkey-hex",
+                    )
+                })?;
+                authorized_client_pubkey = Some(parse_hex_32(&val, "authorized-client-pubkey")?);
             }
             "--guest-cid" => {
                 guest_cid = args
@@ -153,24 +199,44 @@ fn parse_cli() -> Result<HostCli, HostError> {
             "--ide-socket <path> is required for sb-host",
         )
     })?;
+    let staging_dir = ide_socket.parent().map(|p| p.join(".sb-boot-stage"));
 
     let mode = if let (Some(kp), Some(ks), Some(ip), Some(is)) =
         (kernel_path, kernel_sha256, initramfs_path, initramfs_sha256)
     {
-        BackendMode::KvmMicroVm(MicroVmLaunchSpec {
-            vmm_binary,
-            kernel_path: kp,
-            kernel_sha256: ks,
-            initramfs_path: ip,
-            initramfs_sha256: is,
-            guest_cid,
-            vsock_port,
-            memory_mib,
-        })
+        let client_pk = authorized_client_pubkey.ok_or_else(|| {
+            HostError::new(
+                ErrorCode::Validation,
+                "--authorized-client-pubkey-hex <64-hex> is required when booting a microVM",
+            )
+        })?;
+        BackendMode::NativeMicroVm {
+            backend,
+            spec: MicroVmLaunchSpec {
+                vmm_binary,
+                vmm_sha256,
+                kernel_path: kp,
+                kernel_sha256: ks,
+                initramfs_path: ip,
+                initramfs_sha256: is,
+                authorized_client_pubkey: client_pk,
+                guest_cid,
+                vsock_port,
+                memory_mib,
+                staging_dir,
+            },
+        }
     } else if let (Some(bin), Some(sock)) = (enclave_bin, enclave_socket) {
+        let client_pk = authorized_client_pubkey.ok_or_else(|| {
+            HostError::new(
+                ErrorCode::Validation,
+                "--authorized-client-pubkey-hex <64-hex> is required with --enclave-bin",
+            )
+        })?;
         BackendMode::LocalEnclaveProcess {
             enclave_bin: bin,
             enclave_socket: sock,
+            authorized_client_pubkey: client_pk,
             extra_args: enclave_extra_args,
         }
     } else if let Some(pk) = enclave_pubkey {
@@ -182,54 +248,85 @@ fn parse_cli() -> Result<HostCli, HostError> {
     } else {
         return Err(HostError::new(
             ErrorCode::Validation,
-            "specify either KVM microVM flags (--kernel/--kernel-sha256/--initramfs/--initramfs-sha256), --enclave-bin + --enclave-socket, or --enclave-pubkey-hex",
+            "specify microVM flags (--kernel/--kernel-sha256/--initramfs/--initramfs-sha256/--authorized-client-pubkey-hex), --enclave-bin + --enclave-socket + --authorized-client-pubkey-hex, or --enclave-pubkey-hex",
         ));
     };
 
     Ok(HostCli { ide_socket, mode })
 }
 
-fn run() -> Result<(), HostError> {
-    let cli = parse_cli()?;
-    let handle = match cli.mode {
-        BackendMode::KvmMicroVm(spec) => ManagedEnclaveHandle::boot_kvm_microvm(&spec)?,
+fn boot_backend(mode: BackendMode) -> Result<ManagedEnclaveHandle, HostError> {
+    match mode {
+        BackendMode::NativeMicroVm { backend, spec } => match backend {
+            VmBackendPreference::Auto => ManagedEnclaveHandle::boot_native_microvm(&spec),
+            VmBackendPreference::Kvm => ManagedEnclaveHandle::boot_kvm_microvm(&spec),
+            VmBackendPreference::Vz => {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    ManagedEnclaveHandle::boot_macos_vz_microvm(&spec)
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    let _ = spec;
+                    Err(HostError::new(
+                        ErrorCode::Validation,
+                        "--backend vz is only supported on macOS arm64",
+                    ))
+                }
+            }
+        },
         BackendMode::LocalEnclaveProcess {
             enclave_bin,
             enclave_socket,
+            authorized_client_pubkey,
             extra_args,
         } => ManagedEnclaveHandle::spawn_local_bridge_process(
             &enclave_bin,
             &enclave_socket,
+            authorized_client_pubkey,
             &extra_args,
-        )?,
+        ),
         BackendMode::ExistingVsock {
             cid,
             port,
             enclave_pubkey,
-        } => {
-            let client_kp = generate_noise_keypair()?;
-            ManagedEnclaveHandle::connect_existing(
-                EnclaveEndpoint::Vsock { cid, port },
-                client_kp,
-                enclave_pubkey,
-            )
-        }
-    };
+        } => Ok(ManagedEnclaveHandle::connect_existing(
+            EnclaveEndpoint::Vsock { cid, port },
+            enclave_pubkey,
+        )),
+    }
+}
+
+fn run() -> Result<(), HostError> {
+    let cli = parse_cli()?;
+    let handle = boot_backend(cli.mode)?;
+
+    // Bind the mode-0600 Unix listener BEFORE emitting SB_HOST_READY so the IDE can connect
+    // immediately without racing listener creation (closes H5).
+    let listener = HostBridge::bind_ide_unix_listener(&cli.ide_socket)?;
 
     let mut auth_token = [0u8; 32];
     OsRng.fill_bytes(&mut auth_token);
-    let auth_hex = hex::encode(auth_token);
+    let auth_hex = Zeroizing::new(hex::encode(auth_token));
+    let enclave_pk_hex = hex::encode(handle.enclave_pubkey());
 
-    // Emit single startup handshake line on stdout for the spawning JetBrains IDE process.
+    let bridge = Arc::new(HostBridge::new(
+        handle,
+        Arc::new(NativeOsCaptureProvider),
+        auth_token,
+    ));
+    auth_token.zeroize();
+
+    // Emit fixed-prefix startup banner with `socket=` LAST so paths containing spaces parse cleanly (H8).
     println!(
-        "SB_HOST_READY socket={} token={auth_hex}",
+        "SB_HOST_READY token={} enckey={enclave_pk_hex} socket={}",
+        auth_hex.as_str(),
         cli.ide_socket.display()
     );
     let _ = std::io::stdout().flush();
+    drop(auth_hex);
 
-    let bridge = HostBridge::new(handle, Arc::new(NativeOsCaptureProvider), auth_token);
-    zeroize::Zeroize::zeroize(&mut auth_token);
-    bridge.serve_ide_unix_socket(&cli.ide_socket)
+    bridge.serve_bound_ide_listener(listener, None)
 }
 
 fn main() {

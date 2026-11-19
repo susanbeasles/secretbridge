@@ -4,10 +4,11 @@ set -euo pipefail
 # Reproducible minimal glibc Linux microVM initramfs builder for SecretBridge.
 # Stages strictly under ./vm/out/ (gitignored) -- never touches /tmp or cache dirs.
 #
-# Required inputs:
-#   SB_ENCLAVE_BIN         Path to compiled Linux sb-enclave binary
-#   SB_OP_CORE_SO          Path to libop_uniffi_core.so (glibc-linked)
-#   SB_OP_CORE_SHA256      Expected 64-char lowercase hex SHA-256 of libop_uniffi_core.so
+# Inputs (supports both SB_* and Makefile OP_UNIFFI_* variable names):
+#   SB_OP_CORE_SO / OP_UNIFFI_LIB          Path to libop_uniffi_core.so (glibc-linked)
+#   SB_OP_CORE_SHA256 / OP_UNIFFI_SHA256   Expected 64-char lowercase hex SHA-256 of libop_uniffi_core.so
+#   SB_ENCLAVE_BIN                         Optional path to prebuilt Linux sb-enclave release binary
+#   SB_BUILD_ENCLAVE                       Set to 1 to compile sb-enclave with SB_PINNED_OP_CORE_SHA256
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -15,22 +16,17 @@ OUT_DIR="${REPO_ROOT}/vm/out"
 STAGE_DIR="${OUT_DIR}/rootfs-stage"
 
 ENCLAVE_BIN="${SB_ENCLAVE_BIN:-${REPO_ROOT}/target/release/sb-enclave}"
-OP_CORE_SO="${SB_OP_CORE_SO:-}"
-OP_CORE_SHA256="${SB_OP_CORE_SHA256:-}"
-VSOCK_PORT="${SB_VSOCK_PORT:-5190}"
-
-if [[ ! -f "${ENCLAVE_BIN}" ]]; then
-  echo "error: sb-enclave binary not found at ${ENCLAVE_BIN}" >&2
-  exit 1
-fi
+OP_CORE_SO="${SB_OP_CORE_SO:-${OP_UNIFFI_LIB:-}}"
+OP_CORE_SHA256="${SB_OP_CORE_SHA256:-${OP_UNIFFI_SHA256:-}}"
+BUILD_ENCLAVE="${SB_BUILD_ENCLAVE:-0}"
 
 if [[ -z "${OP_CORE_SO}" || ! -f "${OP_CORE_SO}" ]]; then
-  echo "error: set SB_OP_CORE_SO to a valid libop_uniffi_core.so file" >&2
+  echo "error: set SB_OP_CORE_SO (or OP_UNIFFI_LIB) to a valid libop_uniffi_core.so file" >&2
   exit 1
 fi
 
 if [[ ! "${OP_CORE_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
-  echo "error: set SB_OP_CORE_SHA256 to the 64-char lowercase hex SHA-256 of libop_uniffi_core.so" >&2
+  echo "error: set SB_OP_CORE_SHA256 (or OP_UNIFFI_SHA256) to the 64-char lowercase hex SHA-256 of libop_uniffi_core.so" >&2
   exit 1
 fi
 
@@ -39,6 +35,93 @@ if [[ "${ACTUAL_SO_SHA256}" != "${OP_CORE_SHA256}" ]]; then
   echo "error: libop_uniffi_core.so SHA-256 mismatch (expected ${OP_CORE_SHA256}, got ${ACTUAL_SO_SHA256})" >&2
   exit 1
 fi
+
+if [[ "${BUILD_ENCLAVE}" == "1" || ! -f "${ENCLAVE_BIN}" ]]; then
+  CARGO_EXTRA_FLAGS=()
+  if [[ "${SB_CARGO_OFFLINE:-0}" == "1" ]]; then
+    CARGO_EXTRA_FLAGS+=(--offline)
+  fi
+  echo "Compiling sb-enclave (--release --locked) with SB_PINNED_OP_CORE_SHA256=${OP_CORE_SHA256}..."
+  (
+    cd "${REPO_ROOT}"
+    SB_PINNED_OP_CORE_SHA256="${OP_CORE_SHA256}" \
+      cargo build --release --locked -p sb-enclave "${CARGO_EXTRA_FLAGS[@]}"
+  )
+fi
+
+if [[ ! -f "${ENCLAVE_BIN}" ]]; then
+  echo "error: sb-enclave binary not found at ${ENCLAVE_BIN}" >&2
+  exit 1
+fi
+
+if ! command -v readelf >/dev/null 2>&1; then
+  echo "error: readelf (binutils) is required to inspect ELF dependencies safely without ldd" >&2
+  exit 1
+fi
+
+LIB_SEARCH_DIRS=(
+  /lib/x86_64-linux-gnu
+  /usr/lib/x86_64-linux-gnu
+  /lib/aarch64-linux-gnu
+  /usr/lib/aarch64-linux-gnu
+  /lib64
+  /usr/lib64
+  /lib
+  /usr/lib
+)
+
+find_host_shlib() {
+  local soname="$1"
+  local dir
+  for dir in "${LIB_SEARCH_DIRS[@]}"; do
+    if [[ -f "${dir}/${soname}" ]]; then
+      printf '%s\n' "${dir}/${soname}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+stage_host_file() {
+  local host_path="$1"
+  local mode="$2"
+  local dest="${STAGE_DIR}${host_path}"
+  mkdir -p "$(dirname "${dest}")"
+  cp -L "${host_path}" "${dest}"
+  chmod "${mode}" "${dest}"
+}
+
+# Safely resolves ELF PT_INTERP and transitive DT_NEEDED shared libraries via `readelf`
+# (never invoking `ldd` / dynamic linker execution on binary artifacts, closing H7).
+declare -A VISITED_ELFS=()
+resolve_elf_tree() {
+  local elf_path="$1"
+  if [[ -n "${VISITED_ELFS[${elf_path}]:-}" ]]; then
+    return 0
+  fi
+  VISITED_ELFS["${elf_path}"]=1
+
+  local interp
+  interp="$(readelf -lW "${elf_path}" 2>/dev/null | sed -n 's/.*\[Requesting program interpreter: \(.*\)\].*/\1/p' | head -n 1)"
+  if [[ -n "${interp}" && -f "${interp}" ]]; then
+    stage_host_file "${interp}" 0555
+  fi
+
+  local soname resolved
+  while IFS= read -r soname; do
+    [[ -z "${soname}" ]] && continue
+    if [[ "${soname}" == "libop_uniffi_core.so" ]]; then
+      continue
+    fi
+    if resolved="$(find_host_shlib "${soname}")"; then
+      stage_host_file "${resolved}" 0555
+      resolve_elf_tree "${resolved}"
+    else
+      echo "error: required glibc shared library '${soname}' (needed by ${elf_path}) not found in standard library paths" >&2
+      exit 1
+    fi
+  done < <(readelf -dW "${elf_path}" 2>/dev/null | sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p')
+}
 
 rm -rf "${STAGE_DIR}"
 mkdir -p \
@@ -51,64 +134,41 @@ mkdir -p \
   "${STAGE_DIR}/sys" \
   "${STAGE_DIR}/usr/lib"
 
-install -m 0755 "${ENCLAVE_BIN}" "${STAGE_DIR}/bin/sb-enclave"
+# Install self-contained PID-1 Rust enclave binary directly as /init (no busybox/shell in guest, H7)
+install -m 0755 "${ENCLAVE_BIN}" "${STAGE_DIR}/init"
+ln -s /init "${STAGE_DIR}/bin/sb-enclave"
 install -m 0444 "${OP_CORE_SO}" "${STAGE_DIR}/usr/lib/libop_uniffi_core.so"
+
+resolve_elf_tree "${ENCLAVE_BIN}"
+resolve_elf_tree "${OP_CORE_SO}"
+
+# Explicitly include glibc NSS DNS/files modules loaded dynamically via dlopen() for getaddrinfo()
+for nss_lib in libnss_files.so.2 libnss_dns.so.2 libresolv.so.2; do
+  if nss_path="$(find_host_shlib "${nss_lib}")"; then
+    stage_host_file "${nss_path}" 0555
+    resolve_elf_tree "${nss_path}"
+  fi
+done
+
+cat > "${STAGE_DIR}/etc/nsswitch.conf" <<'EOF'
+hosts: files dns
+EOF
+chmod 0444 "${STAGE_DIR}/etc/nsswitch.conf"
 
 if [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
   install -m 0444 /etc/ssl/certs/ca-certificates.crt "${STAGE_DIR}/etc/ssl/certs/ca-certificates.crt"
 fi
 
-# Copy minimal glibc dynamic linker and shared library dependencies required by sb-enclave and libop_uniffi_core.so
-copy_elf_deps() {
-  local bin="$1"
-  ldd "${bin}" | awk '{
-    for (i = 1; i <= NF; i++) {
-      if ($i ~ /^\//) print $i
-    }
-  }' | sort -u | while IFS= read -r lib_path; do
-    if [[ -f "${lib_path}" ]]; then
-      local dest_dir
-      dest_dir="${STAGE_DIR}$(dirname "${lib_path}")"
-      mkdir -p "${dest_dir}"
-      cp -L "${lib_path}" "${dest_dir}/$(basename "${lib_path}")"
-      chmod 0555 "${dest_dir}/$(basename "${lib_path}")"
-    fi
-  done
-}
-
-copy_elf_deps "${ENCLAVE_BIN}"
-copy_elf_deps "${OP_CORE_SO}"
-
-cat > "${STAGE_DIR}/init" <<EOF
-#!/bin/sb-enclave-init-disabled
-EOF
-
-# If busybox is installed on the build host, include minimal mount/ip applet for /init bootstrap;
-# otherwise /bin/sb-enclave runs directly when kernel mounts devtmpfs.
-if command -v busybox >/dev/null 2>&1; then
-  install -m 0755 "$(command -v busybox)" "${STAGE_DIR}/bin/busybox"
-  copy_elf_deps "$(command -v busybox)"
-  cat > "${STAGE_DIR}/init" <<EOF
-#!/bin/busybox sh
-/bin/busybox mount -t proc proc /proc
-/bin/busybox mount -t sysfs sysfs /sys
-/bin/busybox mount -t devtmpfs devtmpfs /dev
-/bin/busybox ip link set lo up || true
-/bin/busybox ip link set eth0 up || true
-/bin/busybox udhcpc -i eth0 -n -q || true
-exec /bin/sb-enclave --vsock-port ${VSOCK_PORT} --op-core-lib /usr/lib/libop_uniffi_core.so --op-core-sha256 ${OP_CORE_SHA256}
-EOF
-else
-  ln -sf /bin/sb-enclave "${STAGE_DIR}/init"
-fi
-chmod 0755 "${STAGE_DIR}/init"
-
-# Normalize mtimes for reproducible cpio archive generation
-find "${STAGE_DIR}" -maxdepth 2 -exec touch -h -d "@0" {} +
+# Normalize mtimes across all staged tree depths for deterministic cpio archive generation (H7)
+find "${STAGE_DIR}" -exec touch -h -d "@0" {} +
 mkdir -p "${OUT_DIR}"
 (
   cd "${STAGE_DIR}"
-  find . -print0 | LC_ALL=C sort -z | cpio --null --create --format=newc --owner=0:0 --quiet | gzip -n -9 > "${OUT_DIR}/initramfs.cpio.gz"
+  if cpio --help 2>&1 | grep -q -- '--reproducible'; then
+    find . -print0 | LC_ALL=C sort -z | cpio --null --create --format=newc --owner=0:0 --reproducible --quiet | gzip -n -9 > "${OUT_DIR}/initramfs.cpio.gz"
+  else
+    find . -print0 | LC_ALL=C sort -z | cpio --null --create --format=newc --owner=0:0 --quiet | gzip -n -9 > "${OUT_DIR}/initramfs.cpio.gz"
+  fi
 )
 chmod 0600 "${OUT_DIR}/initramfs.cpio.gz"
 sha256sum "${OUT_DIR}/initramfs.cpio.gz" | awk '{print $1}' > "${OUT_DIR}/initramfs.sha256"

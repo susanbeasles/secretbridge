@@ -13,6 +13,7 @@ import com.intellij.ui.components.JBTextField
 import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
+import javax.swing.DefaultListCellRenderer
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
@@ -24,15 +25,21 @@ class BridgeSettingsConfigurable : Configurable {
     private val sbHostBinaryField = JBTextField()
     private val backendModeCombo = ComboBox(HostBackendMode.entries.toTypedArray())
     private val vmmBinaryField = JBTextField()
+    private val vmmSha256Field = JBTextField()
     private val kernelPathField = JBTextField()
     private val kernelSha256Field = JBTextField()
     private val initramfsPathField = JBTextField()
     private val initramfsSha256Field = JBTextField()
-    private val guestCidSpinner = JSpinner(SpinnerNumberModel(42, 3, 65535, 1))
+    private val guestCidSpinner = JSpinner(SpinnerNumberModel(42, 3, 60000, 1))
     private val vsockPortSpinner = JSpinner(SpinnerNumberModel(5190, 1024, 65535, 1))
     private val memoryMibSpinner = JSpinner(SpinnerNumberModel(256, 128, 4096, 64))
     private val enclavePubkeyHexField = JBTextField()
+    private val pinnedEnclavePubkeyHexField = JBTextField()
     private val enclaveBinaryField = JBTextField()
+
+    private val allowedGithubHostField = JBTextField()
+    private val allowedGithubOwnersField = JBTextField()
+    private val allowedAwsAccountsField = JBTextField()
 
     private val defaultGenLengthSpinner = JSpinner(SpinnerNumberModel(40, 16, 256, 4))
     private val defaultGenCharsetCombo = ComboBox(SecretCharset.entries.toTypedArray())
@@ -53,13 +60,21 @@ class BridgeSettingsConfigurable : Configurable {
     }
 
     private var rootPanel: JPanel? = null
+    private var listenerRegistered = false
 
     override fun getDisplayName(): String = "SecretBridge for 1Password"
 
     override fun createComponent(): JComponent {
-        backendModeCombo.renderer = javax.swing.DefaultListCellRenderer().apply {
+        backendModeCombo.renderer = DefaultListCellRenderer()
+        if (!listenerRegistered) {
             backendModeCombo.addActionListener { updateModeFieldVisibility() }
+            listenerRegistered = true
         }
+        vmmSha256Field.emptyText.text = "Optional 64-hex SHA-256 of QEMU binary (Linux KVM)"
+        pinnedEnclavePubkeyHexField.emptyText.text = "Optional 64-hex pinned enclave Noise pubkey"
+        allowedGithubHostField.emptyText.text = "github.com (single authorized host)"
+        allowedGithubOwnersField.emptyText.text = "Optional comma-separated GitHub orgs/owners"
+        allowedAwsAccountsField.emptyText.text = "Optional comma-separated 12-digit AWS account IDs"
         opTokenField.emptyText.text = "Leave blank to keep existing OS Keychain token"
         githubTokenField.emptyText.text = "Leave blank to keep existing GitHub token"
         awsAccessKeyField.emptyText.text = "Optional (leave blank to keep existing)"
@@ -75,17 +90,22 @@ class BridgeSettingsConfigurable : Configurable {
             .addLabeledComponent("sb-host binary path:", sbHostBinaryField, 1, false)
             .addLabeledComponent("Enclave backend mode:", backendModeCombo, 1, false)
             .addSeparator()
-            .addLabeledComponent("VMM binary (KVM mode):", vmmBinaryField, 1, false)
+            .addLabeledComponent("VMM binary (Linux KVM):", vmmBinaryField, 1, false)
+            .addLabeledComponent("VMM binary SHA-256 (optional):", vmmSha256Field, 1, false)
             .addLabeledComponent("Guest kernel image:", kernelPathField, 1, false)
             .addLabeledComponent("Guest kernel SHA-256:", kernelSha256Field, 1, false)
             .addLabeledComponent("Guest initramfs image:", initramfsPathField, 1, false)
             .addLabeledComponent("Guest initramfs SHA-256:", initramfsSha256Field, 1, false)
-            .addLabeledComponent("Guest AF_VSOCK CID:", guestCidSpinner, 1, false)
+            .addLabeledComponent("Base AF_VSOCK CID:", guestCidSpinner, 1, false)
             .addLabeledComponent("Guest AF_VSOCK port:", vsockPortSpinner, 1, false)
             .addLabeledComponent("MicroVM RAM (MiB):", memoryMibSpinner, 1, false)
-            .addLabeledComponent("Enclave Noise pubkey (64-hex):", enclavePubkeyHexField, 1, false)
+            .addLabeledComponent("Existing enclave pubkey (64-hex):", enclavePubkeyHexField, 1, false)
+            .addLabeledComponent("Pinned enclave pubkey (64-hex):", pinnedEnclavePubkeyHexField, 1, false)
             .addLabeledComponent("Local sb-enclave binary:", enclaveBinaryField, 1, false)
             .addSeparator()
+            .addLabeledComponent("Authorized GitHub host:", allowedGithubHostField, 1, false)
+            .addLabeledComponent("Allowed GitHub owners (CSV):", allowedGithubOwnersField, 1, false)
+            .addLabeledComponent("Allowed AWS accounts (CSV):", allowedAwsAccountsField, 1, false)
             .addLabeledComponent("Default generated length:", defaultGenLengthSpinner, 1, false)
             .addLabeledComponent("Default generated charset:", defaultGenCharsetCombo, 1, false)
             .addLabeledComponent("Pinned 1Password Action SHA:", pinnedActionShaField, 1, false)
@@ -104,7 +124,7 @@ class BridgeSettingsConfigurable : Configurable {
 
         val container = JPanel(BorderLayout()).apply {
             border = JBUI.Borders.empty(8)
-            add(form, BorderLayout.CENTER)
+            add(JBScrollPane(form), BorderLayout.CENTER)
         }
         rootPanel = container
         reset()
@@ -113,19 +133,20 @@ class BridgeSettingsConfigurable : Configurable {
 
     private fun updateModeFieldVisibility() {
         val mode = backendModeCombo.selectedItem as? HostBackendMode ?: HostBackendMode.KVM_MICROVM
-        val isKvm = mode == HostBackendMode.KVM_MICROVM
+        val isManagedVm = mode == HostBackendMode.KVM_MICROVM
         val isExistingVsock = mode == HostBackendMode.EXISTING_VSOCK
         val isLocalProc = mode == HostBackendMode.LOCAL_ENCLAVE_PROCESS
 
-        vmmBinaryField.isEnabled = isKvm
-        kernelPathField.isEnabled = isKvm
-        kernelSha256Field.isEnabled = isKvm
-        initramfsPathField.isEnabled = isKvm
-        initramfsSha256Field.isEnabled = isKvm
-        memoryMibSpinner.isEnabled = isKvm
+        vmmBinaryField.isEnabled = isManagedVm
+        vmmSha256Field.isEnabled = isManagedVm
+        kernelPathField.isEnabled = isManagedVm
+        kernelSha256Field.isEnabled = isManagedVm
+        initramfsPathField.isEnabled = isManagedVm
+        initramfsSha256Field.isEnabled = isManagedVm
+        memoryMibSpinner.isEnabled = isManagedVm
 
-        guestCidSpinner.isEnabled = isKvm || isExistingVsock
-        vsockPortSpinner.isEnabled = isKvm || isExistingVsock
+        guestCidSpinner.isEnabled = isManagedVm || isExistingVsock
+        vsockPortSpinner.isEnabled = isManagedVm || isExistingVsock
         enclavePubkeyHexField.isEnabled = isExistingVsock
         enclaveBinaryField.isEnabled = isLocalProc
     }
@@ -139,6 +160,7 @@ class BridgeSettingsConfigurable : Configurable {
         if (sbHostBinaryField.text.trim() != s.sbHostBinaryPath) return true
         if (selectedMode != s.backendMode) return true
         if (vmmBinaryField.text.trim() != s.vmmBinaryPath) return true
+        if (vmmSha256Field.text.trim() != s.vmmSha256) return true
         if (kernelPathField.text.trim() != s.kernelPath) return true
         if (kernelSha256Field.text.trim() != s.kernelSha256) return true
         if (initramfsPathField.text.trim() != s.initramfsPath) return true
@@ -147,7 +169,11 @@ class BridgeSettingsConfigurable : Configurable {
         if ((vsockPortSpinner.value as Int) != s.vsockPort) return true
         if ((memoryMibSpinner.value as Int) != s.memoryMib) return true
         if (enclavePubkeyHexField.text.trim() != s.enclavePubkeyHex) return true
+        if (pinnedEnclavePubkeyHexField.text.trim() != s.pinnedEnclavePubkeyHex) return true
         if (enclaveBinaryField.text.trim() != s.enclaveBinaryPath) return true
+        if (allowedGithubHostField.text.trim() != s.allowedGithubHost) return true
+        if (allowedGithubOwnersField.text.trim() != s.allowedGithubOwnersCsv) return true
+        if (allowedAwsAccountsField.text.trim() != s.allowedAwsAccountsCsv) return true
         if ((defaultGenLengthSpinner.value as Int) != s.defaultGenerateLength) return true
         if (selectedCharset != s.defaultGenerateCharset) return true
         if (pinnedActionShaField.text.trim() != s.pinnedLoadSecretsActionSha) return true
@@ -167,12 +193,35 @@ class BridgeSettingsConfigurable : Configurable {
         return nonEmpty
     }
 
+    private fun wipeAllPasswordFields() {
+        wipePasswordField(opTokenField)
+        wipePasswordField(githubTokenField)
+        wipePasswordField(awsAccessKeyField)
+        wipePasswordField(awsSecretKeyField)
+        wipePasswordField(awsSessionTokenField)
+    }
+
+    private fun wipePasswordField(field: JBPasswordField) {
+        try {
+            val doc = field.document
+            val len = doc.length
+            if (len > 0) {
+                doc.remove(0, len)
+                doc.insertString(0, "0".repeat(len), null)
+                doc.remove(0, doc.length)
+            }
+        } catch (_: Exception) {
+        }
+        field.text = ""
+    }
+
     override fun apply() {
         val settings = BridgeSettings.getInstance()
         val s = settings.state
         s.sbHostBinaryPath = sbHostBinaryField.text.trim().ifEmpty { "sb-host" }
         s.backendMode = (backendModeCombo.selectedItem as? HostBackendMode ?: HostBackendMode.KVM_MICROVM).wireValue
         s.vmmBinaryPath = vmmBinaryField.text.trim()
+        s.vmmSha256 = vmmSha256Field.text.trim()
         s.kernelPath = kernelPathField.text.trim()
         s.kernelSha256 = kernelSha256Field.text.trim()
         s.initramfsPath = initramfsPathField.text.trim()
@@ -181,7 +230,11 @@ class BridgeSettingsConfigurable : Configurable {
         s.vsockPort = vsockPortSpinner.value as Int
         s.memoryMib = memoryMibSpinner.value as Int
         s.enclavePubkeyHex = enclavePubkeyHexField.text.trim()
-        s.enclaveBinaryPath = enclaveBinaryField.text.trim().ifEmpty { "sb-enclave" }
+        s.pinnedEnclavePubkeyHex = pinnedEnclavePubkeyHexField.text.trim()
+        s.enclaveBinaryPath = enclaveBinaryField.text.trim().ifEmpty { "/usr/local/bin/sb-enclave" }
+        s.allowedGithubHost = allowedGithubHostField.text.trim().ifEmpty { "github.com" }
+        s.allowedGithubOwnersCsv = allowedGithubOwnersField.text.trim()
+        s.allowedAwsAccountsCsv = allowedAwsAccountsField.text.trim()
         s.defaultGenerateLength = defaultGenLengthSpinner.value as Int
         s.defaultGenerateCharset =
             (defaultGenCharsetCombo.selectedItem as? SecretCharset ?: SecretCharset.ALPHANUMERIC_SYMBOLS).wireName
@@ -194,11 +247,7 @@ class BridgeSettingsConfigurable : Configurable {
         val awsSecChars = awsSecretKeyField.password
         val awsSessChars = awsSessionTokenField.password
 
-        opTokenField.text = ""
-        githubTokenField.text = ""
-        awsAccessKeyField.text = ""
-        awsSecretKeyField.text = ""
-        awsSessionTokenField.text = ""
+        wipeAllPasswordFields()
         clearStoredCredentialsCheck.isSelected = false
 
         ApplicationManager.getApplication().executeOnPooledThread {
@@ -243,6 +292,7 @@ class BridgeSettingsConfigurable : Configurable {
         sbHostBinaryField.text = s.sbHostBinaryPath
         backendModeCombo.selectedItem = HostBackendMode.fromWire(s.backendMode)
         vmmBinaryField.text = s.vmmBinaryPath
+        vmmSha256Field.text = s.vmmSha256
         kernelPathField.text = s.kernelPath
         kernelSha256Field.text = s.kernelSha256
         initramfsPathField.text = s.initramfsPath
@@ -251,16 +301,16 @@ class BridgeSettingsConfigurable : Configurable {
         vsockPortSpinner.value = s.vsockPort
         memoryMibSpinner.value = s.memoryMib
         enclavePubkeyHexField.text = s.enclavePubkeyHex
+        pinnedEnclavePubkeyHexField.text = s.pinnedEnclavePubkeyHex
         enclaveBinaryField.text = s.enclaveBinaryPath
+        allowedGithubHostField.text = s.allowedGithubHost
+        allowedGithubOwnersField.text = s.allowedGithubOwnersCsv
+        allowedAwsAccountsField.text = s.allowedAwsAccountsCsv
         defaultGenLengthSpinner.value = s.defaultGenerateLength
         defaultGenCharsetCombo.selectedItem = SecretCharset.fromWire(s.defaultGenerateCharset)
         pinnedActionShaField.text = s.pinnedLoadSecretsActionSha
 
-        opTokenField.text = ""
-        githubTokenField.text = ""
-        awsAccessKeyField.text = ""
-        awsSecretKeyField.text = ""
-        awsSessionTokenField.text = ""
+        wipeAllPasswordFields()
         clearStoredCredentialsCheck.isSelected = false
         updateModeFieldVisibility()
 
@@ -281,11 +331,14 @@ class BridgeSettingsConfigurable : Configurable {
         val hasOp = settings.hasStoredCredentialOffEdt(BridgeSettings.KEY_OP_SERVICE_ACCOUNT_TOKEN)
         val hasGh = settings.hasStoredCredentialOffEdt(BridgeSettings.KEY_GITHUB_TOKEN)
         val hasAws = settings.hasStoredCredentialOffEdt(BridgeSettings.KEY_AWS_SECRET_ACCESS_KEY)
+        val (_, pubKey) = settings.loadOrCreateClientNoiseKeypairOffEdt()
+        val pubShort = BridgeSettings.encodeHexString(pubKey).take(16)
         val summary = buildString {
-            append("OS Keychain bootstrap tokens: ")
+            append("OS Keychain tokens: ")
             append("1Password=").append(if (hasOp) "present" else "unset").append(", ")
             append("GitHub=").append(if (hasGh) "present" else "unset").append(", ")
             append("AWS=").append(if (hasAws) "present" else "unset")
+            append(" | IDE Noise pubkey: ").append(pubShort).append("...")
         }
         SwingUtilities.invokeLater {
             credentialStatusLabel.text = summary
@@ -298,7 +351,7 @@ class BridgeSettingsConfigurable : Configurable {
             diagnosticsOutput.text = "Open a project first to launch the project-scoped enclave bridge."
             return
         }
-        diagnosticsOutput.text = "Connecting to sb-host and querying enclave capabilities..."
+        diagnosticsOutput.text = "Connecting over E2E Noise_IK and querying enclave capabilities..."
         EnclaveClient.runBackgroundTask(
             project = project,
             title = "Testing SecretBridge Enclave",
@@ -333,6 +386,7 @@ class BridgeSettingsConfigurable : Configurable {
     }
 
     override fun disposeUIResources() {
+        wipeAllPasswordFields()
         rootPanel = null
     }
 }

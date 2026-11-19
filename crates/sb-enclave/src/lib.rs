@@ -10,9 +10,14 @@ pub mod vsock;
 #[cfg(test)]
 mod tests {
     use crate::aws::{InMemoryAwsClient, TAG_ENVIRONMENT, TAG_PROJECT};
-    use crate::github::InMemoryGitHubClient;
+    use crate::github::{InMemoryGitHubClient, is_public_unicast_ip};
+    use crate::mem_secret::MemSecret;
     use crate::service::EnclaveService;
-    use crate::vault::InMemoryVaultProvider;
+    use crate::templates::escape_hcl_string;
+    use crate::vault::{
+        ForeignBytes, InMemoryVaultProvider, RustBuffer, RustCallStatus, UniffiCoreVaultProvider,
+        UniffiSymbolTable, VaultProvider,
+    };
     use crate::vsock::serve_noise_connection;
     use sb_proto::crypto::{NoiseSession, generate_noise_keypair, seal_base64};
     use sb_proto::error::ErrorCode;
@@ -23,8 +28,25 @@ mod tests {
     };
     use sb_proto::types::{Manifest, OpRef, SecretName, SecretState, Slug};
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::net::IpAddr;
+    use std::sync::{Arc, Mutex};
     use std::thread;
+
+    fn dummy_op_token() -> String {
+        format!("{}_{}_{}", "dummy", "op_sa", 101)
+    }
+
+    fn dummy_gh_token() -> String {
+        format!("{}_{}_{}", "dummy", "gh_tok", 202)
+    }
+
+    fn dummy_aws_ak() -> String {
+        format!("{}{}", "TEST", "0000000000000001")
+    }
+
+    fn dummy_aws_sk() -> String {
+        format!("{}/{}/{}", "unit_test_only", "not_a_key", 303)
+    }
 
     fn sample_manifest() -> Manifest {
         Manifest::from_json_str(
@@ -79,10 +101,8 @@ mod tests {
         Arc<InMemoryAwsClient>,
         Arc<InMemoryGitHubClient>,
     ) {
-        let vault = Arc::new(InMemoryVaultProvider::new(
-            "ops_secret_token_123",
-            can_create_vaults,
-        ));
+        let op_tok = dummy_op_token();
+        let vault = Arc::new(InMemoryVaultProvider::new(&op_tok, can_create_vaults));
         vault.seed_vault("vault-dev-01", "Dev Vault", true, true);
         vault.seed_vault("vault-stg-01", "Staging Vault", true, false);
         vault.seed_item(
@@ -121,11 +141,14 @@ mod tests {
 
         let cfg_resp = svc.handle(EnclaveRequest::ConfigureSession {
             credentials: SessionCredentialsInput {
-                op_service_account_token: Some("ops_secret_token_123".into()),
-                github_token: Some("ghp_test_token_456".into()),
-                aws_access_key_id: Some("AKIAIOSFODNN7EXAMPLE".into()),
-                aws_secret_access_key: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into()),
+                op_service_account_token: Some(op_tok),
+                github_token: Some(dummy_gh_token()),
+                aws_access_key_id: Some(dummy_aws_ak()),
+                aws_secret_access_key: Some(dummy_aws_sk()),
                 aws_session_token: None,
+                allowed_github_hosts: vec!["github.com".into()],
+                allowed_github_owners: vec!["susanbeasles".into()],
+                allowed_aws_account_ids: vec!["123456789012".into()],
             },
         });
         assert!(cfg_resp.ok);
@@ -302,8 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_apply_verifies_hmac_ownership_freshness_and_reports_partial_failures_closing_s4_s6_s8()
-    {
+    fn plan_apply_verifies_hmac_ownership_freshness_replay_and_reports_partial_failures() {
         let (svc, _, aws, gh) = build_fixture(true);
         svc.set_clock_override_for_test(Some(10_000));
         let mut manifest = sample_manifest();
@@ -326,11 +348,25 @@ mod tests {
             ErrorCode::OwnershipConflict
         );
 
-        // Explicitly adopt AWS secret
+        // AdoptAws without confirm_unmanaged on untagged AWS secret must be refused (`H3`)
+        let adopt_unconfirmed = svc.handle(EnclaveRequest::AdoptAws {
+            manifest: manifest.clone(),
+            environment: dev.clone(),
+            name: "DATABASE_URL".parse::<SecretName>().unwrap(),
+            confirm_unmanaged: false,
+        });
+        assert!(!adopt_unconfirmed.ok);
+        assert_eq!(
+            adopt_unconfirmed.error.unwrap().code,
+            ErrorCode::OwnershipConflict
+        );
+
+        // Explicitly adopt AWS secret with operator confirmation (`confirm_unmanaged: true`)
         let adopt_resp = svc.handle(EnclaveRequest::AdoptAws {
             manifest: manifest.clone(),
             environment: dev.clone(),
             name: "DATABASE_URL".parse::<SecretName>().unwrap(),
+            confirm_unmanaged: true,
         });
         assert!(adopt_resp.ok);
 
@@ -357,7 +393,7 @@ mod tests {
         assert!(!forged_apply.ok);
         assert_eq!(forged_apply.error.unwrap().code, ErrorCode::StalePlan);
 
-        // Mutate manifest after plan -> rejected as StalePlan (TOCTOU closed)
+        // Mutate manifest after plan -> rejected as StalePlan WITHOUT burning signed_plan
         let mut mutated_manifest = manifest.clone();
         mutated_manifest
             .environments
@@ -374,11 +410,11 @@ mod tests {
         assert!(!stale_apply.ok);
         assert_eq!(stale_apply.error.unwrap().code, ErrorCode::StalePlan);
 
-        // Simulate partial apply failure on the second AWS secret (`API_KEY` happens before `DATABASE_URL` in BTreeMap order, so fail `DATABASE_URL`)
+        // Simulate partial apply failure on `DATABASE_URL`
         aws.set_fail_on_secret(Some("secretbridge/dev/DATABASE_URL".into()));
         let partial_resp = svc.handle(EnclaveRequest::Apply {
             manifest: manifest.clone(),
-            signed_plan,
+            signed_plan: signed_plan.clone(),
         });
         assert!(partial_resp.ok);
         let Some(EnclaveResult::Applied(report)) = partial_resp.result else {
@@ -387,6 +423,14 @@ mod tests {
         assert!(!report.complete);
         assert!(report.results.iter().any(|r| r.succeeded));
         assert!(report.results.iter().any(|r| !r.succeeded));
+
+        // Replaying `signed_plan` after execution started must fail closed (`H3` single-use consumption)
+        let replay_apply = svc.handle(EnclaveRequest::Apply {
+            manifest: manifest.clone(),
+            signed_plan,
+        });
+        assert!(!replay_apply.ok);
+        assert_eq!(replay_apply.error.unwrap().code, ErrorCode::StalePlan);
 
         // Clear failure, re-plan, and complete apply cleanly
         aws.set_fail_on_secret(None);
@@ -408,8 +452,10 @@ mod tests {
         assert!(full_report.pending.is_empty());
 
         // Verify both GitHub sealed box and AWS Secrets Manager received exact 1Password values
-        let gh_target = manifest.environments[&dev].github.as_ref().unwrap();
-        let gh_db = gh.decrypt_stored_secret(gh_target, "DATABASE_URL").unwrap();
+        let gh_target = manifest.environments[&dev].github.as_ref().unwrap().clone();
+        let gh_db = gh
+            .decrypt_stored_secret(&gh_target, "DATABASE_URL")
+            .unwrap();
         assert_eq!(&gh_db[..], b"postgres://app:supersecret@db:5432/app");
         assert!(aws.stored_value_equals(
             "secretbridge/dev/DATABASE_URL",
@@ -417,7 +463,7 @@ mod tests {
         ));
         assert!(aws.stored_value_equals("secretbridge/dev/API_KEY", b"sk_live_987654321"));
 
-        // Verify Delete action when state transitions to Absent
+        // Verify Delete action when a SecretBridge-managed secret transitions to Absent
         manifest.environments.get_mut(&dev).unwrap().secrets.insert(
             "API_KEY".parse().unwrap(),
             sb_proto::types::SecretSpec {
@@ -426,11 +472,12 @@ mod tests {
                 group: None,
                 github: true,
                 aws: true,
+                allow_unmanaged_github_delete: false,
             },
         );
         let del_plan_resp = svc.handle(EnclaveRequest::Plan {
             manifest: manifest.clone(),
-            environment: dev,
+            environment: dev.clone(),
         });
         let Some(EnclaveResult::Planned(del_plan)) = del_plan_resp.result else {
             panic!("expected delete plan");
@@ -443,11 +490,346 @@ mod tests {
                 .any(|op| op.action() == PlanAction::Delete)
         );
         let del_apply = svc.handle(EnclaveRequest::Apply {
-            manifest,
+            manifest: manifest.clone(),
             signed_plan: del_plan,
         });
         assert!(del_apply.ok);
+
+        // Verify pre-existing UNMANAGED GitHub secret deletion is refused unless allow_unmanaged_github_delete=true (`H3`)
+        let unmanaged_name: SecretName = "LEGACY_CI_TOKEN".parse().unwrap();
+        gh.seed_unmanaged_secret(&gh_target, &unmanaged_name, b"preexisting")
+            .unwrap();
+        manifest.environments.get_mut(&dev).unwrap().secrets.insert(
+            unmanaged_name.clone(),
+            sb_proto::types::SecretSpec {
+                r#ref: None,
+                state: SecretState::Absent,
+                group: None,
+                github: true,
+                aws: false,
+                allow_unmanaged_github_delete: false,
+            },
+        );
+        let refused_gh_del = svc.handle(EnclaveRequest::Plan {
+            manifest: manifest.clone(),
+            environment: dev.clone(),
+        });
+        assert!(!refused_gh_del.ok);
+        assert_eq!(
+            refused_gh_del.error.unwrap().code,
+            ErrorCode::OwnershipConflict
+        );
+
+        manifest
+            .environments
+            .get_mut(&dev)
+            .unwrap()
+            .secrets
+            .get_mut(&unmanaged_name)
+            .unwrap()
+            .allow_unmanaged_github_delete = true;
+        let allowed_gh_del = svc.handle(EnclaveRequest::Plan {
+            manifest,
+            environment: dev,
+        });
+        assert!(allowed_gh_del.ok);
         let _ = (TAG_PROJECT, TAG_ENVIRONMENT);
+    }
+
+    #[test]
+    fn enforces_ssrf_ip_filter_host_binding_and_atomic_session_replacement_closing_c1_c2_h4() {
+        // 1. PublicIpOnlyResolver filter (`C1`, `H4`)
+        for blocked in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "10.0.2.2",        // QEMU SLIRP gateway
+            "10.0.2.3",        // QEMU SLIRP DNS
+            "172.16.0.1",      // RFC1918
+            "192.168.1.1",     // RFC1918
+            "169.254.169.254", // Cloud IMDS
+            "100.64.0.1",      // CGNAT
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "::ffff:10.0.2.2", // IPv4-mapped SLIRP gateway
+            "::ffff:127.0.0.1",
+        ] {
+            let ip: IpAddr = blocked.parse().unwrap();
+            assert!(!is_public_unicast_ip(ip), "{blocked} must be blocked");
+        }
+        for public_ip in ["1.1.1.1", "140.82.112.4", "2606:4700:4700::1111"] {
+            let ip: IpAddr = public_ip.parse().unwrap();
+            assert!(is_public_unicast_ip(ip), "{public_ip} must be allowed");
+        }
+
+        // 2. Untrusted manifest pointing at `evil.example.com` or unauthorized owner/account (`C1`, `C2`)
+        let (svc, _, _, _) = build_fixture(true);
+        let dev: Slug = "dev".parse().unwrap();
+        let mut evil_host_manifest = sample_manifest();
+        evil_host_manifest
+            .environments
+            .get_mut(&dev)
+            .unwrap()
+            .github
+            .as_mut()
+            .unwrap()
+            .host = "evil.example.com".parse().unwrap();
+
+        let evil_plan = svc.handle(EnclaveRequest::Plan {
+            manifest: evil_host_manifest.clone(),
+            environment: dev.clone(),
+        });
+        assert!(!evil_plan.ok);
+        assert_eq!(evil_plan.error.unwrap().code, ErrorCode::Unauthorized);
+
+        // Doctor must report github-target:dev error without sending token to `evil.example.com`
+        let doc_resp = svc.handle(EnclaveRequest::Doctor {
+            manifest: Some(evil_host_manifest),
+        });
+        assert!(doc_resp.ok);
+        let Some(EnclaveResult::Doctor { entries }) = doc_resp.result else {
+            panic!("expected Doctor");
+        };
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.subsystem == "github-target:dev" && e.status == "error")
+        );
+
+        // 3. Atomic ConfigureSession wipes omitted tokens and invalidates prior SignedPlans (`C2`)
+        let manifest = sample_manifest();
+        let plan_before = svc.handle(EnclaveRequest::Plan {
+            manifest: manifest.clone(),
+            environment: dev,
+        });
+        let Some(EnclaveResult::Planned(old_plan)) = plan_before.result else {
+            panic!("expected plan");
+        };
+
+        // Reconfigure session omitting `op_service_account_token` -> must atomically wipe it!
+        let wipe_resp = svc.handle(EnclaveRequest::ConfigureSession {
+            credentials: SessionCredentialsInput::default(),
+        });
+        assert!(wipe_resp.ok);
+        let vaults_after_wipe = svc.handle(EnclaveRequest::Vaults);
+        assert!(!vaults_after_wipe.ok);
+        assert_eq!(
+            vaults_after_wipe.error.unwrap().code,
+            ErrorCode::Unauthorized
+        );
+
+        // Even after restoring identical credentials, `old_plan` must be rejected because `PlanSigner` rotated its HMAC key!
+        let _ = svc.handle(EnclaveRequest::ConfigureSession {
+            credentials: SessionCredentialsInput {
+                op_service_account_token: Some(dummy_op_token()),
+                github_token: Some(dummy_gh_token()),
+                aws_access_key_id: Some(dummy_aws_ak()),
+                aws_secret_access_key: Some(dummy_aws_sk()),
+                aws_session_token: None,
+                allowed_github_hosts: vec!["github.com".into()],
+                allowed_github_owners: vec!["susanbeasles".into()],
+                allowed_aws_account_ids: vec!["123456789012".into()],
+            },
+        });
+        let old_apply = svc.handle(EnclaveRequest::Apply {
+            manifest,
+            signed_plan: old_plan,
+        });
+        assert!(!old_apply.ok);
+        assert_eq!(old_apply.error.unwrap().code, ErrorCode::StalePlan);
+    }
+
+    #[test]
+    fn uniffi_rustbuffer_abi_preserves_allocations_and_splices_secrets_without_heap_strings_closing_c3()
+     {
+        static ALLOC_LEDGER: Mutex<BTreeMap<usize, (u64, u64)>> = Mutex::new(BTreeMap::new());
+        static MOCK_STORE: Mutex<Option<String>> = Mutex::new(None);
+
+        unsafe extern "C" fn test_rb_from_bytes(
+            bytes: ForeignBytes,
+            status: *mut RustCallStatus,
+        ) -> RustBuffer {
+            unsafe {
+                (*status).code = 0;
+            }
+            let len = bytes.len.max(0) as usize;
+            // Deliberately allocate extra capacity (`len + 37`) to prove `zeroize_and_free_rustbuffer`
+            // never clobbers `capacity` or `len` before calling `rustbuffer_free` (`C3`).
+            let mut vec = Vec::<u8>::with_capacity(len + 37);
+            if len > 0 && !bytes.data.is_null() {
+                let slice = unsafe { std::slice::from_raw_parts(bytes.data, len) };
+                vec.extend_from_slice(slice);
+            }
+            let cap = vec.capacity() as u64;
+            let actual_len = vec.len() as u64;
+            let ptr = vec.as_mut_ptr();
+            std::mem::forget(vec);
+            ALLOC_LEDGER
+                .lock()
+                .unwrap()
+                .insert(ptr as usize, (cap, actual_len));
+            RustBuffer {
+                capacity: cap,
+                len: actual_len,
+                data: ptr,
+            }
+        }
+
+        unsafe extern "C" fn test_rb_free(buf: RustBuffer, status: *mut RustCallStatus) {
+            unsafe {
+                (*status).code = 0;
+            }
+            if buf.data.is_null() {
+                return;
+            }
+            let (expected_cap, expected_len) = ALLOC_LEDGER
+                .lock()
+                .unwrap()
+                .remove(&(buf.data as usize))
+                .expect("double-free or unknown RustBuffer pointer");
+            assert_eq!(buf.capacity, expected_cap, "RustBuffer capacity corrupted");
+            assert_eq!(buf.len, expected_len, "RustBuffer len corrupted");
+            unsafe {
+                let _ = Vec::from_raw_parts(buf.data, buf.len as usize, buf.capacity as usize);
+            }
+        }
+
+        fn make_ret_buf(json: &str) -> RustBuffer {
+            let mut status = RustCallStatus::default();
+            let fb = ForeignBytes {
+                len: json.len() as i32,
+                data: json.as_ptr(),
+            };
+            unsafe { test_rb_from_bytes(fb, &raw mut status) }
+        }
+
+        unsafe extern "C" fn test_init_client(
+            arg: RustBuffer,
+            status: *mut RustCallStatus,
+        ) -> RustBuffer {
+            let slice = unsafe { std::slice::from_raw_parts(arg.data, arg.len as usize) };
+            let text = std::str::from_utf8(slice).unwrap();
+            assert!(text.contains("\"serviceAccountToken\":"));
+            // UniFFI callee consumes `arg` by value (`C3`).
+            let mut free_st = RustCallStatus::default();
+            unsafe {
+                test_rb_free(arg, &raw mut free_st);
+                (*status).code = 0;
+            }
+            make_ret_buf("77")
+        }
+
+        unsafe extern "C" fn test_release_client(arg: RustBuffer, status: *mut RustCallStatus) {
+            let slice = unsafe { std::slice::from_raw_parts(arg.data, arg.len as usize) };
+            let text = std::str::from_utf8(slice).unwrap();
+            assert_eq!(text, "{\"client_id\":77}");
+            let mut free_st = RustCallStatus::default();
+            unsafe {
+                test_rb_free(arg, &raw mut free_st);
+                (*status).code = 0;
+            }
+        }
+
+        unsafe extern "C" fn test_invoke_sync(
+            arg: RustBuffer,
+            status: *mut RustCallStatus,
+        ) -> RustBuffer {
+            let req_str = unsafe {
+                std::str::from_utf8(std::slice::from_raw_parts(arg.data, arg.len as usize))
+                    .unwrap()
+                    .to_owned()
+            };
+            let mut free_st = RustCallStatus::default();
+            unsafe {
+                test_rb_free(arg, &raw mut free_st);
+                (*status).code = 0;
+            }
+
+            if req_str.contains("\"VaultsList\"") {
+                return make_ret_buf(r#"[{"id":"vault-dev-01","title":"Dev"}]"#);
+            }
+            if req_str.contains("\"SecretsResolve\"") {
+                return make_ret_buf(r#""resolved_top_secret_\n_val""#);
+            }
+            if req_str.contains("\"ItemsGet\"") {
+                let current = MOCK_STORE.lock().unwrap().clone().unwrap_or_else(|| {
+                    r#"{"id":"item-1","title":"DB","vaultId":"vault-dev-01","category":"API_CREDENTIAL","tags":["secretbridge-managed"],"version":3,"fields":[{"id":"f_existing","title":"OLD_KEY","fieldType":"Concealed","value":"keep_existing_secret_untouched"}]}"#.to_string()
+                });
+                return make_ret_buf(&current);
+            }
+            if req_str.contains("\"ItemsPut\"") || req_str.contains("\"ItemsCreate\"") {
+                let v: serde_json::Value = serde_json::from_str(&req_str).unwrap();
+                let params = &v["invocation"]["parameters"];
+                let item = if params.get("item").is_some() {
+                    &params["item"]
+                } else {
+                    params
+                };
+                *MOCK_STORE.lock().unwrap() = Some(item.to_string());
+                return make_ret_buf(&item.to_string());
+            }
+            make_ret_buf("{}")
+        }
+
+        *MOCK_STORE.lock().unwrap() = None;
+        ALLOC_LEDGER.lock().unwrap().clear();
+
+        let provider = UniffiCoreVaultProvider::from_test_symbol_table(UniffiSymbolTable {
+            rustbuffer_from_bytes: test_rb_from_bytes,
+            rustbuffer_free: test_rb_free,
+            init_client: test_init_client,
+            invoke_sync: test_invoke_sync,
+            release_client: test_release_client,
+        });
+
+        let tok = MemSecret::from_slice(dummy_op_token().as_bytes()).unwrap();
+        let vaults = provider.list_vaults(&tok).unwrap();
+        assert_eq!(vaults.len(), 1);
+        assert_eq!(vaults[0].id, "vault-dev-01");
+
+        let resolved = provider
+            .resolve_ref(
+                &tok,
+                "vault-dev-01",
+                &"op://vault-dev-01/item-1/OLD_KEY".parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(resolved.as_bytes(), b"resolved_top_secret_\n_val");
+
+        // Append a new concealed field via byte-span splicing and verify the untouched field's secret survived intact!
+        let new_val = MemSecret::from_slice(b"new_spliced_secret_\"quoted\"").unwrap();
+        let receipt = provider
+            .store_secret(
+                &tok,
+                "vault-dev-01",
+                &CaptureTarget::ExistingItemNewField {
+                    item_id: "item-1".into(),
+                    field_name: "NEW_KEY".parse().unwrap(),
+                },
+                &new_val,
+                None,
+            )
+            .unwrap();
+        assert_eq!(receipt.item_id, "item-1");
+
+        let saved_json = MOCK_STORE.lock().unwrap().clone().unwrap();
+        let saved_val: serde_json::Value = serde_json::from_str(&saved_json).unwrap();
+        let fields = saved_val["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0]["value"], "keep_existing_secret_untouched");
+        assert_eq!(fields[1]["value"], "new_spliced_secret_\"quoted\"");
+
+        // Every single RustBuffer allocated across FFI must have been freed with zero leaks!
+        assert!(
+            ALLOC_LEDGER.lock().unwrap().is_empty(),
+            "leaked RustBuffers in UniFFI bridge"
+        );
+    }
+
+    #[test]
+    fn hcl_utf8_escaping_and_template_collision_checks_closing_m2() {
+        let escaped = escape_hcl_string("caf\u{00e9}/${aws_var}/%{dir}");
+        assert_eq!(escaped, "\"caf\u{00e9}/$${aws_var}/%%{dir}\"");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use sb_proto::types::{OpRef, Slug, is_safe_item_category};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::CString;
 use std::io::Read;
 use std::mem::DropGuard;
 use std::os::fd::FromRawFd;
@@ -110,15 +110,102 @@ pub trait VaultProvider: Send + Sync {
 }
 
 // =========================================================================
-// Official `libop_uniffi_core.so` C-FFI Provider (FD-pinned SHA-256 check)
+// Official `libop_uniffi_core.so` UniFFI C-FFI Provider (FD-pinned SHA-256)
 // =========================================================================
 
-type InitClientFn = unsafe extern "C" fn(*const c_char) -> *mut c_char;
-type InvokeSyncFn = unsafe extern "C" fn(*const c_char) -> *mut c_char;
-type FreeStringFn = unsafe extern "C" fn(*mut c_char);
+/// Compile-time pinned SHA-256 allowlist (comma-separated 64-hex digests) baked into `.rodata`
+/// when building release enclave images (`SB_PINNED_OP_CORE_SHA256`).
+pub const COMPILED_OP_CORE_SHA256_CSV: Option<&str> = option_env!("SB_PINNED_OP_CORE_SHA256");
+
+pub fn parse_sha256_allowlist_csv(csv: &str) -> Result<Vec<[u8; 32]>, EnclaveError> {
+    let mut out = Vec::new();
+    for item in csv.split(',') {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let raw = hex::decode(trimmed).map_err(|_| {
+            EnclaveError::new(
+                ErrorCode::Validation,
+                "invalid hex SHA-256 digest in allowlist",
+            )
+        })?;
+        let arr: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+            EnclaveError::new(ErrorCode::Validation, "SHA-256 digest must be 32 bytes")
+        })?;
+        out.push(arr);
+    }
+    Ok(out)
+}
+
+pub fn compiled_op_core_allowlist() -> Result<Vec<[u8; 32]>, EnclaveError> {
+    match COMPILED_OP_CORE_SHA256_CSV {
+        Some(csv) => parse_sha256_allowlist_csv(csv),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Mozilla UniFFI `RustBuffer` C ABI (`libop_uniffi_core.so`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RustBuffer {
+    pub capacity: u64,
+    pub len: u64,
+    pub data: *mut u8,
+}
+
+impl Default for RustBuffer {
+    fn default() -> Self {
+        Self {
+            capacity: 0,
+            len: 0,
+            data: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Mozilla UniFFI `ForeignBytes` C ABI (`libop_uniffi_core.so`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ForeignBytes {
+    pub len: i32,
+    pub data: *const u8,
+}
+
+/// Mozilla UniFFI `RustCallStatus` C ABI (`0 = CALL_SUCCESS`, `1 = CALL_ERROR`, `2 = PANIC`).
+#[repr(C)]
+#[derive(Default)]
+pub struct RustCallStatus {
+    pub code: i8,
+    pub error_buf: RustBuffer,
+}
+
+pub type RustBufferFromBytesFn =
+    unsafe extern "C" fn(ForeignBytes, *mut RustCallStatus) -> RustBuffer;
+pub type RustBufferFreeFn = unsafe extern "C" fn(RustBuffer, *mut RustCallStatus);
+pub type UniffiBufToBufFn = unsafe extern "C" fn(RustBuffer, *mut RustCallStatus) -> RustBuffer;
+pub type UniffiBufToVoidFn = unsafe extern "C" fn(RustBuffer, *mut RustCallStatus);
+
+#[derive(Clone, Copy)]
+pub struct UniffiSymbolTable {
+    pub rustbuffer_from_bytes: RustBufferFromBytesFn,
+    pub rustbuffer_free: RustBufferFreeFn,
+    pub init_client: UniffiBufToBufFn,
+    pub invoke_sync: UniffiBufToBufFn,
+    pub release_client: UniffiBufToVoidFn,
+}
+
+enum CoreFfiBackend {
+    Dynamic {
+        _lib: Library,
+        symbols: UniffiSymbolTable,
+    },
+    #[cfg(test)]
+    TestSymbols(UniffiSymbolTable),
+}
 
 pub struct UniffiCoreVaultProvider {
-    lib: Library,
+    backend: CoreFfiBackend,
     allowed_digests: Vec<[u8; 32]>,
     verified_digest: [u8; 32],
 }
@@ -156,43 +243,461 @@ struct CoreItemOverviewDto {
     version: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct CoreFieldDto {
+/// Metadata-only field DTO: `_ignored_value` skips `"value"` in-place on `MemSecret` bytes
+/// without allocating any unlocked heap `String` (`C3`).
+#[derive(Deserialize)]
+struct CoreFieldMetaOnlyDto {
     id: String,
     title: String,
+    #[serde(alias = "fieldType")]
     field_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "sectionId")]
     section_id: Option<String>,
     #[serde(default)]
-    value: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     purpose: Option<String>,
+    #[serde(default, rename = "value")]
+    _ignored_value: Option<serde::de::IgnoredAny>,
 }
 
-impl Drop for CoreFieldDto {
-    fn drop(&mut self) {
-        self.value.zeroize();
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct CoreItemDto {
+/// Metadata-only item DTO: never materializes secret field values onto the unlocked heap (`C3`).
+#[derive(Deserialize)]
+struct CoreItemMetaOnlyDto {
     id: String,
     title: String,
+    #[serde(alias = "vaultId")]
     vault_id: String,
     category: String,
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
-    fields: Vec<CoreFieldDto>,
+    fields: Vec<CoreFieldMetaOnlyDto>,
     #[serde(default)]
     version: u64,
 }
 
+/// Volatile-zeroizes the initialized slice `[0..len]` while preserving the exact `(capacity, len, data)`
+/// header so UniFFI's internal `Vec::from_raw_parts` frees the allocation without UB (`C3`).
+unsafe fn zeroize_and_free_rustbuffer(free_fn: RustBufferFreeFn, buf: RustBuffer) {
+    if !buf.data.is_null() {
+        let valid_len = buf.len.min(buf.capacity) as usize;
+        if valid_len > 0 {
+            // SAFETY: `buf.data` was allocated by UniFFI with at least `valid_len` initialized bytes.
+            let slice = unsafe { std::slice::from_raw_parts_mut(buf.data, valid_len) };
+            slice.zeroize();
+        }
+        let mut free_status = RustCallStatus::default();
+        // SAFETY: `buf` retains its exact `capacity`, `len`, and `data` allocated by UniFFI.
+        unsafe {
+            free_fn(buf, &raw mut free_status);
+        }
+    }
+}
+
+fn unescape_json_string_to_mem_secret(quoted_json: &[u8]) -> Result<MemSecret, EnclaveError> {
+    let trimmed = std::str::from_utf8(quoted_json)
+        .map_err(|_| EnclaveError::new(ErrorCode::UpstreamFailure, "invalid UTF-8 from core FFI"))?
+        .trim();
+    let inner = if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        &trimmed[1..trimmed.len() - 1]
+    } else if let Some(extracted) = extract_json_object_string_field_raw(trimmed, "ok")
+        .or_else(|| extract_json_object_string_field_raw(trimmed, "data"))
+    {
+        extracted
+    } else {
+        return Err(EnclaveError::new(
+            ErrorCode::UpstreamFailure,
+            "unexpected secret response shape from core FFI",
+        ));
+    };
+
+    MemSecret::write_with(inner.len().max(1), |cur| {
+        let bytes = inner.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'\\' {
+                cur.write_bytes(&bytes[i..i + 1])?;
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if i >= bytes.len() {
+                return Err(EnclaveError::new(
+                    ErrorCode::UpstreamFailure,
+                    "truncated JSON escape in secret response",
+                ));
+            }
+            match bytes[i] {
+                b'"' => cur.write_bytes(b"\"")?,
+                b'\\' => cur.write_bytes(b"\\")?,
+                b'/' => cur.write_bytes(b"/")?,
+                b'b' => cur.write_bytes(b"\x08")?,
+                b'f' => cur.write_bytes(b"\x0c")?,
+                b'n' => cur.write_bytes(b"\n")?,
+                b'r' => cur.write_bytes(b"\r")?,
+                b't' => cur.write_bytes(b"\t")?,
+                b'u' => {
+                    if i + 4 >= bytes.len() {
+                        return Err(EnclaveError::new(
+                            ErrorCode::UpstreamFailure,
+                            "truncated unicode escape in secret response",
+                        ));
+                    }
+                    let hi = u16::from_str_radix(&inner[i + 1..i + 5], 16).map_err(|_| {
+                        EnclaveError::new(ErrorCode::UpstreamFailure, "bad unicode escape")
+                    })?;
+                    i += 4;
+                    let code_point = if (0xD800..=0xDBFF).contains(&hi) {
+                        if i + 6 >= bytes.len() || &bytes[i + 1..i + 3] != b"\\u" {
+                            return Err(EnclaveError::new(
+                                ErrorCode::UpstreamFailure,
+                                "unpaired high surrogate in secret response",
+                            ));
+                        }
+                        let lo = u16::from_str_radix(&inner[i + 3..i + 7], 16).map_err(|_| {
+                            EnclaveError::new(ErrorCode::UpstreamFailure, "bad low surrogate")
+                        })?;
+                        if !(0xDC00..=0xDFFF).contains(&lo) {
+                            return Err(EnclaveError::new(
+                                ErrorCode::UpstreamFailure,
+                                "invalid UTF-16 surrogate pair in secret response",
+                            ));
+                        }
+                        i += 6;
+                        0x10000 + (((u32::from(hi) - 0xD800) << 10) | (u32::from(lo) - 0xDC00))
+                    } else {
+                        u32::from(hi)
+                    };
+                    let ch = char::from_u32(code_point).ok_or_else(|| {
+                        EnclaveError::new(ErrorCode::UpstreamFailure, "invalid unicode scalar")
+                    })?;
+                    let mut utf8 = [0u8; 4];
+                    let encoded = ch.encode_utf8(&mut utf8);
+                    cur.write_bytes(encoded.as_bytes())?;
+                    utf8.zeroize();
+                }
+                _ => {
+                    return Err(EnclaveError::new(
+                        ErrorCode::UpstreamFailure,
+                        "unsupported JSON escape in secret response",
+                    ));
+                }
+            }
+            i += 1;
+        }
+        Ok(())
+    })
+}
+
+/// Finds `"<target_key>": "<raw_escaped_contents>"` at top-level depth 1 without allocating.
+fn extract_json_object_string_field_raw<'a>(json: &'a str, target_key: &str) -> Option<&'a str> {
+    let b = json.as_bytes();
+    let mut i = skip_ws(b, 0);
+    if i >= b.len() || b[i] != b'{' {
+        return None;
+    }
+    i += 1;
+    let mut depth = 1usize;
+    while i < b.len() && depth > 0 {
+        i = skip_ws(b, i);
+        if i >= b.len() {
+            break;
+        }
+        match b[i] {
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'"' if depth == 1 => {
+                let (k_start, k_end, next_i) = scan_json_string_inner(b, i)?;
+                i = skip_ws(b, next_i);
+                if i < b.len() && b[i] == b':' {
+                    i = skip_ws(b, i + 1);
+                    if &json[k_start..k_end] == target_key && i < b.len() && b[i] == b'"' {
+                        let (v_start, v_end, _) = scan_json_string_inner(b, i)?;
+                        return Some(&json[v_start..v_end]);
+                    }
+                }
+            }
+            b'"' => {
+                let (_, _, next_i) = scan_json_string_inner(b, i)?;
+                i = next_i;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Scans byte ranges `(start, end)` of each `{ ... }` object inside top-level `"fields": [ ... ]`
+/// in an already `serde_json`-validated `ItemsGet` `MemSecret` buffer (`C3`).
+fn scan_top_level_fields_array_spans(json: &[u8]) -> Result<Vec<(usize, usize)>, EnclaveError> {
+    let mut i = skip_ws(json, 0);
+    if i >= json.len() || json[i] != b'{' {
+        return Err(EnclaveError::new(
+            ErrorCode::UpstreamFailure,
+            "expected JSON object for item",
+        ));
+    }
+    i += 1;
+    let mut depth = 1usize;
+    while i < json.len() && depth > 0 {
+        i = skip_ws(json, i);
+        if i >= json.len() {
+            break;
+        }
+        match json[i] {
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'"' if depth == 1 => {
+                let (k_start, k_end, after_key) =
+                    scan_json_string_inner(json, i).ok_or_else(|| {
+                        EnclaveError::new(ErrorCode::UpstreamFailure, "malformed JSON key")
+                    })?;
+                i = skip_ws(json, after_key);
+                if i < json.len() && json[i] == b':' {
+                    i = skip_ws(json, i + 1);
+                    if &json[k_start..k_end] == b"fields" {
+                        if i >= json.len() || json[i] != b'[' {
+                            return Ok(Vec::new());
+                        }
+                        i += 1;
+                        let mut spans = Vec::new();
+                        loop {
+                            i = skip_ws(json, i);
+                            if i >= json.len() {
+                                return Err(EnclaveError::new(
+                                    ErrorCode::UpstreamFailure,
+                                    "unterminated fields array",
+                                ));
+                            }
+                            if json[i] == b']' {
+                                return Ok(spans);
+                            }
+                            if json[i] == b',' {
+                                i += 1;
+                                continue;
+                            }
+                            let elem_start = i;
+                            let elem_end = scan_json_value_end(json, i)?;
+                            spans.push((elem_start, elem_end));
+                            i = elem_end;
+                        }
+                    } else {
+                        i = scan_json_value_end(json, i)?;
+                    }
+                }
+            }
+            b'"' => {
+                let (_, _, next_i) = scan_json_string_inner(json, i).ok_or_else(|| {
+                    EnclaveError::new(ErrorCode::UpstreamFailure, "malformed JSON string")
+                })?;
+                i = next_i;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    i
+}
+
+fn scan_json_string_inner(b: &[u8], quote_idx: usize) -> Option<(usize, usize, usize)> {
+    if quote_idx >= b.len() || b[quote_idx] != b'"' {
+        return None;
+    }
+    let start = quote_idx + 1;
+    let mut i = start;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return Some((start, i, i + 1)),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn scan_json_value_end(b: &[u8], start: usize) -> Result<usize, EnclaveError> {
+    let i = skip_ws(b, start);
+    if i >= b.len() {
+        return Err(EnclaveError::new(
+            ErrorCode::UpstreamFailure,
+            "unexpected EOF in JSON value",
+        ));
+    }
+    match b[i] {
+        b'"' => scan_json_string_inner(b, i)
+            .map(|(_, _, end)| end)
+            .ok_or_else(|| EnclaveError::new(ErrorCode::UpstreamFailure, "unterminated string")),
+        b'{' | b'[' => {
+            let mut depth = 1usize;
+            let mut cur = i + 1;
+            while cur < b.len() && depth > 0 {
+                match b[cur] {
+                    b'"' => {
+                        let (_, _, next) = scan_json_string_inner(b, cur).ok_or_else(|| {
+                            EnclaveError::new(ErrorCode::UpstreamFailure, "unterminated string")
+                        })?;
+                        cur = next;
+                    }
+                    b'{' | b'[' => {
+                        depth += 1;
+                        cur += 1;
+                    }
+                    b'}' | b']' => {
+                        depth -= 1;
+                        cur += 1;
+                    }
+                    _ => cur += 1,
+                }
+            }
+            if depth != 0 {
+                return Err(EnclaveError::new(
+                    ErrorCode::UpstreamFailure,
+                    "unbalanced JSON container",
+                ));
+            }
+            Ok(cur)
+        }
+        _ => {
+            let mut cur = i;
+            while cur < b.len()
+                && !matches!(b[cur], b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n')
+            {
+                cur += 1;
+            }
+            Ok(cur)
+        }
+    }
+}
+
+/// Writes an `ItemsPut` or `ItemsCreate` UniFFI invocation JSON envelope directly into `MemSecret`
+/// by splicing existing raw field JSON slices from `src_raw` (`MemSecret`) and optional new/replaced
+/// `secret` (`MemSecret`) without allocating unlocked heap `String`s (`C3`).
+#[allow(clippy::too_many_arguments)]
+fn build_item_mutation_envelope(
+    client_id: u64,
+    method_name: &str,
+    meta: &CoreItemMetaOnlyDto,
+    vault_id_override: Option<&str>,
+    src_raw_bytes: &[u8],
+    field_spans: &[(usize, usize)],
+    replace_field: Option<(&str, &MemSecret)>,
+    append_field: Option<(&str, &str, &MemSecret)>,
+    remove_field_id: Option<&str>,
+) -> Result<MemSecret, EnclaveError> {
+    if field_spans.len() != meta.fields.len() {
+        return Err(EnclaveError::new(
+            ErrorCode::UpstreamFailure,
+            "item field span count mismatch",
+        ));
+    }
+    let extra_secret_len = replace_field
+        .map(|(_, s)| s.len() * 6 + 256)
+        .unwrap_or(0)
+        .saturating_add(append_field.map(|(_, _, s)| s.len() * 6 + 256).unwrap_or(0));
+    let header_json = serde_json::json!({
+        "id": meta.id,
+        "title": meta.title,
+        "vault_id": vault_id_override.unwrap_or(&meta.vault_id),
+        "category": meta.category,
+        "tags": meta.tags,
+        "version": meta.version,
+    })
+    .to_string();
+    let cap_est = src_raw_bytes
+        .len()
+        .saturating_add(header_json.len())
+        .saturating_add(extra_secret_len)
+        .saturating_add(512);
+
+    let header_prefix = header_json
+        .strip_suffix('}')
+        .ok_or_else(|| EnclaveError::new(ErrorCode::InternalError, "invalid item header JSON"))?;
+
+    MemSecret::write_with(cap_est, |cur| {
+        cur.write_str(&format!(
+            "{{\"client_id\":{client_id},\"invocation\":{{\"name\":\"{method_name}\",\"parameters\":"
+        ))?;
+        cur.write_str(header_prefix)?;
+        cur.write_str(",\"fields\":[")?;
+
+        let mut wrote_any = false;
+        for (idx, f_meta) in meta.fields.iter().enumerate() {
+            if remove_field_id.is_some_and(|rem| rem == f_meta.id) {
+                continue;
+            }
+            if wrote_any {
+                cur.write_bytes(b",")?;
+            }
+            if let Some((target_fid, new_secret)) = replace_field
+                && f_meta.id == target_fid
+            {
+                let f_stub = serde_json::json!({
+                    "id": f_meta.id,
+                    "title": f_meta.title,
+                    "field_type": f_meta.field_type,
+                    "section_id": f_meta.section_id,
+                    "purpose": f_meta.purpose,
+                })
+                .to_string();
+                let stub_prefix = f_stub.strip_suffix('}').ok_or_else(|| {
+                    EnclaveError::new(ErrorCode::InternalError, "invalid field stub JSON")
+                })?;
+                cur.write_str(stub_prefix)?;
+                cur.write_str(",\"value\":")?;
+                cur.write_json_string(new_secret.as_str()?)?;
+                cur.write_str("}")?;
+            } else {
+                let (s, e) = field_spans[idx];
+                cur.write_bytes(&src_raw_bytes[s..e])?;
+            }
+            wrote_any = true;
+        }
+
+        if let Some((new_fid, new_title, new_secret)) = append_field {
+            if wrote_any {
+                cur.write_bytes(b",")?;
+            }
+            let f_stub = serde_json::json!({
+                "id": new_fid,
+                "title": new_title,
+                "field_type": "CONCEALED",
+            })
+            .to_string();
+            let stub_prefix = f_stub.strip_suffix('}').ok_or_else(|| {
+                EnclaveError::new(ErrorCode::InternalError, "invalid new field stub JSON")
+            })?;
+            cur.write_str(stub_prefix)?;
+            cur.write_str(",\"value\":")?;
+            cur.write_json_string(new_secret.as_str()?)?;
+            cur.write_str("}")?;
+        }
+
+        cur.write_str("]}}}")
+    })
+}
+
 impl UniffiCoreVaultProvider {
     /// Opens `so_path` with `O_RDONLY | O_CLOEXEC | O_NOFOLLOW`, verifies regular-file mode
-    /// and SHA-256 against `allowed_digests`, and loads `/proc/self/fd/{fd}` on Linux to
-    /// eliminate file-swap TOCTOU between hashing and `dlopen`.
+    /// and SHA-256 against `allowed_digests`, loads `/proc/self/fd/{fd}` on Linux to
+    /// eliminate file-swap TOCTOU between hashing and `dlopen`, and resolves Mozilla UniFFI
+    /// entrypoints (`C3`).
     pub fn load_verified(
         so_path: &Path,
         allowed_digests: Vec<[u8; 32]>,
@@ -273,11 +778,84 @@ impl UniffiCoreVaultProvider {
             )
         })?;
 
+        // Resolve and cache raw function pointers tied to `lib`'s lifetime inside `Self`.
+        // SAFETY: `lib` stays alive inside `CoreFfiBackend::Dynamic` for the entire lifetime of `Self`,
+        // and `Library::drop` only runs when `Self` is dropped.
+        let symbols = unsafe {
+            let rustbuffer_from_bytes = *lib
+                .get::<RustBufferFromBytesFn>(b"ffi_op_uniffi_core_rustbuffer_from_bytes\0")
+                .map_err(|_| {
+                    EnclaveError::new(
+                        ErrorCode::UpstreamFailure,
+                        "missing ffi_op_uniffi_core_rustbuffer_from_bytes in libop_uniffi_core.so",
+                    )
+                })?;
+            let rustbuffer_free = *lib
+                .get::<RustBufferFreeFn>(b"ffi_op_uniffi_core_rustbuffer_free\0")
+                .map_err(|_| {
+                    EnclaveError::new(
+                        ErrorCode::UpstreamFailure,
+                        "missing ffi_op_uniffi_core_rustbuffer_free in libop_uniffi_core.so",
+                    )
+                })?;
+            let init_client = *lib
+                .get::<UniffiBufToBufFn>(b"uniffi_op_uniffi_core_fn_func_init_client_blocking\0")
+                .or_else(|_| {
+                    lib.get::<UniffiBufToBufFn>(b"uniffi_op_uniffi_core_fn_func_init_client\0")
+                })
+                .map_err(|_| {
+                    EnclaveError::new(
+                        ErrorCode::UpstreamFailure,
+                        "missing uniffi_op_uniffi_core_fn_func_init_client_blocking in libop_uniffi_core.so",
+                    )
+                })?;
+            let invoke_sync = *lib
+                .get::<UniffiBufToBufFn>(b"uniffi_op_uniffi_core_fn_func_invoke_sync\0")
+                .map_err(|_| {
+                    EnclaveError::new(
+                        ErrorCode::UpstreamFailure,
+                        "missing uniffi_op_uniffi_core_fn_func_invoke_sync in libop_uniffi_core.so",
+                    )
+                })?;
+            let release_client = *lib
+                .get::<UniffiBufToVoidFn>(b"uniffi_op_uniffi_core_fn_func_release_client\0")
+                .map_err(|_| {
+                    EnclaveError::new(
+                        ErrorCode::UpstreamFailure,
+                        "missing uniffi_op_uniffi_core_fn_func_release_client in libop_uniffi_core.so",
+                    )
+                })?;
+            UniffiSymbolTable {
+                rustbuffer_from_bytes,
+                rustbuffer_free,
+                init_client,
+                invoke_sync,
+                release_client,
+            }
+        };
+
         Ok(Self {
-            lib,
+            backend: CoreFfiBackend::Dynamic { _lib: lib, symbols },
             allowed_digests,
             verified_digest: actual,
         })
+    }
+
+    #[cfg(test)]
+    pub fn from_test_symbol_table(symbols: UniffiSymbolTable) -> Self {
+        Self {
+            backend: CoreFfiBackend::TestSymbols(symbols),
+            allowed_digests: vec![[0xAA; 32]],
+            verified_digest: [0xAA; 32],
+        }
+    }
+
+    fn symbols(&self) -> &UniffiSymbolTable {
+        match &self.backend {
+            CoreFfiBackend::Dynamic { symbols, .. } => symbols,
+            #[cfg(test)]
+            CoreFfiBackend::TestSymbols(symbols) => symbols,
+        }
     }
 
     pub fn verified_digest(&self) -> &[u8; 32] {
@@ -288,12 +866,89 @@ impl UniffiCoreVaultProvider {
         self.allowed_digests.len()
     }
 
+    fn lower_bytes_to_rustbuffer(&self, payload: &[u8]) -> Result<RustBuffer, EnclaveError> {
+        let len_i32 = i32::try_from(payload.len()).map_err(|_| {
+            EnclaveError::new(ErrorCode::SizeLimitExceeded, "FFI payload exceeds i32::MAX")
+        })?;
+        let syms = self.symbols();
+        let fb = ForeignBytes {
+            len: len_i32,
+            data: payload.as_ptr(),
+        };
+        let mut status = RustCallStatus::default();
+        // SAFETY: `fb` points to `payload` valid for the synchronous `rustbuffer_from_bytes` call.
+        let rbuf = unsafe { (syms.rustbuffer_from_bytes)(fb, &raw mut status) };
+        if status.code != 0 {
+            // SAFETY: On non-zero status, `status.error_buf` belongs to caller and must be freed.
+            unsafe {
+                zeroize_and_free_rustbuffer(syms.rustbuffer_free, status.error_buf);
+            }
+            return Err(EnclaveError::new(
+                ErrorCode::InternalError,
+                "UniFFI rustbuffer_from_bytes failed",
+            ));
+        }
+        Ok(rbuf)
+    }
+
+    fn call_buf_to_mem_secret(
+        &self,
+        func: UniffiBufToBufFn,
+        arg_payload: &MemSecret,
+        err_code_on_call_error: ErrorCode,
+        err_msg: &'static str,
+    ) -> Result<MemSecret, EnclaveError> {
+        let syms = self.symbols();
+        let arg_buf = self.lower_bytes_to_rustbuffer(arg_payload.as_bytes())?;
+        let mut status = RustCallStatus::default();
+        // SAFETY: UniFFI `uniffi_*_fn_func_*` consumes `arg_buf` by value and populates `status`
+        // or returns an owned `RustBuffer` when `status.code == 0`.
+        let ret_buf = unsafe { func(arg_buf, &raw mut status) };
+        if status.code != 0 {
+            // SAFETY: Free `status.error_buf` without echoing raw upstream error text across vsock.
+            unsafe {
+                zeroize_and_free_rustbuffer(syms.rustbuffer_free, status.error_buf);
+            }
+            return Err(EnclaveError::new(err_code_on_call_error, err_msg));
+        }
+        let free_fn = syms.rustbuffer_free;
+        let ret_guard = DropGuard::new(ret_buf, |b| {
+            // SAFETY: `b` was returned with `status.code == 0` and is owned by this scope.
+            unsafe {
+                zeroize_and_free_rustbuffer(free_fn, b);
+            }
+        });
+        let valid_len = ret_guard.len.min(ret_guard.capacity) as usize;
+        let slice = if ret_guard.data.is_null() || valid_len == 0 {
+            &[][..]
+        } else {
+            // SAFETY: `ret_guard.data` has `valid_len` initialized bytes until `ret_guard` drops.
+            unsafe { std::slice::from_raw_parts(ret_guard.data, valid_len) }
+        };
+        MemSecret::from_slice(slice)
+    }
+
+    fn call_release_client(&self, client_id: u64) {
+        let syms = self.symbols();
+        let rel_json = format!("{{\"client_id\":{client_id}}}");
+        if let Ok(arg_buf) = self.lower_bytes_to_rustbuffer(rel_json.as_bytes()) {
+            let mut status = RustCallStatus::default();
+            // SAFETY: `release_client` consumes `arg_buf` and returns `()` void (`C3`).
+            unsafe {
+                (syms.release_client)(arg_buf, &raw mut status);
+                if status.code != 0 {
+                    zeroize_and_free_rustbuffer(syms.rustbuffer_free, status.error_buf);
+                }
+            }
+        }
+    }
+
     fn with_session<T, F>(&self, token: &MemSecret, f: F) -> Result<T, EnclaveError>
     where
         F: FnOnce(u64) -> Result<T, EnclaveError>,
     {
         let tok_str = token.as_str()?;
-        let mut cfg_json = serde_json::json!({
+        let cfg_prefix = serde_json::json!({
             "programmingLanguage": "Rust",
             "sdkVersion": "0.5.0",
             "integrationName": "SecretBridge Enclave",
@@ -303,28 +958,31 @@ impl UniffiCoreVaultProvider {
             "os": std::env::consts::OS,
             "osVersion": "linux-microvm",
             "architecture": std::env::consts::ARCH,
-            "serviceAccountToken": tok_str,
         })
         .to_string();
-        let cfg_guard = DropGuard::new(&mut cfg_json, |s| s.zeroize());
-        let c_cfg = CString::new(cfg_guard.as_bytes()).map_err(|_| {
-            EnclaveError::new(ErrorCode::Validation, "token contains interior NUL byte")
-        })?;
-        let c_cfg_guard = DropGuard::new(c_cfg.into_bytes_with_nul(), |mut b| b.zeroize());
+        let prefix = cfg_prefix
+            .strip_suffix('}')
+            .ok_or_else(|| EnclaveError::new(ErrorCode::InternalError, "invalid init json"))?;
 
-        let init_raw = self.call_ffi_symbol("op_core_init_client", c_cfg_guard.as_ptr().cast())?;
-        let client_id: u64 = serde_json::from_str(&init_raw).map_err(|_| {
-            EnclaveError::new(
-                ErrorCode::Unauthorized,
-                "1Password Service Account authentication failed",
-            )
+        // Build config JSON directly inside locked `MemSecret` so `tok_str` never lands in a heap `String` (`C3`).
+        let cfg_mem = MemSecret::write_with(prefix.len() + tok_str.len() * 6 + 64, |cur| {
+            cur.write_str(prefix)?;
+            cur.write_str(",\"serviceAccountToken\":")?;
+            cur.write_json_string(tok_str)?;
+            cur.write_str("}")
         })?;
+
+        let syms = self.symbols();
+        let init_resp = self.call_buf_to_mem_secret(
+            syms.init_client,
+            &cfg_mem,
+            ErrorCode::Unauthorized,
+            "1Password Service Account authentication failed",
+        )?;
+        let client_id = parse_client_id_from_mem_secret(&init_resp)?;
 
         let release_guard = DropGuard::new(client_id, |cid| {
-            let rel = serde_json::json!({ "client_id": cid }).to_string();
-            if let Ok(c_rel) = CString::new(rel) {
-                let _ = self.call_ffi_symbol("op_core_release_client", c_rel.as_ptr());
-            }
+            self.call_release_client(cid);
         });
 
         f(*release_guard)
@@ -336,7 +994,7 @@ impl UniffiCoreVaultProvider {
         name: &str,
         params: P,
     ) -> Result<MemSecret, EnclaveError> {
-        let mut raw_req = serde_json::to_string(&CoreInvokeEnvelope {
+        let req_bytes = serde_json::to_vec(&CoreInvokeEnvelope {
             client_id,
             invocation: CoreInvocation {
                 name,
@@ -344,58 +1002,42 @@ impl UniffiCoreVaultProvider {
             },
         })
         .map_err(|_| EnclaveError::new(ErrorCode::InternalError, "FFI request encode failed"))?;
-        let req_guard = DropGuard::new(&mut raw_req, |s| s.zeroize());
-        let c_req = CString::new(req_guard.as_bytes())
-            .map_err(|_| EnclaveError::new(ErrorCode::Validation, "FFI request contains NUL"))?;
-        let c_req_guard = DropGuard::new(c_req.into_bytes_with_nul(), |mut b| b.zeroize());
-
-        let mut resp_str =
-            self.call_ffi_symbol("op_core_invoke_sync", c_req_guard.as_ptr().cast())?;
-        let resp_guard = DropGuard::new(&mut resp_str, |s| s.zeroize());
-        MemSecret::from_slice(resp_guard.as_bytes())
+        let req_guard = DropGuard::new(req_bytes, |mut b| b.zeroize());
+        let req_mem = MemSecret::from_slice(&req_guard)?;
+        self.invoke_raw_envelope(&req_mem)
     }
 
-    fn call_ffi_symbol(
-        &self,
-        symbol_name: &str,
-        arg_ptr: *const c_char,
-    ) -> Result<String, EnclaveError> {
-        // SAFETY: Symbols follow 1Password SDK Core C-string JSON ABI (`fn(*const c_char) -> *mut c_char` + `op_core_free_string`).
-        unsafe {
-            let func: libloading::Symbol<'_, InvokeSyncFn> =
-                self.lib.get(symbol_name.as_bytes()).map_err(|_| {
-                    EnclaveError::new(
-                        ErrorCode::UpstreamFailure,
-                        format!("missing FFI symbol {symbol_name} in libop_uniffi_core.so"),
-                    )
-                })?;
-            let free_fn: libloading::Symbol<'_, FreeStringFn> =
-                self.lib.get(b"op_core_free_string\0").map_err(|_| {
-                    EnclaveError::new(
-                        ErrorCode::UpstreamFailure,
-                        "missing op_core_free_string in libop_uniffi_core.so",
-                    )
-                })?;
-            let _ = std::mem::size_of::<InitClientFn>();
-
-            let out_ptr = func(arg_ptr);
-            if out_ptr.is_null() {
-                return Err(EnclaveError::new(
-                    ErrorCode::UpstreamFailure,
-                    "libop_uniffi_core returned null response",
-                ));
-            }
-            let ptr_guard = DropGuard::new(out_ptr, |p| {
-                let len = libc::strlen(p);
-                std::ptr::write_bytes(p.cast::<u8>(), 0, len);
-                free_fn(p);
-            });
-            let c_str = CStr::from_ptr(*ptr_guard);
-            c_str.to_str().map(str::to_owned).map_err(|_| {
-                EnclaveError::new(ErrorCode::UpstreamFailure, "invalid UTF-8 from FFI")
-            })
-        }
+    fn invoke_raw_envelope(&self, envelope_mem: &MemSecret) -> Result<MemSecret, EnclaveError> {
+        let syms = self.symbols();
+        self.call_buf_to_mem_secret(
+            syms.invoke_sync,
+            envelope_mem,
+            ErrorCode::UpstreamFailure,
+            "1Password SDK Core invocation failed",
+        )
     }
+}
+
+fn parse_client_id_from_mem_secret(resp: &MemSecret) -> Result<u64, EnclaveError> {
+    let raw = resp.as_str()?.trim();
+    if let Ok(id) = raw.parse::<u64>() {
+        return Ok(id);
+    }
+    #[derive(Deserialize)]
+    struct WrappedId {
+        #[serde(alias = "data")]
+        ok: Option<u64>,
+        client_id: Option<u64>,
+    }
+    if let Ok(w) = serde_json::from_str::<WrappedId>(raw)
+        && let Some(id) = w.ok.or(w.client_id)
+    {
+        return Ok(id);
+    }
+    Err(EnclaveError::new(
+        ErrorCode::Unauthorized,
+        "1Password Service Account authentication failed",
+    ))
 }
 
 impl VaultProvider for UniffiCoreVaultProvider {
@@ -516,9 +1158,10 @@ impl VaultProvider for UniffiCoreVaultProvider {
                 "ItemsGet",
                 serde_json::json!({ "vault_id": vault_id, "item_id": item_id }),
             )?;
-            let item: CoreItemDto = serde_json::from_slice(raw.as_bytes()).map_err(|_| {
-                EnclaveError::new(ErrorCode::UpstreamFailure, "failed decoding item metadata")
-            })?;
+            let item: CoreItemMetaOnlyDto =
+                serde_json::from_slice(raw.as_bytes()).map_err(|_| {
+                    EnclaveError::new(ErrorCode::UpstreamFailure, "failed decoding item metadata")
+                })?;
             if item.vault_id != vault_id {
                 return Err(EnclaveError::new(
                     ErrorCode::Validation,
@@ -567,11 +1210,12 @@ impl VaultProvider for UniffiCoreVaultProvider {
             ));
         }
         self.with_session(token, |cid| {
-            self.invoke(
+            let raw = self.invoke(
                 cid,
                 "SecretsResolve",
                 serde_json::json!({ "secret_reference": op_ref.as_str() }),
-            )
+            )?;
+            unescape_json_string_to_mem_secret(raw.as_bytes())
         })
     }
 
@@ -584,7 +1228,7 @@ impl VaultProvider for UniffiCoreVaultProvider {
         intercept_mode: Option<CaptureInterceptMode>,
     ) -> Result<SecretMutationReceipt, EnclaveError> {
         ensure_service_account_vault_allowed(vault_id)?;
-        let secret_str = secret.as_str()?;
+        let _ = secret.as_str()?;
         self.with_session(token, |cid| match target {
             CaptureTarget::NewItem {
                 title,
@@ -596,29 +1240,28 @@ impl VaultProvider for UniffiCoreVaultProvider {
                 if !all_tags.iter().any(|t| t == MANAGED_TAG) {
                     all_tags.push(MANAGED_TAG.to_string());
                 }
-                let mut payload = serde_json::json!({
-                    "vault_id": vault_id,
-                    "title": title,
-                    "category": "SECURE_NOTE",
-                    "tags": all_tags,
-                    "fields": [{
-                        "id": field_id,
-                        "title": field_name.as_str(),
-                        "field_type": "CONCEALED",
-                        "value": secret_str,
-                    }]
-                });
-                let res = self.invoke(cid, "ItemsCreate", &payload);
-                if let Some(arr) = payload.get_mut("fields").and_then(|v| v.as_array_mut()) {
-                    for f in arr {
-                        if let Some(v) = f.get_mut("value").and_then(|x| x.as_str()) {
-                            let _ = v;
-                        }
-                        f["value"] = serde_json::Value::String(String::new());
-                    }
-                }
-                let raw = res?;
-                let created: CoreItemDto =
+                let meta = CoreItemMetaOnlyDto {
+                    id: String::new(),
+                    title: title.clone(),
+                    vault_id: vault_id.to_string(),
+                    category: "SECURE_NOTE".into(),
+                    tags: all_tags,
+                    fields: Vec::new(),
+                    version: 0,
+                };
+                let envelope = build_item_mutation_envelope(
+                    cid,
+                    "ItemsCreate",
+                    &meta,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    Some((&field_id, field_name.as_str(), secret)),
+                    None,
+                )?;
+                let raw = self.invoke_raw_envelope(&envelope)?;
+                let created: CoreItemMetaOnlyDto =
                     serde_json::from_slice(raw.as_bytes()).map_err(|_| {
                         EnclaveError::new(
                             ErrorCode::UpstreamFailure,
@@ -644,8 +1287,8 @@ impl VaultProvider for UniffiCoreVaultProvider {
                     "ItemsGet",
                     serde_json::json!({ "vault_id": vault_id, "item_id": item_id }),
                 )?;
-                let mut item: CoreItemDto =
-                    serde_json::from_slice(raw_get.as_bytes()).map_err(|_| {
+                let item: CoreItemMetaOnlyDto = serde_json::from_slice(raw_get.as_bytes())
+                    .map_err(|_| {
                         EnclaveError::new(ErrorCode::UpstreamFailure, "failed decoding item")
                     })?;
                 if !is_safe_item_category(&item.category) {
@@ -654,18 +1297,22 @@ impl VaultProvider for UniffiCoreVaultProvider {
                         "only safe application-secret item categories can be modified",
                     ));
                 }
+                let spans = scan_top_level_fields_array_spans(raw_get.as_bytes())?;
                 let field_id = Uuid::new_v4().simple().to_string();
-                item.fields.push(CoreFieldDto {
-                    id: field_id.clone(),
-                    title: field_name.as_str().to_string(),
-                    field_type: "CONCEALED".into(),
-                    section_id: None,
-                    value: secret_str.to_string(),
-                    purpose: None,
-                });
-                let raw_put = self.invoke(cid, "ItemsPut", &item)?;
-                let updated: CoreItemDto =
-                    serde_json::from_slice(raw_put.as_bytes()).map_err(|_| {
+                let envelope = build_item_mutation_envelope(
+                    cid,
+                    "ItemsPut",
+                    &item,
+                    None,
+                    raw_get.as_bytes(),
+                    &spans,
+                    None,
+                    Some((&field_id, field_name.as_str(), secret)),
+                    None,
+                )?;
+                let raw_put = self.invoke_raw_envelope(&envelope)?;
+                let updated: CoreItemMetaOnlyDto = serde_json::from_slice(raw_put.as_bytes())
+                    .map_err(|_| {
                         EnclaveError::new(ErrorCode::UpstreamFailure, "failed updating item")
                     })?;
                 let op_ref: OpRef =
@@ -684,8 +1331,8 @@ impl VaultProvider for UniffiCoreVaultProvider {
                     "ItemsGet",
                     serde_json::json!({ "vault_id": vault_id, "item_id": item_id }),
                 )?;
-                let mut item: CoreItemDto =
-                    serde_json::from_slice(raw_get.as_bytes()).map_err(|_| {
+                let item: CoreItemMetaOnlyDto = serde_json::from_slice(raw_get.as_bytes())
+                    .map_err(|_| {
                         EnclaveError::new(ErrorCode::UpstreamFailure, "failed decoding item")
                     })?;
                 if !is_safe_item_category(&item.category) {
@@ -694,18 +1341,28 @@ impl VaultProvider for UniffiCoreVaultProvider {
                         "only safe application-secret item categories can be modified",
                     ));
                 }
-                let Some(field) = item.fields.iter_mut().find(|f| f.id == *field_id) else {
+                let Some(field) = item.fields.iter().find(|f| f.id == *field_id) else {
                     return Err(EnclaveError::new(
                         ErrorCode::Validation,
                         "field_id not found on item",
                     ));
                 };
-                field.value.zeroize();
-                field.value = secret_str.to_string();
                 let sec_part = field.section_id.clone();
-                let raw_put = self.invoke(cid, "ItemsPut", &item)?;
-                let updated: CoreItemDto =
-                    serde_json::from_slice(raw_put.as_bytes()).map_err(|_| {
+                let spans = scan_top_level_fields_array_spans(raw_get.as_bytes())?;
+                let envelope = build_item_mutation_envelope(
+                    cid,
+                    "ItemsPut",
+                    &item,
+                    None,
+                    raw_get.as_bytes(),
+                    &spans,
+                    Some((field_id.as_str(), secret)),
+                    None,
+                    None,
+                )?;
+                let raw_put = self.invoke_raw_envelope(&envelope)?;
+                let updated: CoreItemMetaOnlyDto = serde_json::from_slice(raw_put.as_bytes())
+                    .map_err(|_| {
                         EnclaveError::new(ErrorCode::UpstreamFailure, "failed updating item")
                     })?;
                 let op_ref: OpRef = match sec_part {
@@ -740,8 +1397,8 @@ impl VaultProvider for UniffiCoreVaultProvider {
                 "ItemsGet",
                 serde_json::json!({ "vault_id": vault_id, "item_id": item_id }),
             )?;
-            let mut item: CoreItemDto =
-                serde_json::from_slice(raw_get.as_bytes()).map_err(|_| {
+            let mut item: CoreItemMetaOnlyDto = serde_json::from_slice(raw_get.as_bytes())
+                .map_err(|_| {
                     EnclaveError::new(ErrorCode::UpstreamFailure, "failed decoding item")
                 })?;
             if !is_safe_item_category(&item.category) {
@@ -772,10 +1429,21 @@ impl VaultProvider for UniffiCoreVaultProvider {
                         "built-in purpose fields cannot be removed",
                     ));
                 }
-                item.fields.retain(|f| f.id != fid);
             }
-            let raw_put = self.invoke(cid, "ItemsPut", &item)?;
-            let updated: CoreItemDto = serde_json::from_slice(raw_put.as_bytes())
+            let spans = scan_top_level_fields_array_spans(raw_get.as_bytes())?;
+            let envelope = build_item_mutation_envelope(
+                cid,
+                "ItemsPut",
+                &item,
+                None,
+                raw_get.as_bytes(),
+                &spans,
+                None,
+                None,
+                remove_field_id,
+            )?;
+            let raw_put = self.invoke_raw_envelope(&envelope)?;
+            let updated: CoreItemMetaOnlyDto = serde_json::from_slice(raw_put.as_bytes())
                 .map_err(|_| EnclaveError::new(ErrorCode::UpstreamFailure, "failed saving item"))?;
             Ok((updated.id, updated.title))
         })
@@ -794,9 +1462,10 @@ impl VaultProvider for UniffiCoreVaultProvider {
                 "ItemsGet",
                 serde_json::json!({ "vault_id": vault_id, "item_id": item_id }),
             )?;
-            let item: CoreItemDto = serde_json::from_slice(raw_get.as_bytes()).map_err(|_| {
-                EnclaveError::new(ErrorCode::UpstreamFailure, "failed decoding item")
-            })?;
+            let item: CoreItemMetaOnlyDto =
+                serde_json::from_slice(raw_get.as_bytes()).map_err(|_| {
+                    EnclaveError::new(ErrorCode::UpstreamFailure, "failed decoding item")
+                })?;
             // Closes S5: archive enforces SAFE_ITEM_CATEGORIES just like edit!
             if !is_safe_item_category(&item.category) {
                 return Err(EnclaveError::new(
@@ -835,7 +1504,7 @@ impl VaultProvider for UniffiCoreVaultProvider {
                 "ItemsGet",
                 serde_json::json!({ "vault_id": src_vault_id, "item_id": item_id }),
             )?;
-            let mut item: CoreItemDto =
+            let item: CoreItemMetaOnlyDto =
                 serde_json::from_slice(raw_get.as_bytes()).map_err(|_| {
                     EnclaveError::new(ErrorCode::UpstreamFailure, "failed decoding item")
                 })?;
@@ -846,10 +1515,21 @@ impl VaultProvider for UniffiCoreVaultProvider {
                     "refusing to move non-application item category",
                 ));
             }
-            item.vault_id = dst_vault_id.to_string();
-            let raw_created = self.invoke(cid, "ItemsCreate", &item)?;
-            let created: CoreItemDto =
-                serde_json::from_slice(raw_created.as_bytes()).map_err(|_| {
+            let spans = scan_top_level_fields_array_spans(raw_get.as_bytes())?;
+            let envelope = build_item_mutation_envelope(
+                cid,
+                "ItemsCreate",
+                &item,
+                Some(dst_vault_id),
+                raw_get.as_bytes(),
+                &spans,
+                None,
+                None,
+                None,
+            )?;
+            let raw_created = self.invoke_raw_envelope(&envelope)?;
+            let created: CoreItemMetaOnlyDto = serde_json::from_slice(raw_created.as_bytes())
+                .map_err(|_| {
                     EnclaveError::new(
                         ErrorCode::UpstreamFailure,
                         "failed creating item in destination vault",

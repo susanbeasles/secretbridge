@@ -22,8 +22,22 @@ data class JsonStr(val value: String) : JsonValue
 class JsonSecretChars(private val chars: CharArray) : JsonValue {
     fun writeEscapedUtf8(out: ByteArrayOutputStream) {
         out.write('"'.code)
-        for (ch in chars) {
+        var i = 0
+        while (i < chars.size) {
+            val ch = chars[i]
+            if (ch.isHighSurrogate() && i + 1 < chars.size && chars[i + 1].isLowSurrogate()) {
+                val cp = Character.toCodePoint(ch, chars[i + 1])
+                writeFourByteUtf8CodePoint(cp, out)
+                i += 2
+                continue
+            }
+            if (ch.isSurrogate()) {
+                writeUnicodeEscapeHex(ch.code, out)
+                i += 1
+                continue
+            }
             writeEscapedCharUtf8(ch, out)
+            i += 1
         }
         out.write('"'.code)
     }
@@ -69,6 +83,8 @@ data class JsonObj(val entries: Map<String, JsonValue>) : JsonValue {
 class ProtocolCodecException(message: String) : IllegalArgumentException(message)
 
 object JsonCodec {
+    const val MAX_DEPTH = 64
+
     fun parse(input: CharSequence): JsonValue {
         val parser = Parser(input)
         val result = parser.parseValue()
@@ -98,7 +114,7 @@ object JsonCodec {
     fun encodeUtf8(value: JsonValue, appendNewline: Boolean = true): ByteArray {
         val out = ZeroizableByteArrayOutputStream(512)
         return try {
-            writeUtf8(value, out)
+            writeUtf8(value, out, depth = 0)
             if (appendNewline) {
                 out.write('\n'.code)
             }
@@ -118,7 +134,10 @@ object JsonCodec {
         }
     }
 
-    private fun writeUtf8(value: JsonValue, out: ByteArrayOutputStream) {
+    private fun writeUtf8(value: JsonValue, out: ByteArrayOutputStream, depth: Int) {
+        if (depth > MAX_DEPTH) {
+            throw ProtocolCodecException("JSON nesting exceeds maximum depth of $MAX_DEPTH")
+        }
         when (value) {
             JsonNull -> out.write("null".toByteArray(StandardCharsets.US_ASCII))
             is JsonBool -> out.write(
@@ -131,9 +150,14 @@ object JsonCodec {
                 while (i < value.value.length) {
                     val ch = value.value[i]
                     if (ch.isHighSurrogate() && i + 1 < value.value.length && value.value[i + 1].isLowSurrogate()) {
-                        val cpBytes = value.value.substring(i, i + 2).toByteArray(StandardCharsets.UTF_8)
-                        out.write(cpBytes)
+                        val cp = Character.toCodePoint(ch, value.value[i + 1])
+                        writeFourByteUtf8CodePoint(cp, out)
                         i += 2
+                        continue
+                    }
+                    if (ch.isSurrogate()) {
+                        writeUnicodeEscapeHex(ch.code, out)
+                        i += 1
                         continue
                     }
                     writeEscapedCharUtf8(ch, out)
@@ -152,7 +176,7 @@ object JsonCodec {
                 out.write('['.code)
                 value.items.forEachIndexed { idx, item ->
                     if (idx > 0) out.write(','.code)
-                    writeUtf8(item, out)
+                    writeUtf8(item, out, depth + 1)
                 }
                 out.write(']'.code)
             }
@@ -162,9 +186,9 @@ object JsonCodec {
                 for ((k, v) in value.entries) {
                     if (!first) out.write(','.code)
                     first = false
-                    writeUtf8(JsonStr(k), out)
+                    writeUtf8(JsonStr(k), out, depth + 1)
                     out.write(':'.code)
-                    writeUtf8(v, out)
+                    writeUtf8(v, out, depth + 1)
                 }
                 out.write('}'.code)
             }
@@ -181,6 +205,7 @@ object JsonCodec {
 
     private class Parser(private val src: CharSequence) {
         var pos: Int = 0
+        private var depth: Int = 0
 
         fun isAtEnd(): Boolean = pos >= src.length
 
@@ -217,6 +242,17 @@ object JsonCodec {
             }
         }
 
+        private fun enterContainer() {
+            depth += 1
+            if (depth > MAX_DEPTH) {
+                throw ProtocolCodecException("JSON nesting exceeds maximum depth of $MAX_DEPTH")
+            }
+        }
+
+        private fun exitContainer() {
+            depth -= 1
+        }
+
         private fun expectKeyword(kw: String) {
             if (pos + kw.length > src.length || src.subSequence(pos, pos + kw.length).toString() != kw) {
                 throw ProtocolCodecException("Invalid JSON literal at index $pos")
@@ -225,59 +261,69 @@ object JsonCodec {
         }
 
         private fun parseObject(): JsonObj {
-            pos++ // '{'
-            skipWhitespace()
-            val map = LinkedHashMap<String, JsonValue>()
-            if (!isAtEnd() && src[pos] == '}') {
-                pos++
-                return JsonObj(map)
-            }
-            while (true) {
+            enterContainer()
+            try {
+                pos++ // '{'
                 skipWhitespace()
-                if (isAtEnd() || src[pos] != '"') {
-                    throw ProtocolCodecException("Expected string object key at index $pos")
+                val map = LinkedHashMap<String, JsonValue>()
+                if (!isAtEnd() && src[pos] == '}') {
+                    pos++
+                    return JsonObj(map)
                 }
-                val key = parseString()
-                skipWhitespace()
-                if (isAtEnd() || src[pos] != ':') {
-                    throw ProtocolCodecException("Expected ':' after object key at index $pos")
-                }
-                pos++
-                val value = parseValue()
-                map[key] = value
-                skipWhitespace()
-                if (isAtEnd()) throw ProtocolCodecException("Unterminated JSON object")
-                when (src[pos]) {
-                    ',' -> pos++
-                    '}' -> {
-                        pos++
-                        return JsonObj(map)
+                while (true) {
+                    skipWhitespace()
+                    if (isAtEnd() || src[pos] != '"') {
+                        throw ProtocolCodecException("Expected string object key at index $pos")
                     }
-                    else -> throw ProtocolCodecException("Expected ',' or '}' in object at index $pos")
+                    val key = parseString()
+                    skipWhitespace()
+                    if (isAtEnd() || src[pos] != ':') {
+                        throw ProtocolCodecException("Expected ':' after object key at index $pos")
+                    }
+                    pos++
+                    val value = parseValue()
+                    map[key] = value
+                    skipWhitespace()
+                    if (isAtEnd()) throw ProtocolCodecException("Unterminated JSON object")
+                    when (src[pos]) {
+                        ',' -> pos++
+                        '}' -> {
+                            pos++
+                            return JsonObj(map)
+                        }
+                        else -> throw ProtocolCodecException("Expected ',' or '}' in object at index $pos")
+                    }
                 }
+            } finally {
+                exitContainer()
             }
         }
 
         private fun parseArray(): JsonArr {
-            pos++ // '['
-            skipWhitespace()
-            val items = ArrayList<JsonValue>()
-            if (!isAtEnd() && src[pos] == ']') {
-                pos++
-                return JsonArr(items)
-            }
-            while (true) {
-                items.add(parseValue())
+            enterContainer()
+            try {
+                pos++ // '['
                 skipWhitespace()
-                if (isAtEnd()) throw ProtocolCodecException("Unterminated JSON array")
-                when (src[pos]) {
-                    ',' -> pos++
-                    ']' -> {
-                        pos++
-                        return JsonArr(items)
-                    }
-                    else -> throw ProtocolCodecException("Expected ',' or ']' in array at index $pos")
+                val items = ArrayList<JsonValue>()
+                if (!isAtEnd() && src[pos] == ']') {
+                    pos++
+                    return JsonArr(items)
                 }
+                while (true) {
+                    items.add(parseValue())
+                    skipWhitespace()
+                    if (isAtEnd()) throw ProtocolCodecException("Unterminated JSON array")
+                    when (src[pos]) {
+                        ',' -> pos++
+                        ']' -> {
+                            pos++
+                            return JsonArr(items)
+                        }
+                        else -> throw ProtocolCodecException("Expected ',' or ']' in array at index $pos")
+                    }
+                }
+            } finally {
+                exitContainer()
             }
         }
 
@@ -301,8 +347,14 @@ object JsonCodec {
                                 if (pos + 4 > src.length) {
                                     throw ProtocolCodecException("Incomplete unicode escape at index $pos")
                                 }
-                                val code = src.subSequence(pos, pos + 4).toString().toIntOrNull(16)
-                                    ?: throw ProtocolCodecException("Invalid unicode hex escape at index $pos")
+                                var code = 0
+                                for (k in 0 until 4) {
+                                    val digit = hexNibbleOrNeg(src[pos + k])
+                                    if (digit < 0) {
+                                        throw ProtocolCodecException("Invalid unicode hex escape at index ${pos + k}")
+                                    }
+                                    code = (code shl 4) or digit
+                                }
                                 pos += 4
                                 sb.append(code.toChar())
                             }
@@ -314,6 +366,13 @@ object JsonCodec {
                 }
             }
             throw ProtocolCodecException("Unterminated JSON string")
+        }
+
+        private fun hexNibbleOrNeg(ch: Char): Int = when (ch) {
+            in '0'..'9' -> ch.code - '0'.code
+            in 'a'..'f' -> ch.code - 'a'.code + 10
+            in 'A'..'F' -> ch.code - 'A'.code + 10
+            else -> -1
         }
 
         private fun parseNumber(): JsonNum {
@@ -352,6 +411,22 @@ private val HEX_LOWER_ASCII = charArrayOf(
     '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
 )
 
+private fun writeUnicodeEscapeHex(codeUnit: Int, out: ByteArrayOutputStream) {
+    out.write('\\'.code)
+    out.write('u'.code)
+    out.write(HEX_LOWER_ASCII[(codeUnit ushr 12) and 0x0F].code)
+    out.write(HEX_LOWER_ASCII[(codeUnit ushr 8) and 0x0F].code)
+    out.write(HEX_LOWER_ASCII[(codeUnit ushr 4) and 0x0F].code)
+    out.write(HEX_LOWER_ASCII[codeUnit and 0x0F].code)
+}
+
+private fun writeFourByteUtf8CodePoint(cp: Int, out: ByteArrayOutputStream) {
+    out.write(0xF0 or (cp ushr 18))
+    out.write(0x80 or ((cp ushr 12) and 0x3F))
+    out.write(0x80 or ((cp ushr 6) and 0x3F))
+    out.write(0x80 or (cp and 0x3F))
+}
+
 private fun writeEscapedCharUtf8(ch: Char, out: ByteArrayOutputStream) {
     when (ch) {
         '"' -> {
@@ -385,14 +460,7 @@ private fun writeEscapedCharUtf8(ch: Char, out: ByteArrayOutputStream) {
         else -> {
             val code = ch.code
             when {
-                code < 0x20 -> {
-                    out.write('\\'.code)
-                    out.write('u'.code)
-                    out.write('0'.code)
-                    out.write('0'.code)
-                    out.write(HEX_LOWER_ASCII[(code shr 4) and 0x0F].code)
-                    out.write(HEX_LOWER_ASCII[code and 0x0F].code)
-                }
+                code < 0x20 -> writeUnicodeEscapeHex(code, out)
                 code <= 0x7F -> out.write(code)
                 code <= 0x7FF -> {
                     out.write(0xC0 or (code shr 6))

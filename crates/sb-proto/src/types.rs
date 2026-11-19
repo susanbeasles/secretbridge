@@ -56,6 +56,32 @@ fn reject_control_or_non_ascii(value: &str, field: &str) -> Result<(), ProtoErro
     Ok(())
 }
 
+fn validate_manifest_identifier(value: &str, field: &str) -> Result<(), ProtoError> {
+    if value.is_empty() || value.len() > 128 {
+        return Err(ProtoError::Validation(format!(
+            "{field} must be 1..=128 characters"
+        )));
+    }
+    if value.starts_with('-') || value == "." || value == ".." || value.contains("..") {
+        return Err(ProtoError::Validation(format!(
+            "{field} cannot start with '-' or contain '..'"
+        )));
+    }
+    for b in value.bytes() {
+        if !(0x21..=0x7E).contains(&b)
+            || matches!(
+                b,
+                b'/' | b'\\' | b'?' | b'#' | b'%' | b'"' | b'\'' | b'`' | b'$'
+            )
+        {
+            return Err(ProtoError::Validation(format!(
+                "{field} contains whitespace or forbidden characters"
+            )));
+        }
+    }
+    Ok(())
+}
+
 macro_rules! impl_validated_str_serde {
     ($ty:ident) => {
         impl fmt::Display for $ty {
@@ -302,6 +328,10 @@ impl GitHubHost {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn is_default_github_com(&self) -> bool {
+        self.0 == "github.com"
+    }
 }
 
 impl FromStr for GitHubHost {
@@ -311,14 +341,24 @@ impl FromStr for GitHubHost {
         if s.is_empty() || s.len() > 253 {
             return Err(ProtoError::Validation("invalid GitHub hostname".into()));
         }
+        if s.parse::<std::net::IpAddr>().is_ok() {
+            return Err(ProtoError::Validation(
+                "GitHub hostname must not be an IP address literal".into(),
+            ));
+        }
         let lower = s.to_ascii_lowercase();
+        if lower == "localhost" {
+            return Err(ProtoError::Validation(
+                "GitHub hostname cannot be localhost".into(),
+            ));
+        }
         let labels: Vec<&str> = lower.split('.').collect();
         if labels.len() < 2 {
             return Err(ProtoError::Validation(
                 "GitHub hostname must be a qualified domain".into(),
             ));
         }
-        for label in labels {
+        for label in &labels {
             if label.is_empty()
                 || label.len() > 63
                 || label.starts_with('-')
@@ -331,6 +371,28 @@ impl FromStr for GitHubHost {
                     "invalid GitHub hostname label".into(),
                 ));
             }
+        }
+        let tld = labels[labels.len() - 1];
+        if tld.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ProtoError::Validation(
+                "GitHub hostname top-level label cannot be numeric".into(),
+            ));
+        }
+        if matches!(
+            tld,
+            "localhost"
+                | "local"
+                | "internal"
+                | "arpa"
+                | "home"
+                | "lan"
+                | "corp"
+                | "invalid"
+                | "onion"
+        ) {
+            return Err(ProtoError::Validation(
+                "GitHub hostname uses a reserved or local-only TLD".into(),
+            ));
         }
         Ok(Self(lower))
     }
@@ -620,6 +682,10 @@ fn default_true() -> bool {
     true
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretSpec {
@@ -633,6 +699,8 @@ pub struct SecretSpec {
     pub github: bool,
     #[serde(default = "default_true")]
     pub aws: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_unmanaged_github_delete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -643,8 +711,20 @@ pub enum GitHubScope {
     Organization,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawGitHubTarget {
+    scope: GitHubScope,
+    #[serde(default)]
+    host: GitHubHost,
+    repository: Option<GitHubRepoFullName>,
+    organization: Option<Slug>,
+    environment: Option<GitHubEnvName>,
+    repositories: Option<Vec<Slug>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawGitHubTarget")]
 pub struct GitHubTarget {
     pub scope: GitHubScope,
     #[serde(default)]
@@ -657,6 +737,23 @@ pub struct GitHubTarget {
     pub environment: Option<GitHubEnvName>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repositories: Option<Vec<Slug>>,
+}
+
+impl TryFrom<RawGitHubTarget> for GitHubTarget {
+    type Error = ProtoError;
+
+    fn try_from(raw: RawGitHubTarget) -> Result<Self, Self::Error> {
+        let target = Self {
+            scope: raw.scope,
+            host: raw.host,
+            repository: raw.repository,
+            organization: raw.organization,
+            environment: raw.environment,
+            repositories: raw.repositories,
+        };
+        target.validate()?;
+        Ok(target)
+    }
 }
 
 impl GitHubTarget {
@@ -717,6 +814,58 @@ impl GitHubTarget {
         Ok(())
     }
 
+    pub fn owner_or_org_lower(&self) -> Result<String, ProtoError> {
+        self.validate()?;
+        match self.scope {
+            GitHubScope::Organization => Ok(self
+                .organization
+                .as_ref()
+                .expect("validated")
+                .as_str()
+                .to_ascii_lowercase()),
+            GitHubScope::Repository | GitHubScope::Environment => Ok(self
+                .repository
+                .as_ref()
+                .expect("validated")
+                .owner()
+                .as_str()
+                .to_ascii_lowercase()),
+        }
+    }
+
+    pub fn normalized_destination_key(
+        &self,
+        secret_name: &SecretName,
+    ) -> Result<(String, GitHubScope, String, String, String), ProtoError> {
+        self.validate()?;
+        let scope_target = match self.scope {
+            GitHubScope::Organization => self
+                .organization
+                .as_ref()
+                .expect("validated")
+                .as_str()
+                .to_ascii_lowercase(),
+            GitHubScope::Repository | GitHubScope::Environment => self
+                .repository
+                .as_ref()
+                .expect("validated")
+                .as_str()
+                .to_ascii_lowercase(),
+        };
+        let gh_env = self
+            .environment
+            .as_ref()
+            .map(|e| e.as_str().to_ascii_lowercase())
+            .unwrap_or_default();
+        Ok((
+            self.host.as_str().to_ascii_lowercase(),
+            self.scope,
+            scope_target,
+            gh_env,
+            secret_name.as_str().to_ascii_lowercase(),
+        ))
+    }
+
     /// Safe REST endpoint path (leading slash omitted, every dynamic segment percent-encoded).
     pub fn secrets_endpoint_path(&self) -> Result<String, ProtoError> {
         self.validate()?;
@@ -747,8 +896,20 @@ impl GitHubTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawAwsTarget {
+    profile: Option<Slug>,
+    region: AwsRegion,
+    account_id: AwsAccountId,
+    prefix: AwsSecretPrefix,
+    kms_key_id: Option<String>,
+    #[serde(default)]
+    recovery_days: RecoveryDays,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawAwsTarget")]
 pub struct AwsTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<Slug>,
@@ -759,6 +920,23 @@ pub struct AwsTarget {
     pub kms_key_id: Option<String>,
     #[serde(default)]
     pub recovery_days: RecoveryDays,
+}
+
+impl TryFrom<RawAwsTarget> for AwsTarget {
+    type Error = ProtoError;
+
+    fn try_from(raw: RawAwsTarget) -> Result<Self, Self::Error> {
+        let target = Self {
+            profile: raw.profile,
+            region: raw.region,
+            account_id: raw.account_id,
+            prefix: raw.prefix,
+            kms_key_id: raw.kms_key_id,
+            recovery_days: raw.recovery_days,
+        };
+        target.validate()?;
+        Ok(target)
+    }
 }
 
 impl AwsTarget {
@@ -773,8 +951,18 @@ impl AwsTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawEnvironmentConfig {
+    vault: String,
+    #[serde(default)]
+    secrets: BTreeMap<SecretName, SecretSpec>,
+    github: Option<GitHubTarget>,
+    aws: Option<AwsTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawEnvironmentConfig")]
 pub struct EnvironmentConfig {
     pub vault: String,
     #[serde(default)]
@@ -785,15 +973,84 @@ pub struct EnvironmentConfig {
     pub aws: Option<AwsTarget>,
 }
 
-/// Root project manifest (`secretbridge.json`).
-/// Note `#[serde(deny_unknown_fields)]`: any `tools` block from v0.1.0 is rejected (S1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl EnvironmentConfig {
+    pub fn validate(&self) -> Result<(), ProtoError> {
+        validate_manifest_identifier(&self.vault, "vault")?;
+        if let Some(gh) = &self.github {
+            gh.validate()?;
+        }
+        if let Some(aws) = &self.aws {
+            aws.validate()?;
+        }
+        for (secret_name, spec) in &self.secrets {
+            if spec.state == SecretState::Present {
+                let Some(op_ref) = &spec.r#ref else {
+                    return Err(ProtoError::Validation(format!(
+                        "{secret_name}: present secret requires op:// reference"
+                    )));
+                };
+                if op_ref.vault() != self.vault {
+                    return Err(ProtoError::Validation(format!(
+                        "{secret_name}: reference vault '{}' must match environment vault '{}'",
+                        op_ref.vault(),
+                        self.vault
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<RawEnvironmentConfig> for EnvironmentConfig {
+    type Error = ProtoError;
+
+    fn try_from(raw: RawEnvironmentConfig) -> Result<Self, Self::Error> {
+        let cfg = Self {
+            vault: raw.vault,
+            secrets: raw.secrets,
+            github: raw.github,
+            aws: raw.aws,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawManifest {
+    version: u32,
+    project: Slug,
+    account: String,
+    environments: BTreeMap<Slug, EnvironmentConfig>,
+}
+
+/// Root project manifest (`secretbridge.json`).
+/// Note `#[serde(try_from = "RawManifest")]` + `#[serde(deny_unknown_fields)]`:
+/// any `tools` block from v0.1.0 is rejected (S1) and `.validate()` runs on every deserialize (C5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawManifest")]
 pub struct Manifest {
     pub version: u32,
     pub project: Slug,
     pub account: String,
     pub environments: BTreeMap<Slug, EnvironmentConfig>,
+}
+
+impl TryFrom<RawManifest> for Manifest {
+    type Error = ProtoError;
+
+    fn try_from(raw: RawManifest) -> Result<Self, Self::Error> {
+        let manifest = Self {
+            version: raw.version,
+            project: raw.project,
+            account: raw.account,
+            environments: raw.environments,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
 }
 
 impl Manifest {
@@ -803,12 +1060,7 @@ impl Manifest {
                 "manifest version must be 1 or 2".into(),
             ));
         }
-        reject_control_or_non_ascii(&self.account, "account")?;
-        if self.account.len() > 128 {
-            return Err(ProtoError::Validation(
-                "account identifier is too long".into(),
-            ));
-        }
+        validate_manifest_identifier(&self.account, "account")?;
         if self.environments.is_empty() {
             return Err(ProtoError::Validation(
                 "at least one environment is required".into(),
@@ -820,74 +1072,21 @@ impl Manifest {
         let mut aws_destinations = BTreeSet::new();
 
         for (env_name, env) in &self.environments {
-            reject_control_or_non_ascii(&env.vault, "vault")?;
-            if env.vault.contains('/') || env.vault.len() > 128 {
-                return Err(ProtoError::Validation(format!(
-                    "environment '{env_name}' has invalid vault identifier"
-                )));
-            }
-            let norm_vault = env.vault.trim().to_ascii_lowercase();
+            env.validate().map_err(|e| {
+                ProtoError::Validation(format!("environment '{env_name}' invalid: {e}"))
+            })?;
+            let norm_vault = env.vault.to_ascii_lowercase();
             if !vaults_seen_norm.insert(norm_vault) {
                 return Err(ProtoError::Validation(
                     "each environment must use a separate vault".into(),
                 ));
             }
 
-            if let Some(gh) = &env.github {
-                gh.validate()?;
-            }
-            if let Some(aws) = &env.aws {
-                aws.validate()?;
-            }
-
             for (secret_name, spec) in &env.secrets {
-                match spec.state {
-                    SecretState::Present => {
-                        let Some(op_ref) = &spec.r#ref else {
-                            return Err(ProtoError::Validation(format!(
-                                "{secret_name}: present secret requires op:// reference"
-                            )));
-                        };
-                        if op_ref.vault() != env.vault {
-                            return Err(ProtoError::Validation(format!(
-                                "{secret_name}: reference vault '{}' must match environment vault '{}'",
-                                op_ref.vault(),
-                                env.vault
-                            )));
-                        }
-                    }
-                    SecretState::Absent => {}
-                }
-
                 if let Some(gh) = &env.github
                     && spec.github
                 {
-                    let scope_target = match gh.scope {
-                        GitHubScope::Organization => gh
-                            .organization
-                            .as_ref()
-                            .expect("validated")
-                            .as_str()
-                            .to_string(),
-                        GitHubScope::Repository | GitHubScope::Environment => gh
-                            .repository
-                            .as_ref()
-                            .expect("validated")
-                            .as_str()
-                            .to_string(),
-                    };
-                    let gh_env = gh
-                        .environment
-                        .as_ref()
-                        .map(|e| e.as_str().to_string())
-                        .unwrap_or_default();
-                    let dest_key = (
-                        gh.host.as_str().to_string(),
-                        gh.scope,
-                        scope_target,
-                        gh_env,
-                        secret_name.as_str().to_string(),
-                    );
+                    let dest_key = gh.normalized_destination_key(secret_name)?;
                     if !gh_destinations.insert(dest_key) {
                         return Err(ProtoError::Validation(
                             "environment collision in GitHub targets".into(),
@@ -955,6 +1154,7 @@ impl Manifest {
                 group: next_group,
                 github: next_github,
                 aws: next_aws,
+                allow_unmanaged_github_delete: false,
             },
         );
         self.validate()

@@ -70,7 +70,7 @@ pub enum CaptureInterceptMode {
     PasteboardFallback,
 }
 
-/// Write-only session credentials sealed into enclave memory over `Noise_IK`.
+/// Write-only session credentials and destination allowlists sealed into enclave memory over `Noise_IK`.
 /// Zeroized on drop; never echoed in any response or log.
 #[derive(Clone, Default, Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
@@ -86,6 +86,12 @@ pub struct SessionCredentialsInput {
     pub aws_secret_access_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws_session_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_github_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_github_owners: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_aws_account_ids: Vec<String>,
 }
 
 impl std::fmt::Debug for SessionCredentialsInput {
@@ -96,6 +102,9 @@ impl std::fmt::Debug for SessionCredentialsInput {
             .field("aws_access_key_id", &"[REDACTED]")
             .field("aws_secret_access_key", &"[REDACTED]")
             .field("aws_session_token", &"[REDACTED]")
+            .field("allowed_github_hosts", &self.allowed_github_hosts)
+            .field("allowed_github_owners", &self.allowed_github_owners)
+            .field("allowed_aws_account_ids", &self.allowed_aws_account_ids)
             .finish()
     }
 }
@@ -177,6 +186,8 @@ pub enum EnclaveRequest {
         manifest: Manifest,
         environment: Slug,
         name: SecretName,
+        #[serde(default)]
+        confirm_unmanaged: bool,
     },
     PrepareGithub {
         manifest: Manifest,

@@ -2,11 +2,100 @@ use crate::error::EnclaveError;
 use crate::mem_secret::MemSecret;
 use sb_proto::crypto::seal_base64;
 use sb_proto::error::ErrorCode;
-use sb_proto::types::{CommitSha40, GitHubScope, GitHubTarget, SecretName};
+use sb_proto::types::{CommitSha40, GitHubHost, GitHubScope, GitHubTarget, SecretName};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
+use std::io::Read;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::Duration;
+
+const MAX_UPSTREAM_BODY_BYTES: usize = 256 * 1024;
+
+/// Returns `true` only for globally routable public unicast IPv4/IPv6 addresses.
+/// Blocks loopback (`127.0.0.0/8`, `::1`), RFC1918 (`10.0.0.0/8` including QEMU SLIRP
+/// `10.0.2.2`, `172.16.0.0/12`, `192.168.0.0/16`), link-local/IMDS (`169.254.0.0/16`,
+/// `fe80::/10`), CGNAT (`100.64.0.0/10`), multicast, documentation, ULA (`fc00::/7`),
+/// and IPv4-mapped IPv6 equivalents (`C1`, `H4`).
+pub fn is_public_unicast_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            !(octets[0] == 0
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
+                || octets[0] >= 240)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_public_unicast_ip(IpAddr::V4(mapped_v4));
+            }
+            let segs = v6.segments();
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || (segs[0] & 0xfe00) == 0xfc00
+                || (segs[0] & 0xffc0) == 0xfe80
+                || (segs[0] == 0x2001 && segs[1] == 0x0db8)
+                || (segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0))
+        }
+    }
+}
+
+/// Connect-time DNS resolver enforcing `is_public_unicast_ip` on every resolved socket address,
+/// eliminating DNS-rebinding SSRF (`C1`) and guest-to-host SLIRP gateway access (`10.0.2.2`, `H4`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PublicIpOnlyResolver;
+
+impl ureq::Resolver for PublicIpOnlyResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+        let addrs: Vec<SocketAddr> = netloc
+            .to_socket_addrs()?
+            .filter(|sa| is_public_unicast_ip(sa.ip()))
+            .collect();
+        if addrs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "blocked connection to non-public or loopback IP address",
+            ));
+        }
+        Ok(addrs)
+    }
+}
+
+pub(crate) fn read_bounded_string(
+    resp: ureq::Response,
+    err_msg: &'static str,
+) -> Result<String, EnclaveError> {
+    let mut buf = Vec::with_capacity(1024);
+    resp.into_reader()
+        .take((MAX_UPSTREAM_BODY_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|_| EnclaveError::new(ErrorCode::UpstreamFailure, err_msg))?;
+    if buf.len() > MAX_UPSTREAM_BODY_BYTES {
+        return Err(EnclaveError::new(
+            ErrorCode::UpstreamFailure,
+            "upstream HTTP response exceeded 256 KiB cap",
+        ));
+    }
+    String::from_utf8(buf).map_err(|_| EnclaveError::new(ErrorCode::UpstreamFailure, err_msg))
+}
+
+fn read_bounded_json<T: DeserializeOwned>(
+    resp: ureq::Response,
+    err_msg: &'static str,
+) -> Result<T, EnclaveError> {
+    let text = read_bounded_string(resp, err_msg)?;
+    serde_json::from_str(&text).map_err(|_| EnclaveError::new(ErrorCode::UpstreamFailure, err_msg))
+}
 
 #[derive(Debug, Clone)]
 pub struct GitHubPublicKey {
@@ -119,25 +208,30 @@ impl Default for RestGitHubClient {
 
 impl RestGitHubClient {
     pub fn new(base_url_override: Option<String>) -> Self {
-        let agent = ureq::AgentBuilder::new()
+        let mut builder = ureq::AgentBuilder::new()
+            .redirects(0)
             .timeout_connect(Duration::from_secs(15))
             .timeout_read(Duration::from_secs(30))
-            .timeout_write(Duration::from_secs(30))
-            .build();
+            .timeout_write(Duration::from_secs(30));
+        if base_url_override.is_none() {
+            builder = builder.resolver(PublicIpOnlyResolver);
+        }
+        let agent = builder.build();
         Self {
             agent,
             base_url_override,
         }
     }
 
-    fn api_base(&self, host: &str) -> String {
+    fn api_base(&self, host: &str) -> Result<String, EnclaveError> {
+        let validated: GitHubHost = host.parse()?;
         if let Some(over) = &self.base_url_override {
-            return over.trim_end_matches('/').to_string();
+            return Ok(over.trim_end_matches('/').to_string());
         }
-        if host.eq_ignore_ascii_case("github.com") {
-            "https://api.github.com".to_string()
+        if validated.as_str().eq_ignore_ascii_case("github.com") {
+            Ok("https://api.github.com".to_string())
         } else {
-            format!("https://{host}/api/v3")
+            Ok(format!("https://{}/api/v3", validated.as_str()))
         }
     }
 
@@ -166,16 +260,14 @@ impl GitHubClient for RestGitHubClient {
         token: &MemSecret,
         host: &str,
     ) -> Result<String, EnclaveError> {
-        let url = format!("{}/user", self.api_base(host));
+        let url = format!("{}/user", self.api_base(host)?);
         let resp = self
             .request("GET", &url, Some(token))?
             .call()
             .map_err(|_| {
                 EnclaveError::new(ErrorCode::Unauthorized, "GitHub authentication failed")
             })?;
-        let user: GhUserDto = resp.into_json().map_err(|_| {
-            EnclaveError::new(ErrorCode::UpstreamFailure, "invalid GitHub user response")
-        })?;
+        let user: GhUserDto = read_bounded_json(resp, "invalid GitHub user response")?;
         Ok(user.login)
     }
 
@@ -195,7 +287,7 @@ impl GitHubClient for RestGitHubClient {
         let env_name = target.environment.as_ref().expect("validated");
         let url = format!(
             "{}/repos/{}/{}/environments/{}",
-            self.api_base(target.host.as_str()),
+            self.api_base(target.host.as_str())?,
             repo.owner().url_encoded(),
             repo.repo().url_encoded(),
             env_name.url_encoded()
@@ -230,7 +322,7 @@ impl GitHubClient for RestGitHubClient {
         target: &GitHubTarget,
     ) -> Result<BTreeMap<String, Option<String>>, EnclaveError> {
         let endpoint = target.secrets_endpoint_path()?;
-        let base = self.api_base(target.host.as_str());
+        let base = self.api_base(target.host.as_str())?;
         let mut out = BTreeMap::new();
         let mut page = 1u32;
         loop {
@@ -245,9 +337,7 @@ impl GitHubClient for RestGitHubClient {
                     ),
                     _ => EnclaveError::new(ErrorCode::UpstreamFailure, "GitHub connection failed"),
                 })?;
-            let dto: GhSecretsPageDto = resp.into_json().map_err(|_| {
-                EnclaveError::new(ErrorCode::UpstreamFailure, "invalid GitHub secrets list")
-            })?;
+            let dto: GhSecretsPageDto = read_bounded_json(resp, "invalid GitHub secrets list")?;
             let count = dto.secrets.len();
             for s in dto.secrets {
                 out.insert(s.name, s.updated_at);
@@ -266,9 +356,9 @@ impl GitHubClient for RestGitHubClient {
         target: &GitHubTarget,
     ) -> Result<(GitHubPublicKey, Vec<u64>), EnclaveError> {
         let endpoint = target.secrets_endpoint_path()?;
-        let base = self.api_base(target.host.as_str());
+        let base = self.api_base(target.host.as_str())?;
         let pk_url = format!("{base}/{endpoint}/public-key");
-        let pk_dto: GhPublicKeyDto = self
+        let pk_resp = self
             .request("GET", &pk_url, Some(token))?
             .call()
             .map_err(|_| {
@@ -276,11 +366,8 @@ impl GitHubClient for RestGitHubClient {
                     ErrorCode::UpstreamFailure,
                     "failed fetching GitHub Actions public key",
                 )
-            })?
-            .into_json()
-            .map_err(|_| {
-                EnclaveError::new(ErrorCode::UpstreamFailure, "invalid GitHub public key JSON")
             })?;
+        let pk_dto: GhPublicKeyDto = read_bounded_json(pk_resp, "invalid GitHub public key JSON")?;
 
         let mut repo_ids = Vec::new();
         if target.scope == GitHubScope::Organization {
@@ -298,7 +385,7 @@ impl GitHubClient for RestGitHubClient {
                     org.url_encoded(),
                     repo_slug.url_encoded()
                 );
-                let r_dto: GhRepoDto = self
+                let r_resp = self
                     .request("GET", &r_url, Some(token))?
                     .call()
                     .map_err(|_| {
@@ -306,11 +393,8 @@ impl GitHubClient for RestGitHubClient {
                             ErrorCode::UpstreamFailure,
                             format!("failed resolving org repository '{}'", repo_slug.as_str()),
                         )
-                    })?
-                    .into_json()
-                    .map_err(|_| {
-                        EnclaveError::new(ErrorCode::UpstreamFailure, "invalid repository JSON")
                     })?;
+                let r_dto: GhRepoDto = read_bounded_json(r_resp, "invalid repository JSON")?;
                 repo_ids.push(r_dto.id);
             }
         }
@@ -350,7 +434,7 @@ impl GitHubClient for RestGitHubClient {
         let endpoint = target.secrets_endpoint_path()?;
         let url = format!(
             "{}/{endpoint}/{}",
-            self.api_base(target.host.as_str()),
+            self.api_base(target.host.as_str())?,
             name.url_encoded()
         );
         self.request("PUT", &url, Some(token))?
@@ -374,7 +458,7 @@ impl GitHubClient for RestGitHubClient {
         let endpoint = target.secrets_endpoint_path()?;
         let url = format!(
             "{}/{endpoint}/{}",
-            self.api_base(target.host.as_str()),
+            self.api_base(target.host.as_str())?,
             name.url_encoded()
         );
         self.request("DELETE", &url, Some(token))?
@@ -393,19 +477,15 @@ impl GitHubClient for RestGitHubClient {
         &self,
         token: Option<&MemSecret>,
     ) -> Result<CommitSha40, EnclaveError> {
-        let base = self.api_base("github.com");
+        let base = self.api_base("github.com")?;
         let ref_url = format!("{base}/repos/1Password/load-secrets-action/git/ref/tags/v5");
-        let git_ref: GhGitRefDto = self
-            .request("GET", &ref_url, token)?
-            .call()
-            .map_err(|_| {
-                EnclaveError::new(
-                    ErrorCode::UpstreamFailure,
-                    "failed resolving 1Password/load-secrets-action tag",
-                )
-            })?
-            .into_json()
-            .map_err(|_| EnclaveError::new(ErrorCode::UpstreamFailure, "invalid git ref JSON"))?;
+        let git_ref_resp = self.request("GET", &ref_url, token)?.call().map_err(|_| {
+            EnclaveError::new(
+                ErrorCode::UpstreamFailure,
+                "failed resolving 1Password/load-secrets-action tag",
+            )
+        })?;
+        let git_ref: GhGitRefDto = read_bounded_json(git_ref_resp, "invalid git ref JSON")?;
 
         let mut obj = git_ref.object;
         for _ in 0..3 {
@@ -417,16 +497,10 @@ impl GitHubClient for RestGitHubClient {
                 "{base}/repos/1Password/load-secrets-action/git/tags/{}",
                 sha_checked.as_str()
             );
-            let deref: GhGitRefDto = self
-                .request("GET", &tag_url, token)?
-                .call()
-                .map_err(|_| {
-                    EnclaveError::new(ErrorCode::UpstreamFailure, "failed dereferencing git tag")
-                })?
-                .into_json()
-                .map_err(|_| {
-                    EnclaveError::new(ErrorCode::UpstreamFailure, "invalid git tag JSON")
-                })?;
+            let deref_resp = self.request("GET", &tag_url, token)?.call().map_err(|_| {
+                EnclaveError::new(ErrorCode::UpstreamFailure, "failed dereferencing git tag")
+            })?;
+            let deref: GhGitRefDto = read_bounded_json(deref_resp, "invalid git tag JSON")?;
             obj = deref.object;
         }
         if obj.obj_type != "commit" {
@@ -474,6 +548,22 @@ impl InMemoryGitHubClient {
                 org_repos: BTreeMap::from([("secretbridge".into(), 101)]),
             }),
         }
+    }
+
+    pub fn seed_unmanaged_secret(
+        &self,
+        target: &GitHubTarget,
+        name: &SecretName,
+        plaintext: &[u8],
+    ) -> Result<(), EnclaveError> {
+        let ep = target.secrets_endpoint_path()?;
+        let mut st = self.state.lock().unwrap();
+        let sealed = seal_base64(&st.pub_key.key_b64, plaintext)?;
+        st.secrets.insert(
+            (ep, name.as_str().to_string()),
+            (sealed, "2026-11-17T00:00:00Z".into()),
+        );
+        Ok(())
     }
 
     pub fn decrypt_stored_secret(

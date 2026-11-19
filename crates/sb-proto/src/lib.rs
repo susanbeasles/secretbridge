@@ -100,14 +100,79 @@ mod tests {
     }
 
     #[test]
-    fn rejects_flag_injection_host_closing_s3() {
+    fn rejects_flag_injection_ip_and_local_hosts_closing_s3_and_c1() {
         assert!("-evil.flag".parse::<GitHubHost>().is_err());
         assert!("https://github.com".parse::<GitHubHost>().is_err());
         assert!("github.com:8443".parse::<GitHubHost>().is_err());
+        assert!("127.0.0.1".parse::<GitHubHost>().is_err());
+        assert!("169.254.169.254".parse::<GitHubHost>().is_err());
+        assert!("10.0.2.2".parse::<GitHubHost>().is_err());
+        assert!("::1".parse::<GitHubHost>().is_err());
+        assert!("localhost".parse::<GitHubHost>().is_err());
+        assert!("api.localhost".parse::<GitHubHost>().is_err());
+        assert!("ghe.corp.local".parse::<GitHubHost>().is_err());
+        assert!("ghe.corp.internal".parse::<GitHubHost>().is_err());
         assert_eq!(
             "GitHub.COM".parse::<GitHubHost>().unwrap().as_str(),
             "github.com"
         );
+    }
+
+    #[test]
+    fn serde_deserialize_enforces_validation_and_case_insensitive_collisions_closing_c5() {
+        // Direct serde_json::from_str::<Manifest> (bypassing from_json_str) must still run validate()
+        let bad_whitespace = r#"{
+          "version": 2,
+          "project": "demo",
+          "account": "vespoli 1password.com",
+          "environments": {
+            "dev": { "vault": "vault-dev-01", "secrets": {} }
+          }
+        }"#;
+        assert!(serde_json::from_str::<Manifest>(bad_whitespace).is_err());
+
+        let bad_vault_ws = r#"{
+          "version": 2,
+          "project": "demo",
+          "account": "vespoli.1password.com",
+          "environments": {
+            "dev": { "vault": "vault dev", "secrets": {} }
+          }
+        }"#;
+        assert!(serde_json::from_str::<Manifest>(bad_vault_ws).is_err());
+
+        // Case-insensitive GitHub repo/env collision across two environments must fail
+        let colliding_gh = r#"{
+          "version": 2,
+          "project": "demo",
+          "account": "vespoli.1password.com",
+          "environments": {
+            "dev": {
+              "vault": "vault-dev-01",
+              "secrets": {
+                "API_KEY": { "ref": "op://vault-dev-01/item/f", "state": "present", "github": true, "aws": false }
+              },
+              "github": {
+                "scope": "environment",
+                "repository": "susanbeasles/secretbridge",
+                "environment": "Prod"
+              }
+            },
+            "prod": {
+              "vault": "vault-prod-01",
+              "secrets": {
+                "API_KEY": { "ref": "op://vault-prod-01/item/f", "state": "present", "github": true, "aws": false }
+              },
+              "github": {
+                "scope": "environment",
+                "repository": "SusanBeasles/SecretBridge",
+                "environment": "prod"
+              }
+            }
+          }
+        }"#;
+        let err = serde_json::from_str::<Manifest>(colliding_gh).unwrap_err();
+        assert!(err.to_string().contains("collision in GitHub targets"));
     }
 
     #[test]
@@ -168,14 +233,17 @@ mod tests {
     }
 
     #[test]
-    fn plan_hmac_rejects_tampering_and_expiry_closing_s4() {
+    fn plan_hmac_rejects_tampering_expiry_replay_and_key_rotation_closing_s4_and_h3() {
         let m = Manifest::from_json_str(sample_valid_manifest_json()).unwrap();
         let signer = PlanSigner::new([0x42; 32], 300);
         let unsigned = UnsignedPlan {
+            plan_id: "plan-nonce-001".into(),
             version: 2,
             environment: "dev".parse().unwrap(),
             manifest_digest: sha256_hex(&m).unwrap(),
             source_revision_digest: "rev-abc".into(),
+            credentials_fingerprint: "cred-fp-01".into(),
+            github_actor: Some("anthonyvespoli".into()),
             aws_identity: None,
             issued_at_unix_secs: 1_000,
             operations: vec![PlannedOp::Github {
@@ -188,10 +256,23 @@ mod tests {
                 observed_updated_at: None,
             }],
         };
-        let mut signed = signer.sign(unsigned).unwrap();
+        let mut signed = signer.sign(unsigned.clone()).unwrap();
         assert!(signer.verify(&signed, 1_120).is_ok());
         // Expired
         assert!(signer.verify(&signed, 1_301).is_err());
+        // Single-use consume succeeds once, then rejects replay!
+        assert!(signer.consume_verified(&signed, 1_120).is_ok());
+        assert!(signer.verify(&signed, 1_120).is_err());
+        assert!(signer.consume_verified(&signed, 1_120).is_err());
+
+        // Key rotation invalidates newly signed plans from prior key
+        let mut u2 = unsigned;
+        u2.plan_id = "plan-nonce-002".into();
+        let signed2 = signer.sign(u2).unwrap();
+        assert!(signer.verify(&signed2, 1_120).is_ok());
+        signer.rotate_key([0x99; 32]).unwrap();
+        assert!(signer.verify(&signed2, 1_120).is_err());
+
         // Tampered environment
         signed.plan.source_revision_digest = "rev-evil".into();
         assert!(signer.verify(&signed, 1_120).is_err());
@@ -211,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn noise_ik_mutually_authenticates_and_chunks_large_payloads() {
+    fn noise_ik_mutually_authenticates_rekeys_and_rejects_empty_continuations_closing_h1() {
         let enclave_kp = generate_noise_keypair().unwrap();
         let client_kp = generate_noise_keypair().unwrap();
         let rogue_kp = generate_noise_keypair().unwrap();
@@ -227,6 +308,11 @@ mod tests {
                 NoiseSession::accept_responder(&mut s_sock, &enclave_priv, &client_pub).unwrap();
             let msg = session.recv_message(&mut s_sock).unwrap();
             session.send_message(&mut s_sock, &msg).unwrap();
+            // Exercise > 1024 frames to verify synchronized transport auto-rekeying
+            for _ in 0..1_030 {
+                let ping = session.recv_message(&mut s_sock).unwrap();
+                session.send_message(&mut s_sock, &ping).unwrap();
+            }
         });
 
         let mut client =
@@ -236,7 +322,36 @@ mod tests {
         client.send_message(&mut c_sock, &large_payload).unwrap();
         let echoed = client.recv_message(&mut c_sock).unwrap();
         assert_eq!(&echoed[..], &large_payload[..]);
+        for _ in 0..1_030 {
+            client.send_message(&mut c_sock, b"ok").unwrap();
+            let pong = client.recv_message(&mut c_sock).unwrap();
+            assert_eq!(&pong[..], b"ok");
+        }
         server.join().unwrap();
+
+        // Craft an encrypted empty continuation chunk `[0x01]` via raw snow transport and verify H1 rejection
+        let (mut bad_c, mut bad_s) = std::os::unix::net::UnixStream::pair().unwrap();
+        let bad_srv = thread::spawn(move || {
+            let mut session =
+                NoiseSession::accept_responder(&mut bad_s, &enclave_priv, &client_pub).unwrap();
+            session.recv_message(&mut bad_s)
+        });
+        let params: snow::params::NoiseParams = super::crypto::NOISE_PATTERN.parse().unwrap();
+        let mut hs = snow::Builder::new(params)
+            .local_private_key(&client_priv)
+            .remote_public_key(&enclave_pub)
+            .build_initiator()
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n1 = hs.write_message(&[], &mut buf).unwrap();
+        super::crypto::write_raw_frame(&mut bad_c, &buf[..n1]).unwrap();
+        let m2 = super::crypto::read_raw_frame(&mut bad_c).unwrap();
+        hs.read_message(&m2, &mut buf).unwrap();
+        let mut tp = hs.into_transport_mode().unwrap();
+        let n_ct = tp.write_message(&[0x01u8], &mut buf).unwrap();
+        super::crypto::write_raw_frame(&mut bad_c, &buf[..n_ct]).unwrap();
+        let err = bad_srv.join().unwrap().unwrap_err();
+        assert!(err.to_string().contains("empty continuation"));
 
         // Rogue client with unauthorized static key must be rejected by enclave responder
         let (mut rc_sock, mut rs_sock) = std::os::unix::net::UnixStream::pair().unwrap();

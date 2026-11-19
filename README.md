@@ -1,37 +1,40 @@
 # SecretBridge for 1Password (`me.vespoli.secretbridge`)
 
-Zero-trust 1Password secret orchestration for JetBrains IDEs (`2024.3+`, build `243+`), backed by an isolated separate-kernel Linux microVM Rust enclave over `AF_VSOCK` and end-to-end `Noise_IK_25519_ChaChaPoly_BLAKE2s` transport encryption.
+Zero-trust 1Password secret orchestration for JetBrains IDEs (`2024.3+`, build `243+`), backed by an isolated separate-kernel Linux microVM Rust enclave over `AF_VSOCK` and true end-to-end `Noise_IK_25519_ChaChaPoly_BLAKE2s` transport encryption between the Kotlin IDE plugin and the guest enclave.
 
 ## Architecture Overview
 
-SecretBridge splits secret handling across three trust zones so plaintext application secrets never reside on the JetBrains JVM heap:
+SecretBridge splits secret handling across three trust zones so plaintext application secrets never reside on the JetBrains JVM heap or in the host bridge:
 
 1. **`crates/sb-proto` (`#![forbid(unsafe_code)]`)**:
    - Strict 7-bit ASCII validated newtypes (`Manifest`, `OpRef`, `SecretName`, `GitHubTarget`, `AwsTarget`, `RecoveryDays`, `CommitSha40`) with `#[serde(deny_unknown_fields)]` (rejecting legacy v0.1.0 `tools` execution blocks).
-   - Mutual-authenticated `Noise_IK` length-prefixed framing (`<= 1 MiB` frames), libsodium-compatible `crypto_box` (`X25519XSalsa20Poly1305`) sealed boxes, and ephemeral enclave HMAC-SHA256 `SignedPlan` verification.
+   - Mutually-authenticated `Noise_IK` length-prefixed framing (`<= 1 MiB` messages, synchronized `1,024`-frame transport cipherstate rekeying), libsodium-compatible `crypto_box` (`X25519XSalsa20Poly1305`) sealed boxes, and canonical RFC-8785-sorted enclave HMAC-SHA256 `SignedPlan` verification.
 2. **`crates/sb-enclave` (Isolated Guest MicroVM Daemon)**:
+   - Runs as hardened Linux PID 1 inside a minimal `glibc` initramfs (`MS_NOSUID | MS_NOEXEC | MS_NODEV` pseudo-filesystems, pure-Rust `ioctl` network bring-up, zero guest shell).
    - Stores secret material inside `memfd_secret(2)` / `mlock(2)` + `MADV_DONTDUMP` (`MemSecret`) backed by Rust `1.100.0` `std::mem::DropGuard` zeroization.
-   - Connects directly to 1Password via SHA-256-pinned `libop_uniffi_core.so` (`O_NOFOLLOW` + `/proc/self/fd/{fd}` verification prior to `dlopen`) behind the `VaultProvider` trait -- no `op` CLI and no sidecar containers.
-   - Enforces `SAFE_ITEM_CATEGORIES` (`SECURE_NOTE`, `API_CREDENTIAL`, `PASSWORD`, `DATABASE`, `SERVER`), blocks Personal/Private/Employee vaults, and gates vault creation on `OP_SERVICE_ACCOUNT_TOKEN` `can_create_vaults` permissions.
-   - Executes pure-Rust (`rustls`) AWS Secrets Manager + STS SigV4 calls (`GetCallerIdentity` account verification, `secretbridge:managed=true` ownership tag enforcement, `7..=30` day recovery window, `DescribeSecret` metadata allowlisting) and pure-Rust GitHub Actions secret encryption (`X25519XSalsa20Poly1305` sealed boxes, RFC-3986 segment encoding, mandatory org repository allowlists).
+   - Connects directly to 1Password via SHA-256-pinned `libop_uniffi_core.so` (`O_NOFOLLOW` + `/proc/self/fd/{fd}` verification prior to `dlopen`, Mozilla UniFFI `RustBuffer`/`ForeignBytes`/`RustCallStatus` C-ABI) behind the `VaultProvider` trait -- no `op` CLI and no sidecar containers.
+   - Enforces `SAFE_ITEM_CATEGORIES` (`SECURE_NOTE`, `API_CREDENTIAL`, `PASSWORD`, `DATABASE`, `SERVER`), blocks Personal/Private/Employee vaults, preserves unmanaged sibling fields byte-for-byte in `MemSecret` during updates, and gates vault creation on `OP_SERVICE_ACCOUNT_TOKEN` `can_create_vaults` permissions.
+   - Executes pure-Rust (`rustls`) AWS Secrets Manager + STS SigV4 calls (`GetCallerIdentity` account verification, session destination allowlists, `secretbridge:managed=true` ownership tag enforcement, `7..=30` day recovery window, `DescribeSecret` metadata allowlisting) and pure-Rust GitHub Actions secret encryption (`X25519XSalsa20Poly1305` sealed boxes, RFC-3986 segment encoding, mandatory org repository allowlists, explicit opt-in for unmanaged GitHub secret deletion).
    - Generates new secrets strictly inside the guest kernel via OS CSPRNG and mints 15-second single-use `X25519` capture challenges (`pk_capture`) for external secret ingestion.
-3. **`crates/sb-host` (Native Host VMM Controller & Armed Copy Hijack)**:
-   - Verifies guest kernel and initramfs SHA-256 digests (`O_NOFOLLOW`) before booting a network-restricted microVM over `AF_VSOCK`.
+3. **`crates/sb-host` (Native Host VMM Controller & Blind Frame Relay)**:
+   - Verifies guest kernel, initramfs, and VMM binary SHA-256 digests (`O_NOFOLLOW`) into write-sealed anonymous `memfd_create` descriptors (`F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`) on Linux (or `0400` private copies on macOS) before booting a network-restricted microVM (`Virtualization.framework` `VZVirtualMachine` + `VZVirtioSocketDeviceConfiguration` on `macOS arm64`; `/dev/kvm` + `/dev/vhost-vsock` on Linux `x86_64`/`aarch64`).
+   - Acts purely as an untrusted raw frame relay (`HostCommand::NoiseTunnel`) for `Noise_IK` ciphertext between the IDE and `sb-enclave` -- `sb-host` holds zero `Noise_IK` private keys.
    - Performs symlink-safe, mode-preserving atomic `fsync` reads/writes of `<project>/secretbridge.json`.
-   - Implements a 15-second single-shot `DropGuard`-backed **Armed Copy Hijack**:
-     - **macOS `arm64`**: Active `CGEventTap` (`kCGSessionEventTap`) swallows the next `Cmd+C`, reads `kAXSelectedTextAttribute` via `AXUIElement` directly into `mlock()` RAM, seals to `pk_capture`, zeroizes, and tears down the tap immediately; paired with a `1ms` `NSPasteboard` snapshot-capture-restore fallback for web "Copy" buttons.
-     - **Linux `x86_64` / `aarch64`**: Single-shot X11 `XGrabKey` (`Ctrl+C`) + `PRIMARY` selection read/wipe into `mlock()` RAM, or Wayland single-shot clipboard stream capture + prior-clipboard restore.
+   - Implements a 15-second single-shot `DropGuard`-backed **Armed Copy Hijack** (`HostCommand::CaptureAndSeal`, zero child subprocesses):
+     - **macOS `arm64`**: Active `CGEventTap` (`kCGSessionEventTap`) swallows the next `Cmd+C`, reads `kAXSelectedTextAttribute` via `AXUIElement` directly into `mlock()` RAM, seals to `pk_capture`, zeroizes, and tears down the tap immediately; paired with a `1ms` `NSPasteboard` multi-representation snapshot-capture-restore fallback (`ConcealedType` / `TransientType`) for web "Copy" buttons.
+     - **Linux `x86_64` / `aarch64`**: Single-shot X11 `XGrabKey` (`Ctrl+C` / `Ctrl+Shift+C`) + `XConvertSelection` (`PRIMARY` / `CLIPBOARD`, including `INCR`) into `mlock()` RAM, or native Wayland wire-protocol (`zwlr-data-control-manager-v1` / `ext-data-control-manager-v1`) pipe stream capture + prior-clipboard restore without spawning `wl-paste` / `wl-copy` / `xclip`.
 4. **`plugin/` (JetBrains IDE Frontend - Kotlin 2.x + Gradle 9.3.0)**:
    - Targets IntelliJ Platform `2024.3+` (`since-build = "243"`).
-   - Stores non-secret paths in `secretbridge.xml` and bootstrap credentials in OS Keychain (`PasswordSafe`), streaming them off-EDT via zeroized `CharArray` JSON buffers to `sb-host` over a mode-`0600` Java 21 `UnixDomainSocketAddress` channel.
+   - Terminates `Noise_IK_25519_ChaChaPoly_BLAKE2s` directly in pure JDK 21 (`NoiseIkSession.kt`) using a persistent client static keypair stored in `PasswordSafe` and pinning the enclave's static public key.
+   - Stores non-secret paths and destination allowlists in `secretbridge.xml` and bootstrap credentials in OS Keychain (`PasswordSafe`), streaming them off-EDT via zeroized `CharArray` JSON buffers (`JsonSecretChars`) directly through the `Noise_IK` session to `sb-enclave`.
    - Provides the **SecretBridge** tool window (capability-gated vault creation, metadata-only item/field browser, in-VM CSPRNG generator, 15s countdown Armed Copy capture, signed plan diff preview & apply, template renderer) and a VFS-cached `ReferenceCompletionContributor`.
 
 ## Toolchain & Supply-Chain Requirements
 
 - **Rust `1.100.0`** (`edition = "2024"`, `rust-version = "1.100.0"`, `clippy`, `rustfmt`).
-- **JDK `21`** toolchain + **Gradle `9.3.0`** wrapper (`plugin/gradlew`).
+- **JDK `21`** toolchain + **Gradle `9.3.0`** wrapper (`plugin/gradlew`, SHA-256 verified).
 - **Supported v1 Host Platforms**:
-  - `macOS arm64` (`Virtualization.framework` entitlement `com.apple.security.virtualization` + Accessibility permission for zero-pasteboard `CGEventTap`).
+  - `macOS arm64` (`Virtualization.framework` entitlement `com.apple.security.virtualization` + Accessibility & Input Monitoring permissions for zero-pasteboard `CGEventTap`).
   - `Linux x86_64` / `aarch64` (`/dev/kvm` + `/dev/vhost-vsock` `AF_VSOCK`).
   - *(Intel macOS `x86_64`, Windows, `SecretRunConfiguration` local app execution, and HTTP credential-injecting proxies are intentionally excluded from v1.)*
 
@@ -40,13 +43,15 @@ SecretBridge splits secret handling across three trust zones so plaintext applic
 Because repository guardrails prohibit automated edits to `.cargo/config*`, add the following manually to `.cargo/config.toml` on developer machines and CI runners:
 
 ```toml
+[registry]
+global-min-publish-age = "7 days"
+
+[registries.crates-io]
+min-publish-age = "7 days"
+
 [resolver]
-# Require crates.io releases to be published at least 7 days before resolution
-# (supported in modern Cargo; adjust window per your release policy).
 incompatible-rust-versions = "fallback"
 ```
-
-*(Note: When running Cargo `1.100.0+` with `min-publish-age` enabled, add `min-publish-age = "7d"` under `[resolver]` or `[net]` per your Cargo `1.100.0` policy.)*
 
 ## Building & Verifying
 
@@ -54,16 +59,16 @@ incompatible-rust-versions = "fallback"
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
 ### 2. Guest MicroVM Minimal `glibc` Initramfs (`Linux`)
 
-`libop_uniffi_core.so` links against `glibc` (`libc.so.6`, `libm.so.6`, `libgcc_s.so.1`, dynamic loader) rather than pure `musl`. Build the minimal guest initramfs image and record its SHA-256 digest:
+`libop_uniffi_core.so` links against `glibc` (`libc.so.6`, `libm.so.6`, `libgcc_s.so.1`, dynamic loader) rather than pure `musl`. Build `sb-enclave` with the pinned `libop_uniffi_core.so` SHA-256 digest baked in at compile time (`SB_PINNED_OP_CORE_SHA256`) and package the minimal guest initramfs image:
 
 ```sh
-cargo build --release -p sb-enclave
+SB_PINNED_OP_CORE_SHA256=<64-hex-sha256> cargo build --release --locked -p sb-enclave
 OP_UNIFFI_LIB=/path/to/pinned/libop_uniffi_core.so \
 OP_UNIFFI_SHA256=<64-hex-sha256> \
   bash vm/build-initramfs.sh
@@ -77,12 +82,16 @@ OP_UNIFFI_SHA256=<64-hex-sha256> \
 ./plugin/gradlew -p plugin verifyPlugin
 ```
 
-The installable plugin archive is written to `plugin/build/distributions/`. Install it in IntelliJ IDEA / WebStorm / GoLand / PyCharm / RustRover (`2024.3+`) via **Settings -> Plugins -> Gear Icon -> Install Plugin from Disk...**, then configure `sb-host` and microVM image SHA-256 digests under **Settings -> Tools -> SecretBridge for 1Password**.
+The installable plugin archive is written to `plugin/build/distributions/`. Install it in IntelliJ IDEA / WebStorm / GoLand / PyCharm / RustRover (`2024.3+`) via **Settings -> Plugins -> Gear Icon -> Install Plugin from Disk...**, then configure `sb-host`, microVM image SHA-256 digests, and cloud destination allowlists under **Settings -> Tools -> SecretBridge for 1Password**.
 
-### 4. Offline Completion Gate
+### 4. Completion Gate
 
 ```sh
+# Offline (default when dependencies are pre-cached):
 make check
+# Online (fresh CI or developer machine):
+SB_ONLINE=1 make check
+
 bash .guard/checks/on-stop
 ```
 

@@ -1,28 +1,168 @@
 use crate::manifest_io::HostError;
-use sb_proto::crypto::{NoiseSession, StaticKeypair, constant_time_eq_32, generate_noise_keypair};
+use sb_proto::crypto::constant_time_eq_32;
 use sb_proto::error::ErrorCode;
-use sb_proto::rpc::{EnclaveRequest, EnclaveResponse};
 use sha2::{Digest, Sha256};
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::DropGuard;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use zeroize::Zeroizing;
 
 pub const DEFAULT_GUEST_CID: u32 = 42;
 pub const DEFAULT_VSOCK_PORT: u32 = 5190;
+const MAX_BOOT_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB ceiling
+const MAX_SERIAL_BANNER_BYTES: usize = 64 * 1024; // 64 KiB pre-banner bound
+
+/// Returns the default absolute VMM binary path for the current Linux host architecture.
+pub fn default_vmm_binary_path() -> PathBuf {
+    if cfg!(target_arch = "aarch64") {
+        PathBuf::from("/usr/bin/qemu-system-aarch64")
+    } else {
+        PathBuf::from("/usr/bin/qemu-system-x86_64")
+    }
+}
+
+/// Verifies an executable host binary (`qemu-system-*` or `sb-enclave`) before spawning:
+/// rejects leading `-`, requires an absolute path, opens with `O_NOFOLLOW`, verifies regular
+/// executable file permissions without world-write bit, and optionally pins SHA-256 (`H4`).
+pub fn verify_executable_binary(
+    path: &Path,
+    expected_sha256: Option<&[u8; 32]>,
+    label: &str,
+) -> Result<PathBuf, HostError> {
+    let raw_str = path.to_string_lossy();
+    if raw_str.is_empty() || raw_str.starts_with('-') {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            format!("{label} binary path must not be empty or start with '-'"),
+        ));
+    }
+    if !path.is_absolute() {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            format!("{label} binary path must be absolute"),
+        ));
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            HostError::new(
+                ErrorCode::Validation,
+                format!("unable to open {label} binary '{}': {e}", path.display()),
+            )
+        })?;
+    let meta = file.metadata().map_err(|e| {
+        HostError::new(
+            ErrorCode::Validation,
+            format!("unable to stat {label} binary: {e}"),
+        )
+    })?;
+    if !meta.is_file() {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            format!("{label} binary must be a regular file"),
+        ));
+    }
+    let mode = meta.permissions().mode();
+    if (mode & 0o111) == 0 {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            format!("{label} binary is not executable"),
+        ));
+    }
+    if (mode & 0o002) != 0 {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            format!("refusing to execute world-writable {label} binary"),
+        ));
+    }
+
+    if let Some(expected) = expected_sha256 {
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            let n = file.read(&mut buf).map_err(|e| {
+                HostError::new(
+                    ErrorCode::Validation,
+                    format!("error hashing {label} binary: {e}"),
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let actual: [u8; 32] = hasher.finalize().into();
+        if !constant_time_eq_32(&actual, expected) {
+            return Err(HostError::new(
+                ErrorCode::CryptoFailure,
+                format!("{label} binary SHA-256 verification failed against pinned digest"),
+            ));
+        }
+    }
+
+    Ok(path.to_path_buf())
+}
 
 /// Verifies a kernel or initramfs image with `O_NOFOLLOW`, regular-file check, non-world-writable
-/// permissions, and constant-time SHA-256 comparison BEFORE passing it to the VMM (closes S9/S12).
+/// permissions, and constant-time SHA-256 comparison.
 pub fn verify_boot_artifact_sha256(
     path: &Path,
     expected_sha256: &[u8; 32],
     label: &str,
 ) -> Result<(), HostError> {
-    let mut file = OpenOptions::new()
+    let _sealed = open_and_seal_boot_artifact(path, expected_sha256, label, None)?;
+    Ok(())
+}
+
+/// Immutable verified boot image handle eliminating filesystem TOCTOU between SHA-256 verification
+/// and VMM ingestion (`H4`):
+/// - On Linux: backed by an anonymous `memfd_create` sealed with
+///   `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE` and passed via `/proc/self/fd/<fd>`.
+/// - On macOS: backed by a mode-`0400` `O_EXCL | O_NOFOLLOW` copy in a private `0700` staging dir.
+pub struct SealedBootArtifact {
+    vmm_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    memfd_file: File,
+    #[cfg(not(target_os = "linux"))]
+    staged_cleanup_path: Option<PathBuf>,
+}
+
+impl SealedBootArtifact {
+    pub fn vmm_path(&self) -> &Path {
+        &self.vmm_path
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.memfd_file.as_raw_fd()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for SealedBootArtifact {
+    fn drop(&mut self) {
+        if let Some(path) = self.staged_cleanup_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub fn open_and_seal_boot_artifact(
+    path: &Path,
+    expected_sha256: &[u8; 32],
+    label: &str,
+    staging_dir: Option<&Path>,
+) -> Result<SealedBootArtifact, HostError> {
+    let mut src = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
@@ -32,7 +172,7 @@ pub fn verify_boot_artifact_sha256(
                 format!("unable to open {label} artifact '{}': {e}", path.display()),
             )
         })?;
-    let meta = file.metadata().map_err(|e| {
+    let meta = src.metadata().map_err(|e| {
         HostError::new(
             ErrorCode::Validation,
             format!("unable to stat {label} artifact: {e}"),
@@ -44,20 +184,65 @@ pub fn verify_boot_artifact_sha256(
             format!("{label} artifact must be a regular file"),
         ));
     }
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if (meta.permissions().mode() & 0o002) != 0 {
-            return Err(HostError::new(
-                ErrorCode::Validation,
-                format!("refusing to boot world-writable {label} artifact"),
-            ));
-        }
+    if meta.len() == 0 || meta.len() > MAX_BOOT_ARTIFACT_BYTES {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            format!("{label} artifact size must be between 1 byte and 512 MiB"),
+        ));
     }
+    if (meta.permissions().mode() & 0o002) != 0 {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            format!("refusing to boot world-writable {label} artifact"),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = staging_dir;
+        open_and_seal_linux_memfd(&mut src, expected_sha256, label)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        open_and_stage_private_copy(&mut src, expected_sha256, label, path, staging_dir)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_and_seal_linux_memfd(
+    src: &mut File,
+    expected_sha256: &[u8; 32],
+    label: &str,
+) -> Result<SealedBootArtifact, HostError> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // SAFETY: `c"sb_boot_artifact"` is NUL-terminated; `MFD_CLOEXEC | MFD_ALLOW_SEALING` creates an
+    // unlinked anonymous file descriptor owned exclusively by this process.
+    let raw_fd = unsafe {
+        libc::memfd_create(
+            c"sb_boot_artifact".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(HostError::new(
+            ErrorCode::InternalError,
+            format!(
+                "memfd_create failed for {label}: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    // SAFETY: `raw_fd` was freshly returned by `memfd_create`.
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let mut memfd_file = File::from(owned_fd);
 
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 32 * 1024];
+    let mut total = 0u64;
     loop {
-        let n = file.read(&mut buf).map_err(|e| {
+        let n = src.read(&mut buf).map_err(|e| {
             HostError::new(
                 ErrorCode::Validation,
                 format!("error reading {label} artifact: {e}"),
@@ -66,8 +251,22 @@ pub fn verify_boot_artifact_sha256(
         if n == 0 {
             break;
         }
+        total = total.saturating_add(n as u64);
+        if total > MAX_BOOT_ARTIFACT_BYTES {
+            return Err(HostError::new(
+                ErrorCode::Validation,
+                format!("{label} artifact exceeded 512 MiB while streaming"),
+            ));
+        }
         hasher.update(&buf[..n]);
+        memfd_file.write_all(&buf[..n]).map_err(|e| {
+            HostError::new(
+                ErrorCode::InternalError,
+                format!("failed writing {label} to sealed memfd: {e}"),
+            )
+        })?;
     }
+
     let actual: [u8; 32] = hasher.finalize().into();
     if !constant_time_eq_32(&actual, expected_sha256) {
         return Err(HostError::new(
@@ -75,22 +274,237 @@ pub fn verify_boot_artifact_sha256(
             format!("{label} SHA-256 verification failed against pinned digest"),
         ));
     }
-    Ok(())
+
+    memfd_file.seek(SeekFrom::Start(0)).map_err(|e| {
+        HostError::new(
+            ErrorCode::InternalError,
+            format!("failed rewinding {label} memfd: {e}"),
+        )
+    })?;
+
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    // SAFETY: `memfd_file` was created with `MFD_ALLOW_SEALING`; sealing freezes its contents.
+    let rc = unsafe { libc::fcntl(memfd_file.as_raw_fd(), libc::F_ADD_SEALS, seals) };
+    if rc < 0 {
+        return Err(HostError::new(
+            ErrorCode::InternalError,
+            format!(
+                "fcntl(F_ADD_SEALS) failed for {label}: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+
+    let fd_num = memfd_file.as_raw_fd();
+    Ok(SealedBootArtifact {
+        vmm_path: PathBuf::from(format!("/proc/self/fd/{fd_num}")),
+        memfd_file,
+    })
 }
 
-#[derive(Debug, Clone)]
+#[cfg(not(target_os = "linux"))]
+fn open_and_stage_private_copy(
+    src: &mut File,
+    expected_sha256: &[u8; 32],
+    label: &str,
+    original_path: &Path,
+    staging_dir: Option<&Path>,
+) -> Result<SealedBootArtifact, HostError> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 32 * 1024];
+
+    if let Some(dir) = staging_dir {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            HostError::new(
+                ErrorCode::InternalError,
+                format!("failed creating boot staging dir: {e}"),
+            )
+        })?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            HostError::new(
+                ErrorCode::InternalError,
+                format!("failed securing boot staging dir permissions: {e}"),
+            )
+        })?;
+        let staged_path = dir.join(format!(".sb-{label}-{}.img", uuid::Uuid::new_v4().simple()));
+        let mut dst = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&staged_path)
+            .map_err(|e| {
+                HostError::new(
+                    ErrorCode::InternalError,
+                    format!("failed creating staged {label} copy: {e}"),
+                )
+            })?;
+        let guard = DropGuard::new(staged_path.clone(), |p| {
+            let _ = std::fs::remove_file(p);
+        });
+        let mut total = 0u64;
+        loop {
+            let n = src.read(&mut buf).map_err(|e| {
+                HostError::new(
+                    ErrorCode::Validation,
+                    format!("error reading {label} artifact: {e}"),
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(n as u64);
+            if total > MAX_BOOT_ARTIFACT_BYTES {
+                return Err(HostError::new(
+                    ErrorCode::Validation,
+                    format!("{label} artifact exceeded 512 MiB"),
+                ));
+            }
+            hasher.update(&buf[..n]);
+            dst.write_all(&buf[..n]).map_err(|e| {
+                HostError::new(
+                    ErrorCode::InternalError,
+                    format!("failed writing staged {label} copy: {e}"),
+                )
+            })?;
+        }
+        dst.sync_all().map_err(|e| {
+            HostError::new(
+                ErrorCode::InternalError,
+                format!("failed syncing staged {label} copy: {e}"),
+            )
+        })?;
+        drop(dst);
+        let actual: [u8; 32] = hasher.finalize().into();
+        if !constant_time_eq_32(&actual, expected_sha256) {
+            return Err(HostError::new(
+                ErrorCode::CryptoFailure,
+                format!("{label} SHA-256 verification failed against pinned digest"),
+            ));
+        }
+        let confirmed = DropGuard::dismiss(guard);
+        Ok(SealedBootArtifact {
+            vmm_path: confirmed.clone(),
+            staged_cleanup_path: Some(confirmed),
+        })
+    } else {
+        loop {
+            let n = src.read(&mut buf).map_err(|e| {
+                HostError::new(
+                    ErrorCode::Validation,
+                    format!("error reading {label} artifact: {e}"),
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let actual: [u8; 32] = hasher.finalize().into();
+        if !constant_time_eq_32(&actual, expected_sha256) {
+            return Err(HostError::new(
+                ErrorCode::CryptoFailure,
+                format!("{label} SHA-256 verification failed against pinned digest"),
+            ));
+        }
+        Ok(SealedBootArtifact {
+            vmm_path: original_path.to_path_buf(),
+            staged_cleanup_path: None,
+        })
+    }
+}
+
+/// Raw full-duplex byte stream connected to the guest enclave's `Noise_IK` responder port.
+/// `sb-host` forwards raw `Noise_IK` ciphertext frames over this stream without holding any
+/// Noise session keys (`C2`).
+pub enum RawEnclaveStream {
+    Unix(std::os::unix::net::UnixStream),
+    SocketFile(File),
+}
+
+impl RawEnclaveStream {
+    pub fn try_clone(&self) -> io::Result<Self> {
+        match self {
+            Self::Unix(s) => s.try_clone().map(Self::Unix),
+            Self::SocketFile(f) => f.try_clone().map(Self::SocketFile),
+        }
+    }
+
+    pub fn shutdown_write(&self) {
+        use std::os::fd::AsRawFd;
+        match self {
+            Self::Unix(s) => {
+                let _ = s.shutdown(std::net::Shutdown::Write);
+            }
+            Self::SocketFile(f) => {
+                // SAFETY: `f` wraps a valid stream socket fd (`AF_VSOCK` or `VZVirtioSocketConnection`).
+                unsafe {
+                    let _ = libc::shutdown(f.as_raw_fd(), libc::SHUT_WR);
+                }
+            }
+        }
+    }
+
+    pub fn shutdown_both(&self) {
+        use std::os::fd::AsRawFd;
+        match self {
+            Self::Unix(s) => {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+            Self::SocketFile(f) => {
+                // SAFETY: `f` wraps a valid stream socket fd.
+                unsafe {
+                    let _ = libc::shutdown(f.as_raw_fd(), libc::SHUT_RDWR);
+                }
+            }
+        }
+    }
+}
+
+impl Read for RawEnclaveStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Unix(s) => s.read(buf),
+            Self::SocketFile(f) => f.read(buf),
+        }
+    }
+}
+
+impl Write for RawEnclaveStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Unix(s) => s.write(buf),
+            Self::SocketFile(f) => f.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Unix(s) => s.flush(),
+            Self::SocketFile(f) => f.flush(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub enum EnclaveEndpoint {
     /// Linux KVM separate-kernel microVM (`AF_VSOCK` CID + port).
     Vsock { cid: u32, port: u32 },
-    /// Mode-0600 Unix domain socket bridge (macOS `VZVirtioSocketDevice` host shim or local enclave).
+    /// Mode-`0600` Unix domain socket (local enclave process / CI tests).
     UnixSocket { path: PathBuf },
+    /// macOS `arm64` `Virtualization.framework` `VZVirtioSocketDevice` direct guest connection (`C4`).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    MacosVz {
+        vm: Arc<macos_vz::VzVmRuntime>,
+        port: u32,
+    },
 }
 
 pub struct ManagedEnclaveHandle {
     endpoint: EnclaveEndpoint,
-    client_keypair: StaticKeypair,
     enclave_pubkey: [u8; 32],
     child_vm: Option<Child>,
+    _boot_artifacts: Vec<SealedBootArtifact>,
 }
 
 impl Drop for ManagedEnclaveHandle {
@@ -105,37 +519,61 @@ impl Drop for ManagedEnclaveHandle {
 #[derive(Debug, Clone)]
 pub struct MicroVmLaunchSpec {
     pub vmm_binary: PathBuf,
+    pub vmm_sha256: Option<[u8; 32]>,
     pub kernel_path: PathBuf,
     pub kernel_sha256: [u8; 32],
     pub initramfs_path: PathBuf,
     pub initramfs_sha256: [u8; 32],
+    pub authorized_client_pubkey: [u8; 32],
     pub guest_cid: u32,
     pub vsock_port: u32,
     pub memory_mib: u32,
+    pub staging_dir: Option<PathBuf>,
 }
 
 impl ManagedEnclaveHandle {
     /// Connects to an already-running enclave over `AF_VSOCK` or a mode-`0600` Unix socket.
-    pub fn connect_existing(
-        endpoint: EnclaveEndpoint,
-        client_keypair: StaticKeypair,
-        enclave_pubkey: [u8; 32],
-    ) -> Self {
+    pub fn connect_existing(endpoint: EnclaveEndpoint, enclave_pubkey: [u8; 32]) -> Self {
         Self {
             endpoint,
-            client_keypair,
             enclave_pubkey,
             child_vm: None,
+            _boot_artifacts: Vec::new(),
         }
     }
 
-    /// Verifies kernel & initramfs SHA-256 digests and boots an isolated separate-kernel Linux
-    /// microVM (`qemu-system-* -M microvm -enable-kvm` with `vhost-vsock-pci`), binding the
-    /// enclave to a fresh ephemeral client `Noise_IK` static public key via kernel cmdline
-    /// and reading the enclave's fresh ephemeral `Noise_IK` static public key from serial stdout.
+    /// Boots the platform's native isolated microVM backend:
+    /// - Linux (`x86_64`/`aarch64`): KVM + QEMU (`q35` / `virt`) using `memfd`-sealed boot images
+    ///   and `AF_VSOCK` (`vhost-vsock-pci`).
+    /// - macOS (`aarch64`): `Virtualization.framework` (`VZVirtualMachine` + `VZVirtioSocketDevice`).
+    pub fn boot_native_microvm(spec: &MicroVmLaunchSpec) -> Result<Self, HostError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Self::boot_macos_vz_microvm(spec)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            Self::boot_kvm_microvm(spec)
+        }
+    }
+
+    /// Verifies VMM binary + seals kernel & initramfs into immutable `memfd`s (`H4`), then boots
+    /// a separate-kernel Linux KVM microVM bound to `spec.authorized_client_pubkey` (`C2`).
     pub fn boot_kvm_microvm(spec: &MicroVmLaunchSpec) -> Result<Self, HostError> {
-        verify_boot_artifact_sha256(&spec.kernel_path, &spec.kernel_sha256, "vmlinuz")?;
-        verify_boot_artifact_sha256(&spec.initramfs_path, &spec.initramfs_sha256, "initramfs")?;
+        let verified_vmm =
+            verify_executable_binary(&spec.vmm_binary, spec.vmm_sha256.as_ref(), "VMM")?;
+        let sealed_kernel = open_and_seal_boot_artifact(
+            &spec.kernel_path,
+            &spec.kernel_sha256,
+            "vmlinuz",
+            spec.staging_dir.as_deref(),
+        )?;
+        let sealed_initramfs = open_and_seal_boot_artifact(
+            &spec.initramfs_path,
+            &spec.initramfs_sha256,
+            "initramfs",
+            spec.staging_dir.as_deref(),
+        )?;
 
         if !Path::new("/dev/kvm").exists() {
             return Err(HostError::new(
@@ -143,70 +581,113 @@ impl ManagedEnclaveHandle {
                 "/dev/kvm is not available on this Linux host; enable KVM virtualization",
             ));
         }
+        if spec.guest_cid <= 2 {
+            return Err(HostError::new(
+                ErrorCode::Validation,
+                "guest AF_VSOCK CID must be >= 3 (CIDs 0..=2 are reserved)",
+            ));
+        }
 
-        let client_kp = generate_noise_keypair()?;
-        let client_pk_hex = hex::encode(client_kp.public);
+        let client_pk_hex = hex::encode(spec.authorized_client_pubkey);
+        let (arch_machine, console_dev) = if cfg!(target_arch = "aarch64") {
+            ("virt,accel=kvm,gic-version=3", "ttyAMA0")
+        } else {
+            ("q35,accel=kvm", "ttyS0")
+        };
         let cmdline = format!(
-            "console=ttyS0 reboot=k panic=1 pci=off nomodules quiet rdinit=/init sb.client_pubkey={client_pk_hex}"
+            "console={console_dev} reboot=k panic=1 nomodules quiet rdinit=/init sb.vsock_port={} sb.client_pubkey={client_pk_hex}",
+            spec.vsock_port
         );
 
-        let arch_machine = if cfg!(target_arch = "aarch64") {
-            "virt,accel=kvm,gic-version=3"
-        } else {
-            "microvm,accel=kvm"
-        };
+        let mut cmd = Command::new(&verified_vmm);
+        cmd.args([
+            "-machine",
+            arch_machine,
+            "-cpu",
+            "host",
+            "-m",
+            &format!("{}M", spec.memory_mib.max(128)),
+            "-smp",
+            "1",
+            "-nodefaults",
+            "-no-user-config",
+            "-nographic",
+            "-serial",
+            "stdio",
+            "-kernel",
+        ])
+        .arg(sealed_kernel.vmm_path())
+        .arg("-initrd")
+        .arg(sealed_initramfs.vmm_path())
+        .args(["-append", &cmdline])
+        .args([
+            "-object",
+            "rng-random,filename=/dev/urandom,id=rng0",
+            "-device",
+            "virtio-rng-pci,rng=rng0",
+            "-netdev",
+            "user,id=net0,restrict=off",
+            "-device",
+            "virtio-net-pci,netdev=net0",
+            "-device",
+            &format!("vhost-vsock-pci,guest-cid={},id=vsock0", spec.guest_cid),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-        let child = Command::new(&spec.vmm_binary)
-            .args([
-                "-machine",
-                arch_machine,
-                "-m",
-                &format!("{}M", spec.memory_mib.max(128)),
-                "-smp",
-                "1",
-                "-nodefaults",
-                "-no-user-config",
-                "-nographic",
-                "-serial",
-                "stdio",
-                "-kernel",
-            ])
-            .arg(&spec.kernel_path)
-            .arg("-initrd")
-            .arg(&spec.initramfs_path)
-            .args(["-append", &cmdline])
-            .args([
-                "-netdev",
-                "user,id=net0,restrict=off",
-                "-device",
-                "virtio-net-device,netdev=net0",
-                "-device",
-                &format!("vhost-vsock-device,guest-cid={},id=vsock0", spec.guest_cid),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                HostError::new(
-                    ErrorCode::TransportFailure,
-                    format!(
-                        "failed to launch microVM VMM '{}': {e}",
-                        spec.vmm_binary.display()
-                    ),
-                )
-            })?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let parent_pid = unsafe { libc::getpid() };
+            let kernel_fd = sealed_kernel.raw_fd();
+            let initrd_fd = sealed_initramfs.raw_fd();
+            // SAFETY: Runs in forked child before `execve`; uses only async-signal-safe libc calls
+            // (`prctl`, `getppid`, `fcntl`, `_exit`) to bind lifecycle to parent and pass sealed memfds.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent_pid {
+                        libc::_exit(1);
+                    }
+                    for fd in [kernel_fd, initrd_fd] {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
 
-        // Ensure child VM is killed via DropGuard if serial handshake fails or times out.
+        let child = cmd.spawn().map_err(|e| {
+            HostError::new(
+                ErrorCode::TransportFailure,
+                format!(
+                    "failed to launch microVM VMM '{}': {e}",
+                    verified_vmm.display()
+                ),
+            )
+        })?;
+
         let mut child_guard = DropGuard::new(child, |mut c| {
             let _ = c.kill();
             let _ = c.wait();
         });
 
+        if let Some(stderr) = child_guard.stderr.take() {
+            spawn_pipe_drainer(stderr);
+        }
         let stdout = child_guard.stdout.take().ok_or_else(|| {
             HostError::new(ErrorCode::TransportFailure, "missing microVM serial stdout")
         })?;
-        let enclave_pubkey = read_enclave_pubkey_banner(stdout, Duration::from_secs(15))?;
+        let enclave_pubkey = read_enclave_pubkey_banner_and_drain(stdout, Duration::from_secs(20))?;
         let confirmed_child = DropGuard::dismiss(child_guard);
 
         Ok(Self {
@@ -214,23 +695,66 @@ impl ManagedEnclaveHandle {
                 cid: spec.guest_cid,
                 port: spec.vsock_port,
             },
-            client_keypair: client_kp,
             enclave_pubkey,
             child_vm: Some(confirmed_child),
+            _boot_artifacts: vec![sealed_kernel, sealed_initramfs],
         })
     }
 
-    /// Spawns `sb-enclave` over a local mode-0600 Unix domain socket (used on macOS alongside
-    /// the `Virtualization.framework` `VZVirtioSocketDevice` bridge and in automated CI tests).
+    /// Boots an isolated Linux `arm64` microVM via Apple's `Virtualization.framework`
+    /// (`VZVirtualMachine` + `VZVirtioSocketDevice`) on macOS `arm64` (`C4`).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn boot_macos_vz_microvm(spec: &MicroVmLaunchSpec) -> Result<Self, HostError> {
+        let sealed_kernel = open_and_seal_boot_artifact(
+            &spec.kernel_path,
+            &spec.kernel_sha256,
+            "vmlinuz",
+            spec.staging_dir.as_deref(),
+        )?;
+        let sealed_initramfs = open_and_seal_boot_artifact(
+            &spec.initramfs_path,
+            &spec.initramfs_sha256,
+            "initramfs",
+            spec.staging_dir.as_deref(),
+        )?;
+
+        let client_pk_hex = hex::encode(spec.authorized_client_pubkey);
+        let cmdline = format!(
+            "console=hvc0 reboot=k panic=1 nomodules quiet rdinit=/init sb.vsock_port={} sb.client_pubkey={client_pk_hex}",
+            spec.vsock_port
+        );
+
+        let (vz_runtime, serial_reader) = macos_vz::VzVmRuntime::start(
+            sealed_kernel.vmm_path(),
+            sealed_initramfs.vmm_path(),
+            &cmdline,
+            spec.memory_mib.max(128),
+        )?;
+        let enclave_pubkey =
+            read_enclave_pubkey_banner_and_drain(serial_reader, Duration::from_secs(20))?;
+
+        Ok(Self {
+            endpoint: EnclaveEndpoint::MacosVz {
+                vm: Arc::new(vz_runtime),
+                port: spec.vsock_port,
+            },
+            enclave_pubkey,
+            child_vm: None,
+            _boot_artifacts: vec![sealed_kernel, sealed_initramfs],
+        })
+    }
+
+    /// Spawns `sb-enclave` over a local mode-`0600` Unix domain socket (used in automated CI/integration tests).
     pub fn spawn_local_bridge_process(
         enclave_bin: &Path,
         socket_path: &Path,
+        authorized_client_pubkey: [u8; 32],
         extra_args: &[String],
     ) -> Result<Self, HostError> {
-        let client_kp = generate_noise_keypair()?;
-        let client_pk_hex = hex::encode(client_kp.public);
+        let verified_bin = verify_executable_binary(enclave_bin, None, "sb-enclave")?;
+        let client_pk_hex = hex::encode(authorized_client_pubkey);
 
-        let mut cmd = Command::new(enclave_bin);
+        let mut cmd = Command::new(&verified_bin);
         cmd.arg("--unix-socket")
             .arg(socket_path)
             .arg("--authorized-client-pubkey-hex")
@@ -239,6 +763,24 @@ impl ManagedEnclaveHandle {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let parent_pid = unsafe { libc::getpid() };
+            // SAFETY: Async-signal-safe `prctl` + `getppid` in forked child before `execve`.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent_pid {
+                        libc::_exit(1);
+                    }
+                    Ok(())
+                });
+            }
+        }
 
         let child = cmd.spawn().map_err(|e| {
             HostError::new(
@@ -251,12 +793,14 @@ impl ManagedEnclaveHandle {
             let _ = c.wait();
         });
 
+        if let Some(stderr) = child_guard.stderr.take() {
+            spawn_pipe_drainer(stderr);
+        }
         let stdout = child_guard.stdout.take().ok_or_else(|| {
             HostError::new(ErrorCode::TransportFailure, "missing enclave stdout pipe")
         })?;
-        let enclave_pubkey = read_enclave_pubkey_banner(stdout, Duration::from_secs(10))?;
+        let enclave_pubkey = read_enclave_pubkey_banner_and_drain(stdout, Duration::from_secs(10))?;
 
-        // Wait up to 3s for listener socket file to appear
         let wait_deadline = Instant::now() + Duration::from_secs(3);
         while !socket_path.exists() && Instant::now() < wait_deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -267,9 +811,9 @@ impl ManagedEnclaveHandle {
             endpoint: EnclaveEndpoint::UnixSocket {
                 path: socket_path.to_path_buf(),
             },
-            client_keypair: client_kp,
             enclave_pubkey,
             child_vm: Some(confirmed_child),
+            _boot_artifacts: Vec::new(),
         })
     }
 
@@ -277,18 +821,11 @@ impl ManagedEnclaveHandle {
         &self.enclave_pubkey
     }
 
-    /// Executes a mutually-authenticated `Noise_IK` encrypted RPC call against the enclave.
-    pub fn call(&self, request: &EnclaveRequest) -> Result<EnclaveResponse, HostError> {
-        let req_bytes = Zeroizing::new(serde_json::to_vec(request).map_err(|e| {
-            HostError::new(
-                ErrorCode::Validation,
-                format!("failed serializing enclave request: {e}"),
-            )
-        })?);
-
+    /// Opens a raw stream to the guest enclave's `Noise_IK` responder port for blind frame relay (`C2`).
+    pub fn open_raw_stream(&self) -> Result<RawEnclaveStream, HostError> {
         match &self.endpoint {
             EnclaveEndpoint::UnixSocket { path } => {
-                let mut stream = std::os::unix::net::UnixStream::connect(path).map_err(|e| {
+                let stream = std::os::unix::net::UnixStream::connect(path).map_err(|e| {
                     HostError::new(
                         ErrorCode::TransportFailure,
                         format!("failed connecting to enclave socket: {e}"),
@@ -296,50 +833,95 @@ impl ManagedEnclaveHandle {
                 })?;
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(45)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(45)));
-                self.exchange_over_stream(&mut stream, &req_bytes)
+                Ok(RawEnclaveStream::Unix(stream))
             }
             EnclaveEndpoint::Vsock { cid, port } => {
-                let mut vsock_file = connect_linux_vsock(*cid, *port)?;
-                self.exchange_over_stream(&mut vsock_file, &req_bytes)
+                let vsock_file = connect_linux_vsock(*cid, *port)?;
+                Ok(RawEnclaveStream::SocketFile(vsock_file))
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            EnclaveEndpoint::MacosVz { vm, port } => {
+                let conn_file = vm.connect_vsock_port(*port)?;
+                Ok(RawEnclaveStream::SocketFile(conn_file))
             }
         }
     }
-
-    fn exchange_over_stream<S: Read + Write>(
-        &self,
-        stream: &mut S,
-        req_bytes: &[u8],
-    ) -> Result<EnclaveResponse, HostError> {
-        let mut noise = NoiseSession::connect_initiator(
-            stream,
-            &self.client_keypair.private,
-            &self.enclave_pubkey,
-        )?;
-        noise.send_message(stream, req_bytes)?;
-        let resp_bytes = noise.recv_message(stream)?;
-        serde_json::from_slice::<EnclaveResponse>(&resp_bytes).map_err(|e| {
-            HostError::new(
-                ErrorCode::TransportFailure,
-                format!("invalid enclave response JSON: {e}"),
-            )
-        })
-    }
 }
 
-fn read_enclave_pubkey_banner<R: Read + Send + 'static>(
-    reader: R,
+fn spawn_pipe_drainer<R: Read + Send + 'static>(mut reader: R) {
+    let _ = std::thread::spawn(move || {
+        let _ = io::copy(&mut reader, &mut io::sink());
+    });
+}
+
+/// Reads bounded serial output (`<= 64 KiB`) until `SB_ENCLAVE_NOISE_PUBKEY=<64-hex>` is seen,
+/// then continues draining `reader` into `io::sink()` in the background so guest serial writes
+/// never block on a full pipe (`H4`).
+fn read_enclave_pubkey_banner_and_drain<R: Read + Send + 'static>(
+    mut reader: R,
     timeout: Duration,
 ) -> Result<[u8; 32], HostError> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<String, HostError>>();
     std::thread::spawn(move || {
-        let mut buf_reader = BufReader::new(reader);
-        let mut line = String::new();
-        while buf_reader.read_line(&mut line).unwrap_or(0) > 0 {
-            if let Some(hex_pk) = line.trim().strip_prefix("SB_ENCLAVE_NOISE_PUBKEY=") {
-                let _ = tx.send(hex_pk.to_string());
-                return;
+        let mut window = Vec::with_capacity(1024);
+        let mut total_before_banner = 0usize;
+        let mut chunk = [0u8; 512];
+        let mut found = false;
+
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    if !found {
+                        let _ = tx.send(Err(HostError::new(
+                            ErrorCode::TransportFailure,
+                            "guest serial closed before emitting SB_ENCLAVE_NOISE_PUBKEY",
+                        )));
+                    }
+                    return;
+                }
+                Ok(n) => {
+                    if !found {
+                        total_before_banner = total_before_banner.saturating_add(n);
+                        if total_before_banner > MAX_SERIAL_BANNER_BYTES {
+                            let _ = tx.send(Err(HostError::new(
+                                ErrorCode::TransportFailure,
+                                "guest serial output exceeded 64 KiB before emitting SB_ENCLAVE_NOISE_PUBKEY",
+                            )));
+                            found = true;
+                            continue;
+                        }
+                        window.extend_from_slice(&chunk[..n]);
+                        while let Some(nl_pos) = window.iter().position(|&b| b == b'\n') {
+                            let line_bytes: Vec<u8> = window.drain(..=nl_pos).collect();
+                            let line = String::from_utf8_lossy(&line_bytes);
+                            if let Some(hex_pk) =
+                                line.trim().strip_prefix("SB_ENCLAVE_NOISE_PUBKEY=")
+                            {
+                                let _ = tx.send(Ok(hex_pk.trim().to_string()));
+                                found = true;
+                                window.clear();
+                                window.shrink_to_fit();
+                                break;
+                            }
+                        }
+                        if !found && window.len() > 4096 {
+                            // Bound single-line memory even if guest emits no newlines
+                            let keep_from = window.len().saturating_sub(256);
+                            window.drain(..keep_from);
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    if !found {
+                        let _ = tx.send(Err(HostError::new(
+                            ErrorCode::TransportFailure,
+                            format!("error reading guest serial output: {e}"),
+                        )));
+                    }
+                    return;
+                }
             }
-            line.clear();
         }
     });
 
@@ -348,7 +930,7 @@ fn read_enclave_pubkey_banner<R: Read + Send + 'static>(
             ErrorCode::TransportFailure,
             "timed out waiting for SB_ENCLAVE_NOISE_PUBKEY banner from guest enclave",
         )
-    })?;
+    })??;
     let raw = hex::decode(pk_hex.trim()).map_err(|_| {
         HostError::new(
             ErrorCode::CryptoFailure,
@@ -363,14 +945,38 @@ fn read_enclave_pubkey_banner<R: Read + Send + 'static>(
     })
 }
 
+fn apply_socket_timeouts(raw_fd: libc::c_int) {
+    let tv = libc::timeval {
+        tv_sec: 45,
+        tv_usec: 0,
+    };
+    // SAFETY: `raw_fd` is a valid stream socket descriptor; `tv` is initialized.
+    unsafe {
+        let _ = libc::setsockopt(
+            raw_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw const tv).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            raw_fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            (&raw const tv).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn connect_linux_vsock(cid: u32, port: u32) -> Result<std::fs::File, HostError> {
+fn connect_linux_vsock(cid: u32, port: u32) -> Result<File, HostError> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
     // SAFETY: creates a stream `AF_VSOCK` socket with `SOCK_CLOEXEC`.
     let raw_fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if raw_fd < 0 {
-        let err = std::io::Error::last_os_error();
+        let err = io::Error::last_os_error();
         return Err(HostError::new(
             ErrorCode::TransportFailure,
             format!("AF_VSOCK socket() failed: {err}"),
@@ -380,27 +986,7 @@ fn connect_linux_vsock(cid: u32, port: u32) -> Result<std::fs::File, HostError> 
         let _ = libc::close(fd);
     });
 
-    let tv = libc::timeval {
-        tv_sec: 45,
-        tv_usec: 0,
-    };
-    // SAFETY: `fd_guard` is a valid socket fd; `tv` is initialized.
-    unsafe {
-        let _ = libc::setsockopt(
-            *fd_guard,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&raw const tv).cast(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        );
-        let _ = libc::setsockopt(
-            *fd_guard,
-            libc::SOL_SOCKET,
-            libc::SO_SNDTIMEO,
-            (&raw const tv).cast(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        );
-    }
+    apply_socket_timeouts(*fd_guard);
 
     // SAFETY: zero-initializing POD `sockaddr_vm`.
     let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
@@ -417,7 +1003,7 @@ fn connect_linux_vsock(cid: u32, port: u32) -> Result<std::fs::File, HostError> 
         )
     };
     if rc < 0 {
-        let err = std::io::Error::last_os_error();
+        let err = io::Error::last_os_error();
         return Err(HostError::new(
             ErrorCode::TransportFailure,
             format!("AF_VSOCK connect(cid={cid}, port={port}) failed: {err}"),
@@ -427,13 +1013,722 @@ fn connect_linux_vsock(cid: u32, port: u32) -> Result<std::fs::File, HostError> 
     let confirmed_fd = DropGuard::dismiss(fd_guard);
     // SAFETY: `confirmed_fd` is newly created and owned exclusively here.
     let owned = unsafe { OwnedFd::from_raw_fd(confirmed_fd) };
-    Ok(std::fs::File::from(owned))
+    Ok(File::from(owned))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn connect_linux_vsock(_cid: u32, _port: u32) -> Result<std::fs::File, HostError> {
+fn connect_linux_vsock(_cid: u32, _port: u32) -> Result<File, HostError> {
     Err(HostError::new(
         ErrorCode::TransportFailure,
-        "direct host AF_VSOCK requires Linux; on macOS arm64 use Virtualization.framework VZVirtioSocketDevice UnixSocket bridge",
+        "direct host AF_VSOCK requires Linux; on macOS arm64 use Virtualization.framework VZVirtioSocketDevice",
     ))
+}
+
+// =========================================================================
+// macOS arm64 Virtualization.framework + VZVirtioSocketDevice Backend (C4)
+// =========================================================================
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod macos_vz {
+    use super::*;
+    use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::ptr;
+    use std::sync::{Condvar, Mutex};
+
+    type Id = *mut c_void;
+    type Sel = *const c_void;
+    type DispatchQueue = *mut c_void;
+
+    const BLOCK_HAS_COPY_DISPOSE: c_int = 1 << 25;
+
+    #[link(name = "Virtualization", kind = "framework")]
+    #[link(name = "Foundation", kind = "framework")]
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        static _NSConcreteStackBlock: *const c_void;
+
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_msgSend();
+        fn objc_autoreleasePoolPush() -> *mut c_void;
+        fn objc_autoreleasePoolPop(pool: *mut c_void);
+
+        fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> DispatchQueue;
+        fn dispatch_async_f(
+            queue: DispatchQueue,
+            context: *mut c_void,
+            work: unsafe extern "C" fn(*mut c_void),
+        );
+        fn dispatch_release(object: DispatchQueue);
+    }
+
+    unsafe fn cls(name: &CStr) -> Id {
+        unsafe { objc_getClass(name.as_ptr()) }
+    }
+
+    unsafe fn sel(name: &CStr) -> Sel {
+        unsafe { sel_registerName(name.as_ptr()) }
+    }
+
+    #[repr(C)]
+    struct BlockDescriptor<B> {
+        reserved: c_ulong,
+        size: c_ulong,
+        copy_helper: unsafe extern "C" fn(*mut B, *const B),
+        dispose_helper: unsafe extern "C" fn(*mut B),
+    }
+
+    #[repr(C)]
+    struct ArcStackBlock1<T> {
+        isa: *const c_void,
+        flags: c_int,
+        reserved: c_int,
+        invoke: unsafe extern "C" fn(*mut Self, Id),
+        descriptor: *const BlockDescriptor<Self>,
+        ctx: *const T,
+    }
+
+    impl<T> Drop for ArcStackBlock1<T> {
+        fn drop(&mut self) {
+            if !self.ctx.is_null() {
+                unsafe {
+                    drop(Arc::from_raw(self.ctx));
+                }
+            }
+        }
+    }
+
+    unsafe extern "C" fn copy_block1<T>(
+        dst: *mut ArcStackBlock1<T>,
+        src: *const ArcStackBlock1<T>,
+    ) {
+        unsafe {
+            let ptr = (*src).ctx;
+            Arc::increment_strong_count(ptr);
+            (*dst).ctx = ptr;
+        }
+    }
+
+    unsafe extern "C" fn dispose_block1<T>(src: *mut ArcStackBlock1<T>) {
+        unsafe {
+            let ptr = (*src).ctx;
+            if !ptr.is_null() {
+                drop(Arc::from_raw(ptr));
+            }
+        }
+    }
+
+    #[repr(C)]
+    struct ArcStackBlock2<T> {
+        isa: *const c_void,
+        flags: c_int,
+        reserved: c_int,
+        invoke: unsafe extern "C" fn(*mut Self, Id, Id),
+        descriptor: *const BlockDescriptor<Self>,
+        ctx: *const T,
+    }
+
+    impl<T> Drop for ArcStackBlock2<T> {
+        fn drop(&mut self) {
+            if !self.ctx.is_null() {
+                unsafe {
+                    drop(Arc::from_raw(self.ctx));
+                }
+            }
+        }
+    }
+
+    unsafe extern "C" fn copy_block2<T>(
+        dst: *mut ArcStackBlock2<T>,
+        src: *const ArcStackBlock2<T>,
+    ) {
+        unsafe {
+            let ptr = (*src).ctx;
+            Arc::increment_strong_count(ptr);
+            (*dst).ctx = ptr;
+        }
+    }
+
+    unsafe extern "C" fn dispose_block2<T>(src: *mut ArcStackBlock2<T>) {
+        unsafe {
+            let ptr = (*src).ctx;
+            if !ptr.is_null() {
+                drop(Arc::from_raw(ptr));
+            }
+        }
+    }
+
+    type CompletionSignal<R> = Arc<(Mutex<Option<Result<R, HostError>>>, Condvar)>;
+
+    fn new_signal<R>() -> CompletionSignal<R> {
+        Arc::new((Mutex::new(None), Condvar::new()))
+    }
+
+    fn complete_signal<R>(sig: &CompletionSignal<R>, res: Result<R, HostError>) {
+        if let Ok(mut guard) = sig.0.lock() {
+            *guard = Some(res);
+            sig.1.notify_all();
+        }
+    }
+
+    fn wait_signal<R>(
+        sig: &CompletionSignal<R>,
+        timeout: Duration,
+        op: &str,
+    ) -> Result<R, HostError> {
+        let guard = sig.0.lock().map_err(|_| {
+            HostError::new(ErrorCode::InternalError, "VZ completion mutex poisoned")
+        })?;
+        let (mut guard, _) = sig
+            .1
+            .wait_timeout_while(guard, timeout, |slot| slot.is_none())
+            .map_err(|_| HostError::new(ErrorCode::InternalError, "VZ completion wait poisoned"))?;
+        guard.take().ok_or_else(|| {
+            HostError::new(
+                ErrorCode::TransportFailure,
+                format!("Virtualization.framework timed out during {op}"),
+            )
+        })?
+    }
+
+    unsafe fn nsstring_from_str(s: &str) -> Result<Id, HostError> {
+        let cstr = CString::new(s).map_err(|_| {
+            HostError::new(
+                ErrorCode::Validation,
+                "NUL byte in Virtualization.framework string",
+            )
+        })?;
+        unsafe {
+            let msg_str: unsafe extern "C" fn(Id, Sel, *const c_char) -> Id =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let obj = msg_str(
+                cls(c"NSString"),
+                sel(c"stringWithUTF8String:"),
+                cstr.as_ptr(),
+            );
+            if obj.is_null() {
+                return Err(HostError::new(
+                    ErrorCode::InternalError,
+                    "NSString allocation failed",
+                ));
+            }
+            Ok(obj)
+        }
+    }
+
+    unsafe fn file_url_from_path(path: &Path) -> Result<Id, HostError> {
+        let path_str = path.to_str().ok_or_else(|| {
+            HostError::new(
+                ErrorCode::Validation,
+                "boot artifact path must be valid UTF-8",
+            )
+        })?;
+        unsafe {
+            let ns_path = nsstring_from_str(path_str)?;
+            let msg_url: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let url = msg_url(cls(c"NSURL"), sel(c"fileURLWithPath:"), ns_path);
+            if url.is_null() {
+                return Err(HostError::new(
+                    ErrorCode::Validation,
+                    "NSURL fileURLWithPath failed",
+                ));
+            }
+            Ok(url)
+        }
+    }
+
+    unsafe fn nserror_description(err: Id) -> String {
+        if err.is_null() {
+            return "unknown NSError".to_string();
+        }
+        unsafe {
+            let msg0: unsafe extern "C" fn(Id, Sel) -> Id =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let msg_utf8: unsafe extern "C" fn(Id, Sel) -> *const c_char =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let desc = msg0(err, sel(c"localizedDescription"));
+            if desc.is_null() {
+                return "NSError (null description)".to_string();
+            }
+            let ptr = msg_utf8(desc, sel(c"UTF8String"));
+            if ptr.is_null() {
+                "NSError (non-UTF8 description)".to_string()
+            } else {
+                CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            }
+        }
+    }
+
+    pub struct VzVmRuntime {
+        vm_obj: Id,
+        queue: DispatchQueue,
+        _stdin_write_keepalive: File,
+    }
+
+    // SAFETY: `vm_obj` is ONLY ever accessed on the serial `queue` via `dispatch_async_f`,
+    // satisfying Apple's `VZVirtualMachine` single-queue confinement contract.
+    unsafe impl Send for VzVmRuntime {}
+    unsafe impl Sync for VzVmRuntime {}
+
+    struct StartContext {
+        kernel_path: PathBuf,
+        initrd_path: PathBuf,
+        cmdline: String,
+        memory_mib: u32,
+        guest_stdin_read_fd: c_int,
+        guest_stdout_write_fd: c_int,
+        queue: DispatchQueue,
+        signal: CompletionSignal<usize>,
+    }
+
+    unsafe extern "C" fn on_vm_started(
+        block: *mut ArcStackBlock1<(CompletionSignal<usize>, usize)>,
+        err: Id,
+    ) {
+        unsafe {
+            let (ref sig, vm_addr) = *(*block).ctx;
+            if err.is_null() {
+                complete_signal(sig, Ok(vm_addr));
+            } else {
+                let msg0: unsafe extern "C" fn(Id, Sel) =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                msg0(vm_addr as Id, sel(c"release"));
+                complete_signal(
+                    sig,
+                    Err(HostError::new(
+                        ErrorCode::TransportFailure,
+                        format!(
+                            "VZVirtualMachine start failed: {}",
+                            nserror_description(err)
+                        ),
+                    )),
+                );
+            }
+        }
+    }
+
+    unsafe extern "C" fn start_vm_on_queue(raw_ctx: *mut c_void) {
+        unsafe {
+            let ctx = Box::from_raw(raw_ctx.cast::<StartContext>());
+            let pool = objc_autoreleasePoolPush();
+            let _pool_guard = DropGuard::new(pool, |p| objc_autoreleasePoolPop(p));
+
+            let setup_res: Result<Id, HostError> = (|| {
+                let msg0: unsafe extern "C" fn(Id, Sel) -> Id =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                let msg1: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                let set1: unsafe extern "C" fn(Id, Sel, Id) =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                let set_u64: unsafe extern "C" fn(Id, Sel, u64) =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                let init_fh: unsafe extern "C" fn(Id, Sel, c_int, i8) -> Id =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                let init_serial: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                let array_with_obj: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                let validate_fn: unsafe extern "C" fn(Id, Sel, *mut Id) -> i8 =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                let init_vm: unsafe extern "C" fn(Id, Sel, Id, DispatchQueue) -> Id =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+
+                let kernel_url = file_url_from_path(&ctx.kernel_path)?;
+                let initrd_url = file_url_from_path(&ctx.initrd_path)?;
+                let cmd_ns = nsstring_from_str(&ctx.cmdline)?;
+
+                let boot = msg1(
+                    msg0(cls(c"VZLinuxBootLoader"), sel(c"alloc")),
+                    sel(c"initWithKernelURL:"),
+                    kernel_url,
+                );
+                msg0(boot, sel(c"autorelease"));
+                set1(boot, sel(c"setInitialRamdiskURL:"), initrd_url);
+                set1(boot, sel(c"setCommandLine:"), cmd_ns);
+
+                let fh_read = init_fh(
+                    msg0(cls(c"NSFileHandle"), sel(c"alloc")),
+                    sel(c"initWithFileDescriptor:closeOnDealloc:"),
+                    ctx.guest_stdin_read_fd,
+                    1,
+                );
+                msg0(fh_read, sel(c"autorelease"));
+                let fh_write = init_fh(
+                    msg0(cls(c"NSFileHandle"), sel(c"alloc")),
+                    sel(c"initWithFileDescriptor:closeOnDealloc:"),
+                    ctx.guest_stdout_write_fd,
+                    1,
+                );
+                msg0(fh_write, sel(c"autorelease"));
+
+                let serial_att = init_serial(
+                    msg0(cls(c"VZFileHandleSerialPortAttachment"), sel(c"alloc")),
+                    sel(c"initWithFileHandleForReading:fileHandleForWriting:"),
+                    fh_read,
+                    fh_write,
+                );
+                msg0(serial_att, sel(c"autorelease"));
+                let serial_cfg = msg0(
+                    msg0(
+                        cls(c"VZVirtioConsoleDeviceSerialPortConfiguration"),
+                        sel(c"alloc"),
+                    ),
+                    sel(c"init"),
+                );
+                msg0(serial_cfg, sel(c"autorelease"));
+                set1(serial_cfg, sel(c"setAttachment:"), serial_att);
+
+                let entropy_cfg = msg0(
+                    msg0(cls(c"VZVirtioEntropyDeviceConfiguration"), sel(c"alloc")),
+                    sel(c"init"),
+                );
+                msg0(entropy_cfg, sel(c"autorelease"));
+
+                let nat_att = msg0(
+                    msg0(cls(c"VZNATNetworkDeviceAttachment"), sel(c"alloc")),
+                    sel(c"init"),
+                );
+                msg0(nat_att, sel(c"autorelease"));
+                let net_cfg = msg0(
+                    msg0(cls(c"VZVirtioNetworkDeviceConfiguration"), sel(c"alloc")),
+                    sel(c"init"),
+                );
+                msg0(net_cfg, sel(c"autorelease"));
+                set1(net_cfg, sel(c"setAttachment:"), nat_att);
+
+                let sock_cfg = msg0(
+                    msg0(cls(c"VZVirtioSocketDeviceConfiguration"), sel(c"alloc")),
+                    sel(c"init"),
+                );
+                msg0(sock_cfg, sel(c"autorelease"));
+
+                let vm_cfg = msg0(
+                    msg0(cls(c"VZVirtualMachineConfiguration"), sel(c"alloc")),
+                    sel(c"init"),
+                );
+                msg0(vm_cfg, sel(c"autorelease"));
+                set_u64(vm_cfg, sel(c"setCPUCount:"), 1);
+                set_u64(
+                    vm_cfg,
+                    sel(c"setMemorySize:"),
+                    u64::from(ctx.memory_mib) * 1024 * 1024,
+                );
+                set1(vm_cfg, sel(c"setBootLoader:"), boot);
+                set1(
+                    vm_cfg,
+                    sel(c"setSerialPorts:"),
+                    array_with_obj(cls(c"NSArray"), sel(c"arrayWithObject:"), serial_cfg),
+                );
+                set1(
+                    vm_cfg,
+                    sel(c"setEntropyDevices:"),
+                    array_with_obj(cls(c"NSArray"), sel(c"arrayWithObject:"), entropy_cfg),
+                );
+                set1(
+                    vm_cfg,
+                    sel(c"setNetworkDevices:"),
+                    array_with_obj(cls(c"NSArray"), sel(c"arrayWithObject:"), net_cfg),
+                );
+                set1(
+                    vm_cfg,
+                    sel(c"setSocketDevices:"),
+                    array_with_obj(cls(c"NSArray"), sel(c"arrayWithObject:"), sock_cfg),
+                );
+
+                let mut val_err: Id = ptr::null_mut();
+                if validate_fn(vm_cfg, sel(c"validateWithError:"), &raw mut val_err) == 0 {
+                    return Err(HostError::new(
+                        ErrorCode::Validation,
+                        format!(
+                            "VZVirtualMachineConfiguration invalid: {}",
+                            nserror_description(val_err)
+                        ),
+                    ));
+                }
+
+                let vm = init_vm(
+                    msg0(cls(c"VZVirtualMachine"), sel(c"alloc")),
+                    sel(c"initWithConfiguration:queue:"),
+                    vm_cfg,
+                    ctx.queue,
+                );
+                if vm.is_null() {
+                    return Err(HostError::new(
+                        ErrorCode::TransportFailure,
+                        "VZVirtualMachine allocation failed",
+                    ));
+                }
+                Ok(vm)
+            })();
+
+            match setup_res {
+                Ok(vm) => {
+                    static DESC: BlockDescriptor<ArcStackBlock1<(CompletionSignal<usize>, usize)>> =
+                        BlockDescriptor {
+                            reserved: 0,
+                            size: std::mem::size_of::<
+                                ArcStackBlock1<(CompletionSignal<usize>, usize)>,
+                            >() as c_ulong,
+                            copy_helper: copy_block1,
+                            dispose_helper: dispose_block1,
+                        };
+                    let payload = Arc::new((Arc::clone(&ctx.signal), vm as usize));
+                    let mut block = ArcStackBlock1 {
+                        isa: _NSConcreteStackBlock,
+                        flags: BLOCK_HAS_COPY_DISPOSE,
+                        reserved: 0,
+                        invoke: on_vm_started,
+                        descriptor: &raw const DESC,
+                        ctx: Arc::into_raw(payload),
+                    };
+                    let start_fn: unsafe extern "C" fn(Id, Sel, *mut c_void) =
+                        std::mem::transmute(objc_msgSend as *const c_void);
+                    start_fn(
+                        vm,
+                        sel(c"startWithCompletionHandler:"),
+                        (&raw mut block).cast(),
+                    );
+                }
+                Err(e) => {
+                    let _ = libc::close(ctx.guest_stdin_read_fd);
+                    let _ = libc::close(ctx.guest_stdout_write_fd);
+                    complete_signal(&ctx.signal, Err(e));
+                }
+            }
+        }
+    }
+
+    struct ConnectContext {
+        vm_obj: Id,
+        port: u32,
+        signal: CompletionSignal<c_int>,
+    }
+
+    unsafe extern "C" fn on_vsock_connected(
+        block: *mut ArcStackBlock2<CompletionSignal<c_int>>,
+        conn: Id,
+        err: Id,
+    ) {
+        unsafe {
+            let sig = &*(*block).ctx;
+            if !err.is_null() || conn.is_null() {
+                complete_signal(
+                    sig,
+                    Err(HostError::new(
+                        ErrorCode::TransportFailure,
+                        format!(
+                            "VZVirtioSocketDevice connect failed: {}",
+                            nserror_description(err)
+                        ),
+                    )),
+                );
+                return;
+            }
+            let fd_fn: unsafe extern "C" fn(Id, Sel) -> c_int =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let src_fd = fd_fn(conn, sel(c"fileDescriptor"));
+            if src_fd < 0 {
+                complete_signal(
+                    sig,
+                    Err(HostError::new(
+                        ErrorCode::TransportFailure,
+                        "VZVirtioSocketConnection returned invalid fileDescriptor",
+                    )),
+                );
+                return;
+            }
+            let dup_fd = libc::fcntl(src_fd, libc::F_DUPFD_CLOEXEC, 0);
+            if dup_fd < 0 {
+                complete_signal(
+                    sig,
+                    Err(HostError::new(
+                        ErrorCode::TransportFailure,
+                        format!("dup(vsock fd) failed: {}", io::Error::last_os_error()),
+                    )),
+                );
+                return;
+            }
+            complete_signal(sig, Ok(dup_fd));
+        }
+    }
+
+    unsafe extern "C" fn connect_vsock_on_queue(raw_ctx: *mut c_void) {
+        unsafe {
+            let ctx = Box::from_raw(raw_ctx.cast::<ConnectContext>());
+            let pool = objc_autoreleasePoolPush();
+            let _pool_guard = DropGuard::new(pool, |p| objc_autoreleasePoolPop(p));
+
+            let msg0: unsafe extern "C" fn(Id, Sel) -> Id =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let count_fn: unsafe extern "C" fn(Id, Sel) -> usize =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let idx_fn: unsafe extern "C" fn(Id, Sel, usize) -> Id =
+                std::mem::transmute(objc_msgSend as *const c_void);
+
+            let devs = msg0(ctx.vm_obj, sel(c"socketDevices"));
+            if devs.is_null() || count_fn(devs, sel(c"count")) == 0 {
+                complete_signal(
+                    &ctx.signal,
+                    Err(HostError::new(
+                        ErrorCode::TransportFailure,
+                        "VZVirtualMachine has no VZVirtioSocketDevice configured",
+                    )),
+                );
+                return;
+            }
+            let sock_dev = idx_fn(devs, sel(c"objectAtIndex:"), 0);
+
+            static DESC: BlockDescriptor<ArcStackBlock2<CompletionSignal<c_int>>> =
+                BlockDescriptor {
+                    reserved: 0,
+                    size: std::mem::size_of::<ArcStackBlock2<CompletionSignal<c_int>>>() as c_ulong,
+                    copy_helper: copy_block2,
+                    dispose_helper: dispose_block2,
+                };
+            let mut block = ArcStackBlock2 {
+                isa: _NSConcreteStackBlock,
+                flags: BLOCK_HAS_COPY_DISPOSE,
+                reserved: 0,
+                invoke: on_vsock_connected,
+                descriptor: &raw const DESC,
+                ctx: Arc::into_raw(Arc::clone(&ctx.signal)),
+            };
+            let connect_fn: unsafe extern "C" fn(Id, Sel, u32, *mut c_void) =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            connect_fn(
+                sock_dev,
+                sel(c"connectToPort:completionHandler:"),
+                ctx.port,
+                (&raw mut block).cast(),
+            );
+        }
+    }
+
+    unsafe extern "C" fn release_vm_on_queue(raw_vm: *mut c_void) {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let vm = raw_vm as Id;
+            let can_stop: unsafe extern "C" fn(Id, Sel) -> i8 =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let req_stop: unsafe extern "C" fn(Id, Sel, *mut Id) -> i8 =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let release_fn: unsafe extern "C" fn(Id, Sel) =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            if can_stop(vm, sel(c"canRequestStop")) != 0 {
+                let mut err: Id = ptr::null_mut();
+                let _ = req_stop(vm, sel(c"requestStopWithError:"), &raw mut err);
+            }
+            release_fn(vm, sel(c"release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    impl VzVmRuntime {
+        pub fn start(
+            kernel_path: &Path,
+            initrd_path: &Path,
+            cmdline: &str,
+            memory_mib: u32,
+        ) -> Result<(Self, File), HostError> {
+            let mut stdin_fds = [0 as c_int; 2];
+            let mut stdout_fds = [0 as c_int; 2];
+            // SAFETY: Creates POSIX pipes for serial console attachment.
+            unsafe {
+                if libc::pipe(stdin_fds.as_mut_ptr()) != 0 {
+                    return Err(HostError::new(
+                        ErrorCode::InternalError,
+                        "pipe(stdin) failed for VZ serial port",
+                    ));
+                }
+                if libc::pipe(stdout_fds.as_mut_ptr()) != 0 {
+                    let _ = libc::close(stdin_fds[0]);
+                    let _ = libc::close(stdin_fds[1]);
+                    return Err(HostError::new(
+                        ErrorCode::InternalError,
+                        "pipe(stdout) failed for VZ serial port",
+                    ));
+                }
+                let _ = libc::fcntl(stdin_fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+                let _ = libc::fcntl(stdout_fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            // SAFETY: Host ends of the two newly created pipes.
+            let stdin_write = unsafe { File::from_raw_fd(stdin_fds[1]) };
+            let stdout_read = unsafe { File::from_raw_fd(stdout_fds[0]) };
+
+            // SAFETY: Creates dedicated serial GCD queue (`DISPATCH_QUEUE_SERIAL` == NULL).
+            let queue = unsafe {
+                dispatch_queue_create(c"me.vespoli.secretbridge.vz".as_ptr(), ptr::null())
+            };
+            if queue.is_null() {
+                unsafe {
+                    let _ = libc::close(stdin_fds[0]);
+                    let _ = libc::close(stdout_fds[1]);
+                }
+                return Err(HostError::new(
+                    ErrorCode::InternalError,
+                    "dispatch_queue_create failed",
+                ));
+            }
+            let queue_guard = DropGuard::new(queue, |q| unsafe { dispatch_release(q) });
+
+            let signal = new_signal::<usize>();
+            let ctx = Box::new(StartContext {
+                kernel_path: kernel_path.to_path_buf(),
+                initrd_path: initrd_path.to_path_buf(),
+                cmdline: cmdline.to_string(),
+                memory_mib,
+                guest_stdin_read_fd: stdin_fds[0],
+                guest_stdout_write_fd: stdout_fds[1],
+                queue: *queue_guard,
+                signal: Arc::clone(&signal),
+            });
+
+            unsafe {
+                dispatch_async_f(*queue_guard, Box::into_raw(ctx).cast(), start_vm_on_queue);
+            }
+
+            let vm_addr = wait_signal(&signal, Duration::from_secs(20), "VM boot")?;
+            let confirmed_queue = DropGuard::dismiss(queue_guard);
+            Ok((
+                Self {
+                    vm_obj: vm_addr as Id,
+                    queue: confirmed_queue,
+                    _stdin_write_keepalive: stdin_write,
+                },
+                stdout_read,
+            ))
+        }
+
+        pub fn connect_vsock_port(&self, port: u32) -> Result<File, HostError> {
+            let signal = new_signal::<c_int>();
+            let ctx = Box::new(ConnectContext {
+                vm_obj: self.vm_obj,
+                port,
+                signal: Arc::clone(&signal),
+            });
+            unsafe {
+                dispatch_async_f(
+                    self.queue,
+                    Box::into_raw(ctx).cast(),
+                    connect_vsock_on_queue,
+                );
+            }
+            let raw_fd = wait_signal(&signal, Duration::from_secs(15), "VZVirtioSocket connect")?;
+            apply_socket_timeouts(raw_fd);
+            // SAFETY: `raw_fd` was `F_DUPFD_CLOEXEC`'d exclusively for this caller.
+            let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+            Ok(File::from(owned))
+        }
+    }
+
+    impl Drop for VzVmRuntime {
+        fn drop(&mut self) {
+            unsafe {
+                dispatch_async_f(self.queue, self.vm_obj, release_vm_on_queue);
+                dispatch_release(self.queue);
+            }
+        }
+    }
 }

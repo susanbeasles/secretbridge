@@ -6,24 +6,83 @@ use sb_proto::rpc::{GenerateSpec, SecretCharset};
 use std::fmt;
 use std::mem::DropGuard;
 use std::ptr::NonNull;
-use std::sync::atomic::{Ordering, compiler_fence};
+use zeroize::Zeroize;
 
 /// Kernel-isolated secret buffer inside the enclave.
 ///
 /// On Linux 5.14+, allocates pages backed by `memfd_secret(2)` (removed from the kernel
 /// direct map and unswappable). Falls back cleanly to anonymous `mmap` + `MADV_DONTDUMP` +
-/// `mlock(2)`. Uses Rust 1.100's `std::mem::DropGuard` during setup so partial failures
-/// deterministically close descriptors, zeroize, munlock, and munmap.
+/// fail-closed `mlock(2)` (H2). Uses Rust 1.100's `std::mem::DropGuard` during setup so partial
+/// failures deterministically close descriptors, volatile-zeroize, munlock, and munmap.
 pub struct MemSecret {
     ptr: NonNull<u8>,
     len: usize,
     cap: usize,
-    mlocked: bool,
+    is_anon_mlocked: bool,
 }
 
 // SAFETY: `MemSecret` exclusively owns its private anonymous / memfd_secret mapping.
 unsafe impl Send for MemSecret {}
 unsafe impl Sync for MemSecret {}
+
+pub struct MemSecretCursor<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl MemSecretCursor<'_> {
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), EnclaveError> {
+        let end = self.pos.checked_add(bytes.len()).ok_or_else(|| {
+            EnclaveError::new(ErrorCode::SizeLimitExceeded, "secret buffer overflow")
+        })?;
+        if end > self.buf.len() {
+            return Err(EnclaveError::new(
+                ErrorCode::SizeLimitExceeded,
+                "secret payload exceeded isolated buffer capacity",
+            ));
+        }
+        self.buf[self.pos..end].copy_from_slice(bytes);
+        self.pos = end;
+        Ok(())
+    }
+
+    pub fn write_str(&mut self, s: &str) -> Result<(), EnclaveError> {
+        self.write_bytes(s.as_bytes())
+    }
+
+    /// Writes `raw` UTF-8 bytes as a quoted JSON string (`"..."`) directly into locked memory.
+    pub fn write_json_string(&mut self, raw: &str) -> Result<(), EnclaveError> {
+        self.write_bytes(b"\"")?;
+        for ch in raw.chars() {
+            match ch {
+                '"' => self.write_bytes(b"\\\"")?,
+                '\\' => self.write_bytes(b"\\\\")?,
+                '\n' => self.write_bytes(b"\\n")?,
+                '\r' => self.write_bytes(b"\\r")?,
+                '\t' => self.write_bytes(b"\\t")?,
+                c if (c as u32) < 0x20 => {
+                    let mut esc = [0u8; 6];
+                    let hex_digits = b"0123456789abcdef";
+                    let v = c as u32;
+                    esc[0] = b'\\';
+                    esc[1] = b'u';
+                    esc[2] = b'0';
+                    esc[3] = b'0';
+                    esc[4] = hex_digits[((v >> 4) & 0x0F) as usize];
+                    esc[5] = hex_digits[(v & 0x0F) as usize];
+                    self.write_bytes(&esc)?;
+                }
+                c => {
+                    let mut utf8 = [0u8; 4];
+                    let encoded = c.encode_utf8(&mut utf8);
+                    self.write_bytes(encoded.as_bytes())?;
+                    utf8.zeroize();
+                }
+            }
+        }
+        self.write_bytes(b"\"")
+    }
+}
 
 impl MemSecret {
     pub fn from_slice(secret: &[u8]) -> Result<Self, EnclaveError> {
@@ -34,6 +93,21 @@ impl MemSecret {
                 std::ptr::copy_nonoverlapping(secret.as_ptr(), mem.ptr.as_ptr(), secret.len());
             }
         }
+        Ok(mem)
+    }
+
+    /// Pre-allocates `max_len` bytes in `memfd_secret`/`mlock` and lets `writer` populate
+    /// them in-place without staging secrets through unlocked heap `String` or `Vec<u8>`.
+    pub fn write_with<F>(max_len: usize, writer: F) -> Result<Self, EnclaveError>
+    where
+        F: FnOnce(&mut MemSecretCursor<'_>) -> Result<(), EnclaveError>,
+    {
+        let mut mem = Self::allocate(max_len)?;
+        // SAFETY: `mem.ptr` is uniquely owned and valid for `mem.cap` bytes (`max_len <= mem.cap`).
+        let slice = unsafe { std::slice::from_raw_parts_mut(mem.ptr.as_ptr(), mem.cap) };
+        let mut cursor = MemSecretCursor { buf: slice, pos: 0 };
+        writer(&mut cursor)?;
+        mem.len = cursor.pos;
         Ok(mem)
     }
 
@@ -60,10 +134,9 @@ impl MemSecret {
 
         let mem = Self::allocate(len)?;
         // Guard temporary random byte scratch buffer with DropGuard so even a panic wipes it.
-        let scratch = DropGuard::new([0u8; 256], |mut buf| {
-            zeroize::Zeroize::zeroize(&mut buf);
+        let mut scratch = DropGuard::new([0u8; 256], |mut buf| {
+            buf.zeroize();
         });
-        let mut scratch = scratch;
 
         let alpha_len = alphabet.len();
         // Rejection threshold eliminates modulo bias: floor(256 / alpha_len) * alpha_len
@@ -101,7 +174,7 @@ impl MemSecret {
                 ptr,
                 len,
                 cap,
-                mlocked: false, // memfd_secret pages are implicitly locked & unmapped from direct map
+                is_anon_mlocked: false, // memfd_secret pages are implicitly locked & unmapped from direct map
             });
         }
 
@@ -140,10 +213,11 @@ impl fmt::Debug for MemSecret {
 impl Drop for MemSecret {
     fn drop(&mut self) {
         // SAFETY: `self.ptr` is a valid mapping of `self.cap` bytes owned exclusively by `self`.
+        // `zeroize()` uses volatile writes + atomic compiler fence so LLVM cannot elide the wipe (H2).
         unsafe {
-            std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.cap);
-            compiler_fence(Ordering::SeqCst);
-            if self.mlocked {
+            let full_mapping = std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap);
+            full_mapping.zeroize();
+            if self.is_anon_mlocked {
                 let _ = libc::munlock(self.ptr.as_ptr().cast(), self.cap);
             }
             let _ = libc::munmap(self.ptr.as_ptr().cast(), self.cap);
@@ -225,8 +299,8 @@ fn alloc_anon_mlocked(len: usize, cap: usize) -> Result<MemSecret, EnclaveError>
     let guard = DropGuard::new(ptr, |p| {
         // SAFETY: `p` is a valid `cap`-byte mapping if setup aborts early.
         unsafe {
-            std::ptr::write_bytes(p.as_ptr(), 0, cap);
-            compiler_fence(Ordering::SeqCst);
+            let slice = std::slice::from_raw_parts_mut(p.as_ptr(), cap);
+            slice.zeroize();
             let _ = libc::munmap(p.as_ptr().cast(), cap);
         }
     });
@@ -237,14 +311,20 @@ fn alloc_anon_mlocked(len: usize, cap: usize) -> Result<MemSecret, EnclaveError>
         let _ = libc::madvise(guard.as_ptr().cast(), cap, libc::MADV_DONTDUMP);
     }
 
-    // SAFETY: `mlock` pins `cap` bytes in physical RAM (may fail under tight RLIMIT_MEMLOCK in CI).
-    let mlocked = unsafe { libc::mlock(guard.as_ptr().cast(), cap) == 0 };
+    // SAFETY: `mlock` pins `cap` bytes in physical RAM; fail closed if locking fails (H2).
+    let lock_rc = unsafe { libc::mlock(guard.as_ptr().cast(), cap) };
+    if lock_rc != 0 {
+        return Err(EnclaveError::new(
+            ErrorCode::InternalError,
+            "mlock failed for enclave secret buffer; check RLIMIT_MEMLOCK",
+        ));
+    }
 
     let confirmed_ptr = DropGuard::dismiss(guard);
     Ok(MemSecret {
         ptr: confirmed_ptr,
         len,
         cap,
-        mlocked,
+        is_anon_mlocked: true,
     })
 }
