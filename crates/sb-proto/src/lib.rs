@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn plan_hmac_rejects_tampering_expiry_replay_and_key_rotation_closing_s4_and_h3() {
         let m = Manifest::from_json_str(sample_valid_manifest_json()).unwrap();
-        let signer = PlanSigner::new([0x42; 32], 300);
+        let signer = PlanSigner::new_random();
         let unsigned = UnsignedPlan {
             plan_id: "plan-nonce-001".into(),
             version: 2,
@@ -257,8 +257,8 @@ mod tests {
             }],
         };
         let mut signed = signer.sign(unsigned.clone()).unwrap();
-        assert!(signer.verify(&signed, 1_120).is_ok());
-        // Expired
+        assert!(signer.verify(&signed, 1_300).is_ok());
+        // Expired after 300s default TTL
         assert!(signer.verify(&signed, 1_301).is_err());
         // Single-use consume succeeds once, then rejects replay!
         assert!(signer.consume_verified(&signed, 1_120).is_ok());

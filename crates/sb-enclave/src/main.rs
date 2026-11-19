@@ -6,18 +6,28 @@ use sb_enclave::service::EnclaveService;
 use sb_enclave::vault::{InMemoryVaultProvider, parse_sha256_allowlist_csv};
 use sb_enclave::vault::{UniffiCoreVaultProvider, VaultProvider, compiled_op_core_allowlist};
 use sb_enclave::vsock::{
-    DEFAULT_VSOCK_PORT, extract_cmdline_client_pubkey, parse_pubkey_hex, serve_unix_listener,
+    DEFAULT_ENCLAVE_KEY_PATH, DEFAULT_VSOCK_PORT, cmdline_has_token, extract_cmdline_client_pubkey,
+    extract_cmdline_vsock_port, load_enclave_static_keypair, parse_pubkey_hex, serve_unix_listener,
+    write_generated_enclave_identity,
 };
-use sb_proto::crypto::generate_noise_keypair;
 use sb_proto::error::ErrorCode;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+enum EnclaveMode {
+    GenerateIdentity {
+        priv_path: PathBuf,
+        pub_hex_path: PathBuf,
+    },
+    Serve(CliConfig),
+}
+
 struct CliConfig {
     vsock_port: u32,
     unix_socket: Option<PathBuf>,
+    enclave_key_file: PathBuf,
     authorized_client_pubkey: [u8; 32],
     op_core_lib: PathBuf,
     op_core_sha256: Vec<[u8; 32]>,
@@ -29,6 +39,7 @@ struct CliConfig {
 fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
     use std::ffi::CString;
     use std::mem::DropGuard;
+    use std::time::Duration;
 
     for dir in ["/proc", "/sys", "/dev", "/etc"] {
         let _ = std::fs::create_dir_all(dir);
@@ -73,7 +84,7 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
         (libc::MS_NOSUID | libc::MS_NOEXEC) as libc::c_ulong,
     )?;
 
-    // Configure loopback + guest NAT interface via netdevice ioctls (zero busybox/shell in guest).
+    // Configure loopback + guest NAT interface via netdevice ioctls + RFC 2131 DHCPv4.
     // SAFETY: Creates an owned AF_INET datagram socket for netdevice ioctls.
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if sock < 0 {
@@ -125,6 +136,18 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
         true
     }
 
+    fn add_default_gateway(sock: i32, gw: [u8; 4]) {
+        // SAFETY: Zero-initialized `rtentry` populated with valid `AF_INET` sockaddrs.
+        unsafe {
+            let mut rt: libc::rtentry = std::mem::zeroed();
+            rt.rt_dst = make_sin([0, 0, 0, 0]);
+            rt.rt_genmask = make_sin([0, 0, 0, 0]);
+            rt.rt_gateway = make_sin(gw);
+            rt.rt_flags = (libc::RTF_UP | libc::RTF_GATEWAY) as libc::c_ushort;
+            let _ = libc::ioctl(sock, libc::SIOCADDRT as _, &mut rt);
+        }
+    }
+
     let _ = set_if_ipv4_up(sock, "lo", [127, 0, 0, 1], [255, 0, 0, 0]);
 
     // Check if kernel `ip=dhcp` already configured a default route & `/proc/net/pnp`.
@@ -160,19 +183,47 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
             })
             .unwrap_or_else(|| "eth0".to_string());
 
-        if set_if_ipv4_up(sock, &primary_nic, [10, 0, 2, 15], [255, 255, 255, 0]) {
-            // Add default gateway 10.0.2.2 (QEMU user-mode SLIRP NAT).
-            // SAFETY: Zero-initialized `rtentry` populated with valid `AF_INET` sockaddrs.
-            unsafe {
-                let mut rt: libc::rtentry = std::mem::zeroed();
-                rt.rt_dst = make_sin([0, 0, 0, 0]);
-                rt.rt_genmask = make_sin([0, 0, 0, 0]);
-                rt.rt_gateway = make_sin([10, 0, 2, 2]);
-                rt.rt_flags = (libc::RTF_UP | libc::RTF_GATEWAY) as libc::c_ushort;
-                let _ = libc::ioctl(sock, libc::SIOCADDRT as _, &mut rt);
+        match sb_enclave::dhcp::acquire_dhcpv4_lease(&primary_nic, Duration::from_millis(1_500)) {
+            Ok(lease) => {
+                if !set_if_ipv4_up(sock, &primary_nic, lease.yiaddr, lease.subnet_mask) {
+                    return Err(EnclaveError::new(
+                        ErrorCode::TransportFailure,
+                        format!("failed applying DHCPv4 lease address on {primary_nic}"),
+                    ));
+                }
+                if let Some(gw) = lease.router {
+                    add_default_gateway(sock, gw);
+                }
+                let mut resolv = String::new();
+                let dns_list = if !lease.dns_servers.is_empty() {
+                    lease.dns_servers
+                } else if let Some(gw) = lease.router {
+                    vec![gw]
+                } else {
+                    Vec::new()
+                };
+                for ip in dns_list {
+                    resolv.push_str(&format!(
+                        "nameserver {}.{}.{}.{}\n",
+                        ip[0], ip[1], ip[2], ip[3]
+                    ));
+                }
+                if !resolv.is_empty() {
+                    let _ = std::fs::write("/etc/resolv.conf", resolv);
+                }
             }
-            if std::fs::metadata("/etc/resolv.conf").is_err() {
-                let _ = std::fs::write("/etc/resolv.conf", "nameserver 10.0.2.3\n");
+            Err(dhcp_err) => {
+                let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+                if cmdline_has_token(&cmdline, "sb.net_fallback=qemu_slirp")
+                    && set_if_ipv4_up(sock, &primary_nic, [10, 0, 2, 15], [255, 255, 255, 0])
+                {
+                    add_default_gateway(sock, [10, 0, 2, 2]);
+                    if std::fs::metadata("/etc/resolv.conf").is_err() {
+                        let _ = std::fs::write("/etc/resolv.conf", "nameserver 10.0.2.3\n");
+                    }
+                } else {
+                    return Err(dhcp_err);
+                }
             }
         }
     }
@@ -180,9 +231,13 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
     Ok(())
 }
 
-fn parse_args() -> Result<CliConfig, EnclaveError> {
-    let mut vsock_port = DEFAULT_VSOCK_PORT;
+fn parse_args() -> Result<EnclaveMode, EnclaveError> {
+    let mut cli_vsock_port: Option<u32> = None;
     let mut unix_socket: Option<PathBuf> = None;
+    let mut enclave_key_file = PathBuf::from(
+        std::env::var("SB_ENCLAVE_KEY_FILE")
+            .unwrap_or_else(|_| DEFAULT_ENCLAVE_KEY_PATH.to_string()),
+    );
     let mut client_pk_hex: Option<String> = std::env::var("SB_AUTHORIZED_CLIENT_PUBKEY_HEX").ok();
     let mut op_core_lib = PathBuf::from(
         std::env::var("SB_OP_CORE_LIB")
@@ -197,13 +252,44 @@ fn parse_args() -> Result<CliConfig, EnclaveError> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--generate-identity" => {
+                let priv_path = PathBuf::from(args.next().ok_or_else(|| {
+                    EnclaveError::new(
+                        ErrorCode::Validation,
+                        "missing <private_key_path> after --generate-identity",
+                    )
+                })?);
+                let pub_hex_path = PathBuf::from(args.next().ok_or_else(|| {
+                    EnclaveError::new(
+                        ErrorCode::Validation,
+                        "missing <pubkey_hex_path> after --generate-identity",
+                    )
+                })?);
+                return Ok(EnclaveMode::GenerateIdentity {
+                    priv_path,
+                    pub_hex_path,
+                });
+            }
+            "--enclave-key-file" => {
+                let val = args.next().ok_or_else(|| {
+                    EnclaveError::new(ErrorCode::Validation, "missing --enclave-key-file path")
+                })?;
+                enclave_key_file = PathBuf::from(val);
+            }
             "--vsock-port" => {
                 let val = args.next().ok_or_else(|| {
                     EnclaveError::new(ErrorCode::Validation, "missing --vsock-port value")
                 })?;
-                vsock_port = val.parse::<u32>().map_err(|_| {
+                let port = val.parse::<u32>().map_err(|_| {
                     EnclaveError::new(ErrorCode::Validation, "invalid --vsock-port integer")
                 })?;
+                if !(1..=65_535).contains(&port) {
+                    return Err(EnclaveError::new(
+                        ErrorCode::Validation,
+                        "--vsock-port must be in 1..=65535",
+                    ));
+                }
+                cli_vsock_port = Some(port);
             }
             "--unix-socket" => {
                 let val = args.next().ok_or_else(|| {
@@ -260,12 +346,19 @@ fn parse_args() -> Result<CliConfig, EnclaveError> {
         }
     }
 
-    if client_pk_hex.is_none()
-        && let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline")
-        && let Some(found) = extract_cmdline_client_pubkey(&cmdline)
-    {
-        client_pk_hex = Some(found.to_string());
+    // Read and validate `/proc/cmdline` parameters before applying explicit CLI overrides.
+    let mut cmdline_vsock_port: Option<u32> = None;
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        cmdline_vsock_port = extract_cmdline_vsock_port(&cmdline)?;
+        if client_pk_hex.is_none()
+            && let Some(found) = extract_cmdline_client_pubkey(&cmdline)
+        {
+            client_pk_hex = Some(found.to_string());
+        }
     }
+    let vsock_port = cli_vsock_port
+        .or(cmdline_vsock_port)
+        .unwrap_or(DEFAULT_VSOCK_PORT);
 
     let pk_hex = client_pk_hex.ok_or_else(|| {
         EnclaveError::new(
@@ -295,15 +388,16 @@ fn parse_args() -> Result<CliConfig, EnclaveError> {
         list
     };
 
-    Ok(CliConfig {
+    Ok(EnclaveMode::Serve(CliConfig {
         vsock_port,
         unix_socket,
+        enclave_key_file,
         authorized_client_pubkey,
         op_core_lib,
         op_core_sha256,
         #[cfg(debug_assertions)]
         in_memory_test_token,
-    })
+    }))
 }
 
 fn run() -> Result<(), EnclaveError> {
@@ -312,7 +406,16 @@ fn run() -> Result<(), EnclaveError> {
         init_guest_pid1_environment()?;
     }
 
-    let cfg = parse_args()?;
+    let cfg = match parse_args()? {
+        EnclaveMode::GenerateIdentity {
+            priv_path,
+            pub_hex_path,
+        } => {
+            write_generated_enclave_identity(&priv_path, &pub_hex_path)?;
+            return Ok(());
+        }
+        EnclaveMode::Serve(cfg) => cfg,
+    };
 
     #[cfg(debug_assertions)]
     let vault_provider: Arc<dyn VaultProvider> = match cfg.in_memory_test_token {
@@ -341,7 +444,7 @@ fn run() -> Result<(), EnclaveError> {
         github_client,
     ));
 
-    let enclave_kp = generate_noise_keypair()?;
+    let enclave_kp = load_enclave_static_keypair(&cfg.enclave_key_file, std::process::id() == 1)?;
     let pubkey_hex = hex::encode(enclave_kp.public);
     println!("SB_ENCLAVE_NOISE_PUBKEY={pubkey_hex}");
     let _ = std::io::stdout().flush();

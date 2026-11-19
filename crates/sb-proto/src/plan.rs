@@ -9,8 +9,8 @@ use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Default maximum validity window for a previewed plan (15 minutes).
-pub const DEFAULT_PLAN_TTL_SECS: u64 = 900;
+/// Default maximum validity window for a previewed plan (5 minutes).
+pub const DEFAULT_PLAN_TTL_SECS: u64 = 300;
 
 /// Produces deterministic RFC-8785-style canonical JSON bytes (sorted object keys, compact separators).
 pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtoError> {
@@ -163,6 +163,18 @@ impl PlanSigner {
             }),
             ttl_secs,
         }
+    }
+
+    pub fn new_random() -> Self {
+        use crypto_box::aead::OsRng;
+        use crypto_box::aead::rand_core::RngCore;
+        use zeroize::Zeroize;
+
+        let mut key = [0u8; 32];
+        OsRng.fill_bytes(&mut key);
+        let signer = Self::new(key, DEFAULT_PLAN_TTL_SECS);
+        key.zeroize();
+        signer
     }
 
     pub fn rotate_key(&self, new_key: [u8; 32]) -> Result<(), ProtoError> {

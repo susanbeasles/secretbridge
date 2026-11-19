@@ -500,11 +500,108 @@ pub enum EnclaveEndpoint {
     },
 }
 
+pub struct HostCidLease {
+    cid: u32,
+    _lock_file: File,
+}
+
+impl HostCidLease {
+    pub fn cid(&self) -> u32 {
+        self.cid
+    }
+}
+
+pub fn default_host_cid_lock_dir(fallback_dir: Option<&Path>) -> Result<PathBuf, HostError> {
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(home).join(".local/run/secretbridge-cids"));
+    }
+    if let Some(dir) = fallback_dir {
+        return Ok(dir.join("secretbridge-cids"));
+    }
+    Err(HostError::new(
+        ErrorCode::Validation,
+        "unable to determine host CID lock directory: HOME is not set",
+    ))
+}
+
+/// Acquires a host-wide exclusive `flock(LOCK_EX | LOCK_NB)` lease on an `AF_VSOCK` guest CID
+/// inside `lock_dir`, probing `preferred_cid..=65535` followed by `3..preferred_cid` so multiple
+/// IDE processes or `sb-host` instances on the same machine never collide on a managed guest CID.
+pub fn acquire_host_cid_lease_in_dir(
+    lock_dir: &Path,
+    preferred_cid: u32,
+) -> Result<HostCidLease, HostError> {
+    use std::os::fd::AsRawFd;
+
+    if !(3..=65_535).contains(&preferred_cid) {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            "preferred guest AF_VSOCK CID must be in 3..=65535",
+        ));
+    }
+    std::fs::create_dir_all(lock_dir).map_err(|e| {
+        HostError::new(
+            ErrorCode::InternalError,
+            format!(
+                "failed creating host CID lock directory '{}': {e}",
+                lock_dir.display()
+            ),
+        )
+    })?;
+    let dir_meta = std::fs::symlink_metadata(lock_dir).map_err(|e| {
+        HostError::new(
+            ErrorCode::Validation,
+            format!("unable to stat host CID lock directory: {e}"),
+        )
+    })?;
+    if !dir_meta.is_dir() || dir_meta.file_type().is_symlink() {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            "refusing symlinked or non-directory host CID lock path",
+        ));
+    }
+    let _ = std::fs::set_permissions(lock_dir, std::fs::Permissions::from_mode(0o700));
+
+    for candidate in (preferred_cid..=65_535).chain(3..preferred_cid) {
+        let lock_path = lock_dir.join(format!("vmm-cid-{candidate}.lock"));
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let meta = match file.metadata() {
+            Ok(m) if m.is_file() => m,
+            _ => continue,
+        };
+        let _ = meta;
+        // SAFETY: `file` owns a valid open file description; `LOCK_EX | LOCK_NB` never blocks.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(HostCidLease {
+                cid: candidate,
+                _lock_file: file,
+            });
+        }
+    }
+
+    Err(HostError::new(
+        ErrorCode::TransportFailure,
+        "exhausted all host AF_VSOCK guest CIDs in 3..=65535",
+    ))
+}
+
 pub struct ManagedEnclaveHandle {
     endpoint: EnclaveEndpoint,
     enclave_pubkey: [u8; 32],
     child_vm: Option<Child>,
     _boot_artifacts: Vec<SealedBootArtifact>,
+    _cid_lease: Option<HostCidLease>,
 }
 
 impl Drop for ManagedEnclaveHandle {
@@ -539,6 +636,7 @@ impl ManagedEnclaveHandle {
             enclave_pubkey,
             child_vm: None,
             _boot_artifacts: Vec::new(),
+            _cid_lease: None,
         }
     }
 
@@ -581,13 +679,14 @@ impl ManagedEnclaveHandle {
                 "/dev/kvm is not available on this Linux host; enable KVM virtualization",
             ));
         }
-        if spec.guest_cid <= 2 {
+        if !(3..=65_535).contains(&spec.guest_cid) {
             return Err(HostError::new(
                 ErrorCode::Validation,
-                "guest AF_VSOCK CID must be >= 3 (CIDs 0..=2 are reserved)",
+                "guest AF_VSOCK CID must be in 3..=65535 (CIDs 0..=2 are reserved)",
             ));
         }
 
+        let cid_lock_dir = default_host_cid_lock_dir(spec.staging_dir.as_deref())?;
         let client_pk_hex = hex::encode(spec.authorized_client_pubkey);
         let (arch_machine, console_dev) = if cfg!(target_arch = "aarch64") {
             ("virt,accel=kvm,gic-version=3", "ttyAMA0")
@@ -595,110 +694,149 @@ impl ManagedEnclaveHandle {
             ("q35,accel=kvm", "ttyS0")
         };
         let cmdline = format!(
-            "console={console_dev} reboot=k panic=1 nomodules quiet rdinit=/init sb.vsock_port={} sb.client_pubkey={client_pk_hex}",
+            "console={console_dev} reboot=k panic=1 nomodules quiet rdinit=/init ip=dhcp sb.net_fallback=qemu_slirp sb.vsock_port={} sb.client_pubkey={client_pk_hex}",
             spec.vsock_port
         );
 
-        let mut cmd = Command::new(&verified_vmm);
-        cmd.args([
-            "-machine",
-            arch_machine,
-            "-cpu",
-            "host",
-            "-m",
-            &format!("{}M", spec.memory_mib.max(128)),
-            "-smp",
-            "1",
-            "-nodefaults",
-            "-no-user-config",
-            "-nographic",
-            "-serial",
-            "stdio",
-            "-kernel",
-        ])
-        .arg(sealed_kernel.vmm_path())
-        .arg("-initrd")
-        .arg(sealed_initramfs.vmm_path())
-        .args(["-append", &cmdline])
-        .args([
-            "-object",
-            "rng-random,filename=/dev/urandom,id=rng0",
-            "-device",
-            "virtio-rng-pci,rng=rng0",
-            "-netdev",
-            "user,id=net0,restrict=off",
-            "-device",
-            "virtio-net-pci,netdev=net0",
-            "-device",
-            &format!("vhost-vsock-pci,guest-cid={},id=vsock0", spec.guest_cid),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        let mut skipped_leases = Vec::new();
+        let mut preferred_cid = spec.guest_cid;
+        const MAX_CID_ATTEMPTS: usize = 8;
 
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::CommandExt;
-            let parent_pid = unsafe { libc::getpid() };
-            let kernel_fd = sealed_kernel.raw_fd();
-            let initrd_fd = sealed_initramfs.raw_fd();
-            // SAFETY: Runs in forked child before `execve`; uses only async-signal-safe libc calls
-            // (`prctl`, `getppid`, `fcntl`, `_exit`) to bind lifecycle to parent and pass sealed memfds.
-            unsafe {
-                cmd.pre_exec(move || {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::getppid() != parent_pid {
-                        libc::_exit(1);
-                    }
-                    for fd in [kernel_fd, initrd_fd] {
-                        let flags = libc::fcntl(fd, libc::F_GETFD);
-                        if flags < 0 {
+        for attempt in 0..MAX_CID_ATTEMPTS {
+            let cid_lease = acquire_host_cid_lease_in_dir(&cid_lock_dir, preferred_cid)?;
+            let leased_cid = cid_lease.cid();
+
+            let mut cmd = Command::new(&verified_vmm);
+            cmd.args([
+                "-machine",
+                arch_machine,
+                "-cpu",
+                "host",
+                "-m",
+                &format!("{}M", spec.memory_mib.max(128)),
+                "-smp",
+                "1",
+                "-nodefaults",
+                "-no-user-config",
+                "-nographic",
+                "-serial",
+                "stdio",
+                "-kernel",
+            ])
+            .arg(sealed_kernel.vmm_path())
+            .arg("-initrd")
+            .arg(sealed_initramfs.vmm_path())
+            .args(["-append", &cmdline])
+            .args([
+                "-object",
+                "rng-random,filename=/dev/urandom,id=rng0",
+                "-device",
+                "virtio-rng-pci,rng=rng0",
+                "-netdev",
+                "user,id=net0,restrict=off",
+                "-device",
+                "virtio-net-pci,netdev=net0",
+                "-device",
+                &format!("vhost-vsock-pci,guest-cid={leased_cid},id=vsock0"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::process::CommandExt;
+                let parent_pid = unsafe { libc::getpid() };
+                let kernel_fd = sealed_kernel.raw_fd();
+                let initrd_fd = sealed_initramfs.raw_fd();
+                // SAFETY: Runs in forked child before `execve`; uses only async-signal-safe libc calls
+                // (`prctl`, `getppid`, `fcntl`, `_exit`) to bind lifecycle to parent and pass sealed memfds.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                             return Err(io::Error::last_os_error());
                         }
-                        if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                            return Err(io::Error::last_os_error());
+                        if libc::getppid() != parent_pid {
+                            libc::_exit(1);
                         }
+                        for fd in [kernel_fd, initrd_fd] {
+                            let flags = libc::fcntl(fd, libc::F_GETFD);
+                            if flags < 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                            if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+            }
+
+            let child = cmd.spawn().map_err(|e| {
+                HostError::new(
+                    ErrorCode::TransportFailure,
+                    format!(
+                        "failed to launch microVM VMM '{}': {e}",
+                        verified_vmm.display()
+                    ),
+                )
+            })?;
+
+            let mut child_guard = DropGuard::new(child, |mut c| {
+                let _ = c.kill();
+                let _ = c.wait();
+            });
+
+            let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            if let Some(stderr) = child_guard.stderr.take() {
+                spawn_stderr_capture_drainer(stderr, std::sync::Arc::clone(&stderr_capture));
+            }
+            let stdout = child_guard.stdout.take().ok_or_else(|| {
+                HostError::new(ErrorCode::TransportFailure, "missing microVM serial stdout")
+            })?;
+            match read_enclave_pubkey_banner_and_drain(stdout, Duration::from_secs(20)) {
+                Ok(enclave_pubkey) => {
+                    drop(skipped_leases);
+                    let confirmed_child = DropGuard::dismiss(child_guard);
+                    return Ok(Self {
+                        endpoint: EnclaveEndpoint::Vsock {
+                            cid: leased_cid,
+                            port: spec.vsock_port,
+                        },
+                        enclave_pubkey,
+                        child_vm: Some(confirmed_child),
+                        _boot_artifacts: vec![sealed_kernel, sealed_initramfs],
+                        _cid_lease: Some(cid_lease),
+                    });
+                }
+                Err(boot_err) => {
+                    drop(child_guard);
+                    let stderr_snapshot = stderr_capture
+                        .lock()
+                        .map(|s| s.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let cid_conflict = stderr_snapshot.contains("guest-cid")
+                        || stderr_snapshot.contains("vhost-vsock")
+                        || stderr_snapshot.contains("address already in use");
+                    if cid_conflict && attempt + 1 < MAX_CID_ATTEMPTS {
+                        preferred_cid = if leased_cid >= 65_535 {
+                            3
+                        } else {
+                            leased_cid + 1
+                        };
+                        skipped_leases.push(cid_lease);
+                        continue;
                     }
-                    Ok(())
-                });
+                    return Err(boot_err);
+                }
             }
         }
 
-        let child = cmd.spawn().map_err(|e| {
-            HostError::new(
-                ErrorCode::TransportFailure,
-                format!(
-                    "failed to launch microVM VMM '{}': {e}",
-                    verified_vmm.display()
-                ),
-            )
-        })?;
-
-        let mut child_guard = DropGuard::new(child, |mut c| {
-            let _ = c.kill();
-            let _ = c.wait();
-        });
-
-        if let Some(stderr) = child_guard.stderr.take() {
-            spawn_pipe_drainer(stderr);
-        }
-        let stdout = child_guard.stdout.take().ok_or_else(|| {
-            HostError::new(ErrorCode::TransportFailure, "missing microVM serial stdout")
-        })?;
-        let enclave_pubkey = read_enclave_pubkey_banner_and_drain(stdout, Duration::from_secs(20))?;
-        let confirmed_child = DropGuard::dismiss(child_guard);
-
-        Ok(Self {
-            endpoint: EnclaveEndpoint::Vsock {
-                cid: spec.guest_cid,
-                port: spec.vsock_port,
-            },
-            enclave_pubkey,
-            child_vm: Some(confirmed_child),
-            _boot_artifacts: vec![sealed_kernel, sealed_initramfs],
-        })
+        Err(HostError::new(
+            ErrorCode::TransportFailure,
+            "unable to allocate an unused vhost-vsock guest CID after multiple attempts",
+        ))
     }
 
     /// Boots an isolated Linux `arm64` microVM via Apple's `Virtualization.framework`
@@ -720,7 +858,7 @@ impl ManagedEnclaveHandle {
 
         let client_pk_hex = hex::encode(spec.authorized_client_pubkey);
         let cmdline = format!(
-            "console=hvc0 reboot=k panic=1 nomodules quiet rdinit=/init sb.vsock_port={} sb.client_pubkey={client_pk_hex}",
+            "console=hvc0 reboot=k panic=1 nomodules quiet rdinit=/init ip=dhcp sb.vsock_port={} sb.client_pubkey={client_pk_hex}",
             spec.vsock_port
         );
 
@@ -741,6 +879,7 @@ impl ManagedEnclaveHandle {
             enclave_pubkey,
             child_vm: None,
             _boot_artifacts: vec![sealed_kernel, sealed_initramfs],
+            _cid_lease: None,
         })
     }
 
@@ -814,6 +953,7 @@ impl ManagedEnclaveHandle {
             enclave_pubkey,
             child_vm: Some(confirmed_child),
             _boot_artifacts: Vec::new(),
+            _cid_lease: None,
         })
     }
 
@@ -851,6 +991,27 @@ impl ManagedEnclaveHandle {
 fn spawn_pipe_drainer<R: Read + Send + 'static>(mut reader: R) {
     let _ = std::thread::spawn(move || {
         let _ = io::copy(&mut reader, &mut io::sink());
+    });
+}
+
+fn spawn_stderr_capture_drainer<R: Read + Send + 'static>(
+    mut reader: R,
+    captured: std::sync::Arc<std::sync::Mutex<String>>,
+) {
+    let _ = std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut guard) = captured.lock()
+                && guard.len() < 4096
+            {
+                let remaining = 4096 - guard.len();
+                let slice = &buf[..n.min(remaining)];
+                guard.push_str(&String::from_utf8_lossy(slice));
+            }
+        }
     });
 }
 

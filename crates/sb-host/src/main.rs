@@ -73,6 +73,7 @@ fn parse_cli() -> Result<HostCli, HostError> {
     let mut memory_mib = 256u32;
     let mut enclave_bin: Option<PathBuf> = None;
     let mut enclave_socket: Option<PathBuf> = None;
+    let mut enclave_key_file: Option<PathBuf> = None;
     let mut enclave_pubkey: Option<[u8; 32]> = None;
     let mut enclave_extra_args = Vec::new();
 
@@ -173,6 +174,11 @@ fn parse_cli() -> Result<HostCli, HostError> {
                     HostError::new(ErrorCode::Validation, "missing --enclave-socket path")
                 })?));
             }
+            "--enclave-key-file" => {
+                enclave_key_file = Some(PathBuf::from(args.next().ok_or_else(|| {
+                    HostError::new(ErrorCode::Validation, "missing --enclave-key-file path")
+                })?));
+            }
             "--enclave-pubkey-hex" => {
                 let val = args.next().ok_or_else(|| {
                     HostError::new(ErrorCode::Validation, "missing --enclave-pubkey-hex")
@@ -233,6 +239,17 @@ fn parse_cli() -> Result<HostCli, HostError> {
                 "--authorized-client-pubkey-hex <64-hex> is required with --enclave-bin",
             )
         })?;
+        if let Some(kf) = enclave_key_file {
+            let kf_raw = kf.to_string_lossy();
+            if kf_raw.is_empty() || kf_raw.starts_with('-') || !kf.is_absolute() {
+                return Err(HostError::new(
+                    ErrorCode::Validation,
+                    "--enclave-key-file must be a non-empty absolute path",
+                ));
+            }
+            enclave_extra_args.push("--enclave-key-file".to_string());
+            enclave_extra_args.push(kf_raw.into_owned());
+        }
         BackendMode::LocalEnclaveProcess {
             enclave_bin: bin,
             enclave_socket: sock,

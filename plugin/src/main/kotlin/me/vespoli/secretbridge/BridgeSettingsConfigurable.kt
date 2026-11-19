@@ -36,6 +36,7 @@ class BridgeSettingsConfigurable : Configurable {
     private val enclavePubkeyHexField = JBTextField()
     private val pinnedEnclavePubkeyHexField = JBTextField()
     private val enclaveBinaryField = JBTextField()
+    private val enclaveKeyFileField = JBTextField()
 
     private val allowedGithubHostField = JBTextField()
     private val allowedGithubOwnersField = JBTextField()
@@ -71,7 +72,10 @@ class BridgeSettingsConfigurable : Configurable {
             listenerRegistered = true
         }
         vmmSha256Field.emptyText.text = "Optional 64-hex SHA-256 of QEMU binary (Linux KVM)"
-        pinnedEnclavePubkeyHexField.emptyText.text = "Optional 64-hex pinned enclave Noise pubkey"
+        pinnedEnclavePubkeyHexField.emptyText.text =
+            "Required 64-hex guest enclave Noise pubkey (vm/out/enclave-pubkey.txt)"
+        enclaveKeyFileField.emptyText.text =
+            "Mode-0400 enclave Noise key file (provisioned via sb-enclave --generate-identity)"
         allowedGithubHostField.emptyText.text = "github.com (single authorized host)"
         allowedGithubOwnersField.emptyText.text = "Optional comma-separated GitHub orgs/owners"
         allowedAwsAccountsField.emptyText.text = "Optional comma-separated 12-digit AWS account IDs"
@@ -100,8 +104,9 @@ class BridgeSettingsConfigurable : Configurable {
             .addLabeledComponent("Guest AF_VSOCK port:", vsockPortSpinner, 1, false)
             .addLabeledComponent("MicroVM RAM (MiB):", memoryMibSpinner, 1, false)
             .addLabeledComponent("Existing enclave pubkey (64-hex):", enclavePubkeyHexField, 1, false)
-            .addLabeledComponent("Pinned enclave pubkey (64-hex):", pinnedEnclavePubkeyHexField, 1, false)
+            .addLabeledComponent("Pinned enclave pubkey (64-hex, required):", pinnedEnclavePubkeyHexField, 1, false)
             .addLabeledComponent("Local sb-enclave binary:", enclaveBinaryField, 1, false)
+            .addLabeledComponent("Local enclave key file:", enclaveKeyFileField, 1, false)
             .addSeparator()
             .addLabeledComponent("Authorized GitHub host:", allowedGithubHostField, 1, false)
             .addLabeledComponent("Allowed GitHub owners (CSV):", allowedGithubOwnersField, 1, false)
@@ -148,7 +153,9 @@ class BridgeSettingsConfigurable : Configurable {
         guestCidSpinner.isEnabled = isManagedVm || isExistingVsock
         vsockPortSpinner.isEnabled = isManagedVm || isExistingVsock
         enclavePubkeyHexField.isEnabled = isExistingVsock
+        pinnedEnclavePubkeyHexField.isEnabled = isManagedVm || isLocalProc
         enclaveBinaryField.isEnabled = isLocalProc
+        enclaveKeyFileField.isEnabled = isLocalProc
     }
 
     override fun isModified(): Boolean {
@@ -171,6 +178,7 @@ class BridgeSettingsConfigurable : Configurable {
         if (enclavePubkeyHexField.text.trim() != s.enclavePubkeyHex) return true
         if (pinnedEnclavePubkeyHexField.text.trim() != s.pinnedEnclavePubkeyHex) return true
         if (enclaveBinaryField.text.trim() != s.enclaveBinaryPath) return true
+        if (enclaveKeyFileField.text.trim() != s.enclaveKeyFilePath) return true
         if (allowedGithubHostField.text.trim() != s.allowedGithubHost) return true
         if (allowedGithubOwnersField.text.trim() != s.allowedGithubOwnersCsv) return true
         if (allowedAwsAccountsField.text.trim() != s.allowedAwsAccountsCsv) return true
@@ -232,6 +240,7 @@ class BridgeSettingsConfigurable : Configurable {
         s.enclavePubkeyHex = enclavePubkeyHexField.text.trim()
         s.pinnedEnclavePubkeyHex = pinnedEnclavePubkeyHexField.text.trim()
         s.enclaveBinaryPath = enclaveBinaryField.text.trim().ifEmpty { "/usr/local/bin/sb-enclave" }
+        s.enclaveKeyFilePath = enclaveKeyFileField.text.trim()
         s.allowedGithubHost = allowedGithubHostField.text.trim().ifEmpty { "github.com" }
         s.allowedGithubOwnersCsv = allowedGithubOwnersField.text.trim()
         s.allowedAwsAccountsCsv = allowedAwsAccountsField.text.trim()
@@ -250,7 +259,7 @@ class BridgeSettingsConfigurable : Configurable {
         wipeAllPasswordFields()
         clearStoredCredentialsCheck.isSelected = false
 
-        ApplicationManager.getApplication().executeOnPooledThread {
+        settings.submitCredentialTransaction {
             try {
                 if (clearAll) {
                     settings.saveBootstrapCredentialsOffEdt(null, null, null, null, null)
@@ -288,7 +297,8 @@ class BridgeSettingsConfigurable : Configurable {
     }
 
     override fun reset() {
-        val s = BridgeSettings.getInstance().state
+        val settings = BridgeSettings.getInstance()
+        val s = settings.state
         sbHostBinaryField.text = s.sbHostBinaryPath
         backendModeCombo.selectedItem = HostBackendMode.fromWire(s.backendMode)
         vmmBinaryField.text = s.vmmBinaryPath
@@ -303,6 +313,7 @@ class BridgeSettingsConfigurable : Configurable {
         enclavePubkeyHexField.text = s.enclavePubkeyHex
         pinnedEnclavePubkeyHexField.text = s.pinnedEnclavePubkeyHex
         enclaveBinaryField.text = s.enclaveBinaryPath
+        enclaveKeyFileField.text = s.enclaveKeyFilePath
         allowedGithubHostField.text = s.allowedGithubHost
         allowedGithubOwnersField.text = s.allowedGithubOwnersCsv
         allowedAwsAccountsField.text = s.allowedAwsAccountsCsv
@@ -314,7 +325,7 @@ class BridgeSettingsConfigurable : Configurable {
         clearStoredCredentialsCheck.isSelected = false
         updateModeFieldVisibility()
 
-        ApplicationManager.getApplication().executeOnPooledThread {
+        settings.submitCredentialTransaction {
             refreshKeychainStatusOffEdt()
         }
     }
@@ -331,7 +342,7 @@ class BridgeSettingsConfigurable : Configurable {
         val hasOp = settings.hasStoredCredentialOffEdt(BridgeSettings.KEY_OP_SERVICE_ACCOUNT_TOKEN)
         val hasGh = settings.hasStoredCredentialOffEdt(BridgeSettings.KEY_GITHUB_TOKEN)
         val hasAws = settings.hasStoredCredentialOffEdt(BridgeSettings.KEY_AWS_SECRET_ACCESS_KEY)
-        val (_, pubKey) = settings.loadOrCreateClientNoiseKeypairOffEdt()
+        val pubKey = settings.loadOrCreateClientNoisePublicKeyOffEdt()
         val pubShort = BridgeSettings.encodeHexString(pubKey).take(16)
         val summary = buildString {
             append("OS Keychain tokens: ")

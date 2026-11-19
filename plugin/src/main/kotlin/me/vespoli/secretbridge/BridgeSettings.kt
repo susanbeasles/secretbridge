@@ -10,8 +10,20 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.State
 import com.intellij.openapi.components.Storage
 import com.intellij.openapi.components.service
+import com.intellij.util.concurrency.AppExecutorUtil
 import com.intellij.util.xmlb.XmlSerializerUtil
-import java.util.concurrent.atomic.AtomicInteger
+import java.nio.channels.FileChannel
+import java.nio.channels.FileLock
+import java.nio.channels.OverlappingFileLockException
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.Paths
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.PosixFilePermissions
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class HostBackendMode(val wireValue: String, val displayLabel: String) {
     KVM_MICROVM("kvm_microvm", "Managed MicroVM (Linux KVM / macOS arm64 Virtualization.framework)"),
@@ -22,6 +34,29 @@ enum class HostBackendMode(val wireValue: String, val displayLabel: String) {
     companion object {
         fun fromWire(value: String?): HostBackendMode =
             entries.firstOrNull { it.wireValue == value } ?: KVM_MICROVM
+    }
+}
+
+class HostCidLease internal constructor(
+    val cid: Int,
+    private val lock: FileLock,
+    private val channel: FileChannel,
+    private val activeSet: MutableSet<Int>,
+) : AutoCloseable {
+    private val closed = AtomicBoolean(false)
+
+    override fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        try {
+            if (lock.isValid) lock.release()
+        } catch (_: Exception) {
+        }
+        try {
+            channel.close()
+        } catch (_: Exception) {
+        } finally {
+            activeSet.remove(cid)
+        }
     }
 }
 
@@ -45,6 +80,7 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
         var memoryMib: Int = 256,
         var enclavePubkeyHex: String = "",
         var enclaveBinaryPath: String = "/usr/local/bin/sb-enclave",
+        var enclaveKeyFilePath: String = "",
         var defaultGenerateLength: Int = 40,
         var defaultGenerateCharset: String = SecretCharset.ALPHANUMERIC_SYMBOLS.wireName,
         var pinnedLoadSecretsActionSha: String = "",
@@ -53,6 +89,33 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
         var allowedAwsAccountsCsv: String = "",
         var pinnedEnclavePubkeyHex: String = "",
     ) {
+        /**
+         * Resolves the independently authenticated 32-byte guest enclave Noise static public key
+         * and fails closed if unconfigured or all-zero (`C2`). Never trusts an unpinned host banner.
+         */
+        fun resolvePinnedEnclavePubkey32(): ByteArray {
+            val rawHex = when (HostBackendMode.fromWire(backendMode)) {
+                HostBackendMode.EXISTING_VSOCK -> {
+                    require(isHex64(enclavePubkeyHex)) {
+                        "64-character enclave Noise static public key hex is required for Existing Vsock mode"
+                    }
+                    enclavePubkeyHex.trim()
+                }
+                HostBackendMode.KVM_MICROVM, HostBackendMode.LOCAL_ENCLAVE_PROCESS -> {
+                    require(isHex64(pinnedEnclavePubkeyHex)) {
+                        "64-character pinned enclave Noise static public key hex is required before starting or authenticating the enclave"
+                    }
+                    pinnedEnclavePubkeyHex.trim()
+                }
+            }
+            val decoded = decodeHex32(rawHex)
+            if (decoded.all { it == 0.toByte() }) {
+                decoded.fill(0)
+                throw IllegalArgumentException("Pinned enclave Noise static public key must not be all-zero")
+            }
+            return decoded
+        }
+
         fun buildHostCliArgs(
             ideSocketPath: String,
             localEnclaveSocketPath: String,
@@ -63,6 +126,8 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
             require(hostBin.isNotEmpty() && !hostBin.startsWith("-")) {
                 "sb-host binary path must be non-empty and must not start with '-'"
             }
+            resolvePinnedEnclavePubkey32().fill(0)
+
             val args = ArrayList<String>()
             args.add(hostBin)
             args.add("--ide-socket")
@@ -115,11 +180,11 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
                     args.add(memoryMib.toString())
                 }
                 HostBackendMode.EXISTING_VSOCK -> {
-                    require(isHex64(enclavePubkeyHex)) {
-                        "64-character enclave Noise static public key hex is required for Existing Vsock mode"
+                    require(guestCid in 3..65535) {
+                        "Guest AF_VSOCK CID must be in 3..65535"
                     }
                     args.add("--guest-cid")
-                    args.add(effectiveGuestCid.toString())
+                    args.add(guestCid.toString())
                     args.add("--vsock-port")
                     args.add(vsockPort.toString())
                     args.add("--enclave-pubkey-hex")
@@ -137,6 +202,14 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
                     args.add(encBin)
                     args.add("--enclave-socket")
                     args.add(localEnclaveSocketPath)
+                    val keyFileTrimmed = enclaveKeyFilePath.trim()
+                    if (keyFileTrimmed.isNotEmpty()) {
+                        require(!keyFileTrimmed.startsWith("-")) {
+                            "Enclave Noise key file path must not start with '-'"
+                        }
+                        args.add("--enclave-key-file")
+                        args.add(keyFileTrimmed)
+                    }
                     args.add("--authorized-client-pubkey-hex")
                     args.add(authorizedClientPubkeyHex.trim())
                 }
@@ -157,6 +230,8 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
     private var stateData = StateData()
     private val keyLock = Any()
     private var cachedFallbackNoisePrivateKey: ByteArray? = null
+    private val credentialApplyExecutor =
+        AppExecutorUtil.createBoundedApplicationPoolExecutor("SecretBridgeCredentialApply", 1)
 
     override fun getState(): StateData = stateData
 
@@ -165,13 +240,30 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
     }
 
     /**
-     * Allocates a unique `AF_VSOCK` guest CID per open project so multiple IDE project windows
-     * never collide on the same guest CID (`H8`).
+     * Enqueues a credential `load -> merge/clear -> save -> session restart` transaction onto a
+     * single-threaded FIFO executor so rapid `Apply` actions execute strictly in submission order.
      */
-    fun allocateProjectGuestCid(): Int {
-        val base = stateData.guestCid.coerceIn(3, 60_000)
-        val offset = NEXT_CID_OFFSET.getAndIncrement() and 0x0FFF
-        return base + offset
+    fun submitCredentialTransaction(task: () -> Unit): Future<*> =
+        credentialApplyExecutor.submit(task)
+
+    /**
+     * Acquires a host-wide exclusive `AF_VSOCK` guest CID lease for managed microVMs so multiple
+     * open projects and separate JetBrains IDE processes never collide on a guest CID (`H8`).
+     */
+    fun acquireManagedGuestCidLease(): HostCidLease =
+        acquireHostCidLeaseInDir(stateData.guestCid.coerceIn(3, 65_535), defaultHostCidLockDir())
+
+    /**
+     * Loads or generates the IDE's persistent 32-byte client `Noise_IK` static public key while
+     * immediately zeroizing the returned private key `ByteArray` before returning.
+     */
+    fun loadOrCreateClientNoisePublicKeyOffEdt(): ByteArray {
+        val (priv, pub) = loadOrCreateClientNoiseKeypairOffEdt()
+        try {
+            return pub
+        } finally {
+            priv.fill(0)
+        }
     }
 
     /**
@@ -294,11 +386,60 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
         const val KEY_AWS_SESSION_TOKEN = "aws_session_token"
         const val KEY_CLIENT_NOISE_PRIVATE_KEY = "client_noise_private_key_hex"
 
-        private val NEXT_CID_OFFSET = AtomicInteger(0)
+        private val ACTIVE_JVM_CIDS: MutableSet<Int> = ConcurrentHashMap.newKeySet()
         private val HEX_CHARS = charArrayOf(
             '0', '1', '2', '3', '4', '5', '6', '7',
             '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
         )
+
+        fun defaultHostCidLockDir(): Path {
+            val home = System.getProperty("user.home")?.takeIf { it.isNotBlank() }
+                ?: throw IllegalStateException("Missing user.home system property")
+            return Paths.get(home, ".local", "run", "secretbridge-cids")
+        }
+
+        fun acquireHostCidLeaseInDir(preferredCid: Int, lockDir: Path): HostCidLease {
+            require(preferredCid in 3..65_535) { "Preferred guest AF_VSOCK CID must be in 3..65535" }
+            Files.createDirectories(lockDir)
+            require(!Files.isSymbolicLink(lockDir) && Files.isDirectory(lockDir, LinkOption.NOFOLLOW_LINKS)) {
+                "Refusing symlinked or non-directory host CID lock path: $lockDir"
+            }
+            try {
+                Files.setPosixFilePermissions(lockDir, PosixFilePermissions.fromString("rwx------"))
+            } catch (_: UnsupportedOperationException) {
+            }
+
+            val candidates = (preferredCid..65_535).asSequence() + (3 until preferredCid).asSequence()
+            for (candidate in candidates) {
+                if (!ACTIVE_JVM_CIDS.add(candidate)) continue
+                val lockPath = lockDir.resolve("ide-cid-$candidate.lock")
+                if (Files.isSymbolicLink(lockPath)) {
+                    ACTIVE_JVM_CIDS.remove(candidate)
+                    continue
+                }
+                var channel: FileChannel? = null
+                try {
+                    channel = FileChannel.open(
+                        lockPath,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.READ,
+                        StandardOpenOption.WRITE,
+                    )
+                    val fileLock = channel.tryLock()
+                    if (fileLock != null) {
+                        return HostCidLease(candidate, fileLock, channel, ACTIVE_JVM_CIDS)
+                    }
+                } catch (_: OverlappingFileLockException) {
+                } catch (_: Exception) {
+                }
+                try {
+                    channel?.close()
+                } catch (_: Exception) {
+                }
+                ACTIVE_JVM_CIDS.remove(candidate)
+            }
+            throw IllegalStateException("Exhausted all host AF_VSOCK guest CIDs in 3..65535")
+        }
 
         fun defaultHostVmmPath(): String {
             val osName = System.getProperty("os.name")?.lowercase().orEmpty()

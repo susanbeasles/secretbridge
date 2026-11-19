@@ -42,6 +42,198 @@ pub fn extract_cmdline_client_pubkey(cmdline: &str) -> Option<&str> {
     None
 }
 
+/// Extracts and validates `sb.vsock_port=<1..=65535>` from `/proc/cmdline`.
+pub fn extract_cmdline_vsock_port(cmdline: &str) -> Result<Option<u32>, EnclaveError> {
+    let mut found: Option<u32> = None;
+    for token in cmdline.split_whitespace() {
+        if let Some(val) = token.strip_prefix("sb.vsock_port=") {
+            let port = val.parse::<u32>().map_err(|_| {
+                EnclaveError::new(
+                    ErrorCode::Validation,
+                    "invalid sb.vsock_port integer on kernel command line",
+                )
+            })?;
+            if !(1..=65_535).contains(&port) {
+                return Err(EnclaveError::new(
+                    ErrorCode::Validation,
+                    "sb.vsock_port on kernel command line must be in 1..=65535",
+                ));
+            }
+            found = Some(port);
+        }
+    }
+    Ok(found)
+}
+
+/// Checks whether an exact space-delimited token (e.g. `sb.net_fallback=qemu_slirp`) appears on `/proc/cmdline`.
+pub fn cmdline_has_token(cmdline: &str, expected_token: &str) -> bool {
+    cmdline.split_whitespace().any(|tok| tok == expected_token)
+}
+
+pub const DEFAULT_ENCLAVE_KEY_PATH: &str = "/etc/secretbridge/enclave_noise.key";
+
+/// Generates a persistent 32-byte X25519 enclave static identity (`0400`, `O_NOFOLLOW`) for
+/// sealing inside `initramfs` (or local dev key storage) and writes its 64-hex public key to `pub_hex_path`.
+pub fn write_generated_enclave_identity(
+    priv_path: &Path,
+    pub_hex_path: &Path,
+) -> Result<[u8; 32], EnclaveError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let kp = sb_proto::crypto::generate_noise_keypair()?;
+    if let Some(parent) = priv_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            EnclaveError::new(
+                ErrorCode::InternalError,
+                format!("failed creating enclave identity directory: {e}"),
+            )
+        })?;
+    }
+    if let Some(pub_parent) = pub_hex_path.parent()
+        && !pub_parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(pub_parent).map_err(|e| {
+            EnclaveError::new(
+                ErrorCode::InternalError,
+                format!("failed creating enclave pubkey directory: {e}"),
+            )
+        })?;
+    }
+
+    let _ = std::fs::remove_file(priv_path);
+    let mut priv_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(priv_path)
+        .map_err(|e| {
+            EnclaveError::new(
+                ErrorCode::InternalError,
+                format!("failed creating enclave static key file: {e}"),
+            )
+        })?;
+    std::fs::set_permissions(priv_path, std::fs::Permissions::from_mode(0o400)).map_err(|e| {
+        EnclaveError::new(
+            ErrorCode::InternalError,
+            format!("failed setting 0400 mode on enclave static key: {e}"),
+        )
+    })?;
+    priv_file.write_all(&*kp.private).map_err(|e| {
+        EnclaveError::new(
+            ErrorCode::InternalError,
+            format!("failed writing enclave static key: {e}"),
+        )
+    })?;
+    priv_file.sync_all().map_err(|e| {
+        EnclaveError::new(
+            ErrorCode::InternalError,
+            format!("failed syncing enclave static key: {e}"),
+        )
+    })?;
+
+    let mut pub_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(pub_hex_path)
+        .map_err(|e| {
+            EnclaveError::new(
+                ErrorCode::InternalError,
+                format!("failed creating enclave pubkey file: {e}"),
+            )
+        })?;
+    writeln!(pub_file, "{}", hex::encode(kp.public)).map_err(|e| {
+        EnclaveError::new(
+            ErrorCode::InternalError,
+            format!("failed writing enclave pubkey hex: {e}"),
+        )
+    })?;
+    Ok(kp.public)
+}
+
+/// Loads a provisioned 32-byte X25519 enclave static keypair (`O_NOFOLLOW | O_NONBLOCK`, owner-only mode)
+/// so the guest enclave maintains a deterministic authenticated identity across managed restarts.
+/// When `shred_after_read` is true (guest PID 1), overwrites and unlinks the `tmpfs` copy immediately.
+pub fn load_enclave_static_keypair(
+    key_path: &Path,
+    shred_after_read: bool,
+) -> Result<sb_proto::crypto::StaticKeypair, EnclaveError> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let c_path = CString::new(key_path.as_os_str().as_bytes())
+        .map_err(|_| EnclaveError::new(ErrorCode::Validation, "invalid enclave key path"))?;
+    // SAFETY: `c_path` is NUL-terminated; `O_NOFOLLOW | O_NONBLOCK` rejects symlinks and avoids FIFO hangs.
+    let raw_fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(EnclaveError::new(
+            ErrorCode::Unauthorized,
+            format!(
+                "missing provisioned enclave static key at {} (build initramfs with vm/build-initramfs.sh or pass --enclave-key-file)",
+                key_path.display()
+            ),
+        ));
+    }
+    // SAFETY: `raw_fd` is newly opened and owned solely by `file`.
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(raw_fd, &mut st) } != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+    {
+        return Err(EnclaveError::new(
+            ErrorCode::Validation,
+            "enclave static key must be a regular file",
+        ));
+    }
+    if (st.st_mode & 0o077) != 0 {
+        return Err(EnclaveError::new(
+            ErrorCode::Validation,
+            "refusing to load group/world-accessible enclave static key file (expected 0400 or 0600)",
+        ));
+    }
+    if st.st_size != 32 {
+        return Err(EnclaveError::new(
+            ErrorCode::Validation,
+            "enclave static key file must be exactly 32 raw bytes",
+        ));
+    }
+
+    let mut priv_bytes = Zeroizing::new([0u8; 32]);
+    file.read_exact(&mut *priv_bytes).map_err(|e| {
+        EnclaveError::new(
+            ErrorCode::InternalError,
+            format!("failed reading enclave static key: {e}"),
+        )
+    })?;
+    drop(file);
+
+    if shred_after_read {
+        let _ = std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600));
+        if let Ok(mut wipe_file) = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(key_path)
+        {
+            let _ = wipe_file.write_all(&[0u8; 32]);
+            let _ = wipe_file.sync_all();
+        }
+        let _ = std::fs::remove_file(key_path);
+    }
+
+    sb_proto::crypto::derive_noise_keypair_from_private(*priv_bytes).map_err(EnclaveError::from)
+}
+
 /// Handles a single mutually-authenticated `Noise_IK` RPC session.
 /// Immediately drops `stream` on unauthorized handshake or framing violation.
 pub fn serve_noise_connection<S: Read + Write>(

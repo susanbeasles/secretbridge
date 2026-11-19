@@ -124,20 +124,39 @@ resolve_elf_tree() {
 }
 
 rm -rf "${STAGE_DIR}"
+cleanup_stage() {
+  chmod -R u+w "${STAGE_DIR}" 2>/dev/null || true
+  rm -rf "${STAGE_DIR}"
+}
+trap cleanup_stage EXIT
+
 mkdir -p \
   "${STAGE_DIR}/bin" \
   "${STAGE_DIR}/dev" \
+  "${STAGE_DIR}/etc/secretbridge" \
   "${STAGE_DIR}/etc/ssl/certs" \
   "${STAGE_DIR}/lib" \
   "${STAGE_DIR}/lib64" \
   "${STAGE_DIR}/proc" \
   "${STAGE_DIR}/sys" \
-  "${STAGE_DIR}/usr/lib"
+  "${STAGE_DIR}/usr/lib" \
+  "${OUT_DIR}"
 
 # Install self-contained PID-1 Rust enclave binary directly as /init (no busybox/shell in guest, H7)
 install -m 0755 "${ENCLAVE_BIN}" "${STAGE_DIR}/init"
 ln -s /init "${STAGE_DIR}/bin/sb-enclave"
 install -m 0444 "${OP_CORE_SO}" "${STAGE_DIR}/usr/lib/libop_uniffi_core.so"
+
+# Provision sealed guest static Noise_IK identity inside the SHA-256-verified initramfs so the
+# guest keeps an independently authenticated static pubkey across restarts while sb-host stays untrusted.
+if [[ -n "${SB_ENCLAVE_IDENTITY_KEY:-}" ]]; then
+  install -m 0400 "${SB_ENCLAVE_IDENTITY_KEY}" "${STAGE_DIR}/etc/secretbridge/enclave_noise.key"
+else
+  "${ENCLAVE_BIN}" --generate-identity \
+    "${STAGE_DIR}/etc/secretbridge/enclave_noise.key" \
+    "${OUT_DIR}/enclave-pubkey.txt"
+fi
+chmod 0400 "${STAGE_DIR}/etc/secretbridge/enclave_noise.key"
 
 resolve_elf_tree "${ENCLAVE_BIN}"
 resolve_elf_tree "${OP_CORE_SO}"
@@ -161,7 +180,6 @@ fi
 
 # Normalize mtimes across all staged tree depths for deterministic cpio archive generation (H7)
 find "${STAGE_DIR}" -exec touch -h -d "@0" {} +
-mkdir -p "${OUT_DIR}"
 (
   cd "${STAGE_DIR}"
   if cpio --help 2>&1 | grep -q -- '--reproducible'; then
@@ -173,3 +191,6 @@ mkdir -p "${OUT_DIR}"
 chmod 0600 "${OUT_DIR}/initramfs.cpio.gz"
 sha256sum "${OUT_DIR}/initramfs.cpio.gz" | awk '{print $1}' > "${OUT_DIR}/initramfs.sha256"
 echo "Built ${OUT_DIR}/initramfs.cpio.gz (SHA-256: $(cat "${OUT_DIR}/initramfs.sha256"))"
+if [[ -f "${OUT_DIR}/enclave-pubkey.txt" ]]; then
+  echo "Pinned Enclave Noise Pubkey (64-hex): $(cat "${OUT_DIR}/enclave-pubkey.txt")"
+fi

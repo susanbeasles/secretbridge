@@ -47,8 +47,8 @@ data class ParsedHostBanner(
 class HostSocketTransport(
     val socketPath: Path,
     authTokenHex: CharArray,
-    private val clientPrivateKey32: ByteArray = ByteArray(0),
-    private val expectedEnclavePubkey32: ByteArray = ByteArray(0),
+    clientPrivateKey32: ByteArray = ByteArray(0),
+    expectedEnclavePubkey32: ByteArray = ByteArray(0),
     private val ioTimeoutMs: Long = DEFAULT_IO_TIMEOUT_MS,
 ) : AutoCloseable {
     private val tokenChars: CharArray = authTokenHex.copyOf()
@@ -91,8 +91,12 @@ class HostSocketTransport(
     @Synchronized
     fun executeEnclaveBatch(requests: List<EnclaveRequest>): List<EnclaveResult> {
         check(tokenChars.isNotEmpty()) { "HostSocketTransport has already been closed" }
-        require(clientPrivCopy.size == 32 && enclavePubCopy.size == 32) {
-            "HostSocketTransport requires 32-byte client Noise private key and enclave public key for E2E tunnel"
+        require(
+            clientPrivCopy.size == 32 &&
+                enclavePubCopy.size == 32 &&
+                enclavePubCopy.any { it != 0.toByte() },
+        ) {
+            "HostSocketTransport requires 32-byte client Noise private key and non-zero pinned enclave public key for E2E tunnel"
         }
         if (requests.isEmpty()) return emptyList()
 
@@ -428,7 +432,6 @@ class HostSocketTransport(
 @Service(Service.Level.PROJECT)
 class EnclaveClient(private val project: Project) : Disposable {
     private val lock = Any()
-    private val projectGuestCid: Int = BridgeSettings.getInstance().allocateProjectGuestCid()
     private var managedProcess: ManagedHostProcess? = null
 
     fun manifestPathOrNull(): Path? {
@@ -512,10 +515,47 @@ class EnclaveClient(private val project: Project) : Disposable {
 
             val settings = BridgeSettings.getInstance()
             val settingsState = settings.state
-            val (clientPriv32, clientPub32) = settings.loadOrCreateClientNoiseKeypairOffEdt()
+            val mode = HostBackendMode.fromWire(settingsState.backendMode)
+            val pinnedPub32 = try {
+                settingsState.resolvePinnedEnclavePubkey32()
+            } catch (e: IllegalArgumentException) {
+                throw EnclaveBridgeException(
+                    "validation",
+                    e.message ?: "Pinned enclave Noise static public key is required",
+                )
+            }
+
+            val cidLease = if (mode == HostBackendMode.KVM_MICROVM) {
+                try {
+                    settings.acquireManagedGuestCidLease()
+                } catch (e: Exception) {
+                    pinnedPub32.fill(0)
+                    throw EnclaveBridgeException(
+                        "transport_failure",
+                        e.message ?: "Unable to acquire host-wide AF_VSOCK guest CID lease",
+                    )
+                }
+            } else {
+                null
+            }
+
+            val (clientPriv32, clientPub32) = try {
+                settings.loadOrCreateClientNoiseKeypairOffEdt()
+            } catch (e: Exception) {
+                pinnedPub32.fill(0)
+                cidLease?.close()
+                throw e
+            }
             val clientPubHex = BridgeSettings.encodeHexString(clientPub32)
 
-            val runtimeDir = createPrivateSocketDirectory()
+            val runtimeDir = try {
+                createPrivateSocketDirectory()
+            } catch (e: Exception) {
+                pinnedPub32.fill(0)
+                clientPriv32.fill(0)
+                cidLease?.close()
+                throw e
+            }
             val ideSock = runtimeDir.resolve("h.sock")
             val localEncSock = runtimeDir.resolve("e.sock")
 
@@ -524,10 +564,12 @@ class EnclaveClient(private val project: Project) : Disposable {
                     ideSocketPath = ideSock.toString(),
                     localEnclaveSocketPath = localEncSock.toString(),
                     authorizedClientPubkeyHex = clientPubHex,
-                    effectiveGuestCid = projectGuestCid,
+                    effectiveGuestCid = cidLease?.cid ?: settingsState.guestCid,
                 )
             } catch (e: IllegalArgumentException) {
+                pinnedPub32.fill(0)
                 clientPriv32.fill(0)
+                cidLease?.close()
                 cleanupRuntimeDir(runtimeDir)
                 throw EnclaveBridgeException("validation", e.message ?: "Invalid SecretBridge host settings")
             }
@@ -546,7 +588,9 @@ class EnclaveClient(private val project: Project) : Disposable {
             val proc = try {
                 pb.start()
             } catch (e: Exception) {
+                pinnedPub32.fill(0)
                 clientPriv32.fill(0)
+                cidLease?.close()
                 cleanupRuntimeDir(runtimeDir)
                 throw EnclaveBridgeException(
                     "transport_failure",
@@ -572,8 +616,10 @@ class EnclaveClient(private val project: Project) : Disposable {
 
             val readyChars = readStartupBannerCharsWithTimeout(proc.inputStream, STARTUP_TIMEOUT_MS)
             if (readyChars == null) {
+                pinnedPub32.fill(0)
                 clientPriv32.fill(0)
                 proc.destroyForcibly()
+                cidLease?.close()
                 cleanupRuntimeDir(runtimeDir)
                 val detail = stderrRing.snapshot().ifBlank { "timed out waiting for SB_HOST_READY" }
                 throw EnclaveBridgeException("transport_failure", "sb-host failed to start: $detail")
@@ -582,45 +628,44 @@ class EnclaveClient(private val project: Project) : Disposable {
             val parsedBanner = try {
                 HostSocketTransport.parseReadyBannerChars(readyChars)
             } catch (e: Exception) {
+                pinnedPub32.fill(0)
                 clientPriv32.fill(0)
                 proc.destroyForcibly()
+                cidLease?.close()
                 cleanupRuntimeDir(runtimeDir)
                 throw e
             } finally {
                 readyChars.fill('\u0000')
             }
 
-            // Enforce pinned enclave Noise pubkey when configured (or TOFU verify against banner key)
-            val pinnedHex = settingsState.pinnedEnclavePubkeyHex.trim()
-            if (pinnedHex.isNotEmpty()) {
-                val pinnedBytes = try {
-                    BridgeSettings.decodeHex32(pinnedHex)
-                } catch (_: IllegalArgumentException) {
-                    parsedBanner.authTokenChars.fill('\u0000')
-                    clientPriv32.fill(0)
-                    proc.destroyForcibly()
-                    cleanupRuntimeDir(runtimeDir)
-                    throw EnclaveBridgeException("validation", "Pinned enclave Noise pubkey must be 64-character hex")
-                }
-                if (!NoiseIkSession.constantTimeEquals(pinnedBytes, parsedBanner.enclavePubkey32)) {
-                    parsedBanner.authTokenChars.fill('\u0000')
-                    clientPriv32.fill(0)
-                    proc.destroyForcibly()
-                    cleanupRuntimeDir(runtimeDir)
-                    throw EnclaveBridgeException(
-                        "unauthorized",
-                        "Guest enclave Noise pubkey did not match configured pinned pubkey",
-                    )
-                }
+            // Fail closed BEFORE opening any Noise_IK tunnel or transmitting bootstrap credentials:
+            // never accept `SB_HOST_READY enckey=` from the untrusted host relay unless it matches `pinnedPub32`.
+            if (
+                parsedBanner.enclavePubkey32.size != 32 ||
+                !NoiseIkSession.constantTimeEquals(pinnedPub32, parsedBanner.enclavePubkey32)
+            ) {
+                parsedBanner.authTokenChars.fill('\u0000')
+                parsedBanner.enclavePubkey32.fill(0)
+                pinnedPub32.fill(0)
+                clientPriv32.fill(0)
+                proc.destroyForcibly()
+                cidLease?.close()
+                cleanupRuntimeDir(runtimeDir)
+                throw EnclaveBridgeException(
+                    "unauthorized",
+                    "Guest enclave Noise pubkey did not match configured pinned pubkey",
+                )
             }
 
             val transport = HostSocketTransport(
                 socketPath = parsedBanner.socketPath,
                 authTokenHex = parsedBanner.authTokenChars,
                 clientPrivateKey32 = clientPriv32,
-                expectedEnclavePubkey32 = parsedBanner.enclavePubkey32,
+                expectedEnclavePubkey32 = pinnedPub32,
             )
             parsedBanner.authTokenChars.fill('\u0000')
+            parsedBanner.enclavePubkey32.fill(0)
+            pinnedPub32.fill(0)
             clientPriv32.fill(0)
 
             val session = ManagedHostProcess(
@@ -628,6 +673,7 @@ class EnclaveClient(private val project: Project) : Disposable {
                 transport = transport,
                 runtimeDir = runtimeDir,
                 stderrThread = stderrThread,
+                cidLease = cidLease,
             )
 
             try {
@@ -674,6 +720,10 @@ class EnclaveClient(private val project: Project) : Disposable {
             }
         } catch (_: Exception) {
         }
+        try {
+            session.cidLease?.close()
+        } catch (_: Exception) {
+        }
         cleanupRuntimeDir(session.runtimeDir)
     }
 
@@ -694,6 +744,7 @@ class EnclaveClient(private val project: Project) : Disposable {
         val transport: HostSocketTransport,
         val runtimeDir: Path,
         val stderrThread: Thread,
+        val cidLease: HostCidLease?,
     )
 
     private class BoundedStderrRing {

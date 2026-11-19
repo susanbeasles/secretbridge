@@ -58,9 +58,12 @@ class SecretBridgePluginTest {
         }
         val opChars = sampleSa.toCharArray()
         val ghChars = sampleGh.toCharArray()
+        val largeSessSecret = "s".repeat(2_400)
+        val sessChars = largeSessSecret.toCharArray()
         val creds = SessionCredentialsChars(
             opServiceAccountToken = opChars,
             githubToken = ghChars,
+            awsSessionToken = sessChars,
             allowedGithubHosts = listOf("github.com"),
             allowedGithubOwners = listOf("acme"),
             allowedAwsAccountIds = listOf("123456789012"),
@@ -68,8 +71,10 @@ class SecretBridgePluginTest {
         val req = EnclaveRequest.ConfigureSession(creds)
         val encodedBytes = JsonCodec.encodeUtf8(req.toJson(), appendNewline = true)
         try {
+            assertTrue("Encoded payload must exceed initial 512-byte stream capacity", encodedBytes.size > 2_500)
             assertTrue("opChars must be zeroized after encodeUtf8", opChars.all { it == '\u0000' })
             assertTrue("ghChars must be zeroized after encodeUtf8", ghChars.all { it == '\u0000' })
+            assertTrue("sessChars must be zeroized after encodeUtf8", sessChars.all { it == '\u0000' })
 
             val text = String(encodedBytes, StandardCharsets.UTF_8)
             assertTrue(text.endsWith("\n"))
@@ -78,6 +83,7 @@ class SecretBridgePluginTest {
             val parsedCreds = parsed.reqObj("credentials")
             assertEquals(sampleSa, parsedCreds.reqStr("op_service_account_token"))
             assertEquals(sampleGh, parsedCreds.reqStr("github_token"))
+            assertEquals(largeSessSecret, parsedCreds.reqStr("aws_session_token"))
             assertEquals(listOf("acme"), parsedCreds.strList("allowed_github_owners"))
             assertFalse(parsedCreds.entries.containsKey("aws_secret_access_key"))
         } finally {
@@ -293,8 +299,12 @@ class SecretBridgePluginTest {
     @Test
     fun hostCliBuilderAndReadyBannerParserHandleSpacesInSocketPathAndEnforceDigests() {
         val validClientPub = "f".repeat(64)
+        val validPinnedEnclavePub = "c".repeat(64)
 
-        val badBin = BridgeSettings.StateData(sbHostBinaryPath = "--bad-flag")
+        val badBin = BridgeSettings.StateData(
+            sbHostBinaryPath = "--bad-flag",
+            pinnedEnclavePubkeyHex = validPinnedEnclavePub,
+        )
         try {
             badBin.buildHostCliArgs("/path/h.sock", "/path/e.sock", validClientPub, 42)
             fail("Expected IllegalArgumentException for flag-like binary path")
@@ -307,6 +317,7 @@ class SecretBridgePluginTest {
             initramfsPath = "/opt/sb/initramfs.cpio",
             kernelSha256 = "short",
             initramfsSha256 = "0".repeat(64),
+            pinnedEnclavePubkeyHex = validPinnedEnclavePub,
         )
         try {
             missingDigest.buildHostCliArgs("/path/h.sock", "/path/e.sock", validClientPub, 42)
@@ -314,7 +325,25 @@ class SecretBridgePluginTest {
         } catch (_: IllegalArgumentException) {
         }
 
-        val validKvm = missingDigest.copy(kernelSha256 = "a".repeat(64), initramfsSha256 = "b".repeat(64))
+        // Unpinned or all-zero enclave pubkey must fail closed before launching sb-host
+        for (badPin in listOf("", "0".repeat(64))) {
+            val unpinnedKvm = missingDigest.copy(
+                kernelSha256 = "a".repeat(64),
+                initramfsSha256 = "b".repeat(64),
+                pinnedEnclavePubkeyHex = badPin,
+            )
+            try {
+                unpinnedKvm.buildHostCliArgs("/path/h.sock", "/path/e.sock", validClientPub, 42)
+                fail("Expected IllegalArgumentException for unpinned/zero enclave pubkey: '$badPin'")
+            } catch (_: IllegalArgumentException) {
+            }
+        }
+
+        val validKvm = missingDigest.copy(
+            kernelSha256 = "a".repeat(64),
+            initramfsSha256 = "b".repeat(64),
+            pinnedEnclavePubkeyHex = validPinnedEnclavePub,
+        )
         val args = validKvm.buildHostCliArgs("/path/h.sock", "/path/e.sock", validClientPub, 77)
         assertEquals("sb-host", args[0])
         assertTrue(args.contains("--kernel-sha256"))
@@ -323,6 +352,19 @@ class SecretBridgePluginTest {
         assertTrue(args.contains(validClientPub))
         assertTrue(args.contains("77"))
 
+        // EXISTING_VSOCK must use configured guestCid unchanged even if effectiveGuestCid differs
+        val existingVsock = BridgeSettings.StateData(
+            backendMode = HostBackendMode.EXISTING_VSOCK.wireValue,
+            guestCid = 42,
+            vsockPort = 5190,
+            enclavePubkeyHex = "e".repeat(64),
+        )
+        val existingArgs = existingVsock.buildHostCliArgs("/path/h.sock", "/path/e.sock", validClientPub, 999)
+        val cidIdx = existingArgs.indexOf("--guest-cid")
+        assertTrue(cidIdx >= 0)
+        assertEquals("42", existingArgs[cidIdx + 1])
+        assertFalse(existingArgs.contains("999"))
+
         val spacePath = "/Users/Anthony Vespoli/Library/Application Support/sb/h.sock"
         val banner = "SB_HOST_READY token=${"d".repeat(64)} enckey=${"e".repeat(64)} socket=$spacePath"
         val parsed = HostSocketTransport.parseReadyBanner(banner)
@@ -330,6 +372,51 @@ class SecretBridgePluginTest {
         assertEquals("d".repeat(64), String(parsed.authTokenChars))
         assertEquals("e".repeat(64), BridgeSettings.encodeHexString(parsed.enclavePubkey32))
         parsed.authTokenChars.fill('\u0000')
+    }
+
+    @Test
+    fun hostCidLeaseAndSequentialCredentialExecutorEnforceIsolationAndFifoOrder() {
+        val home = System.getProperty("user.home")!!
+        val cidDir = Paths.get(home, ".local", "run", "sb-cid-junit-${UUID.randomUUID().toString().take(8)}")
+        try {
+            val lease1 = BridgeSettings.acquireHostCidLeaseInDir(42, cidDir)
+            val lease2 = BridgeSettings.acquireHostCidLeaseInDir(42, cidDir)
+            assertEquals(42, lease1.cid)
+            assertEquals(43, lease2.cid)
+            lease1.close()
+
+            val reclaimed = BridgeSettings.acquireHostCidLeaseInDir(42, cidDir)
+            assertEquals(42, reclaimed.cid)
+            reclaimed.close()
+            lease2.close()
+        } finally {
+            Files.deleteIfExists(cidDir.resolve("ide-cid-42.lock"))
+            Files.deleteIfExists(cidDir.resolve("ide-cid-43.lock"))
+            Files.deleteIfExists(cidDir)
+        }
+
+        val settings = BridgeSettings()
+        val pubOnly = settings.loadOrCreateClientNoisePublicKeyOffEdt()
+        assertEquals(32, pubOnly.size)
+        assertFalse(pubOnly.all { it == 0.toByte() })
+        val (privPair, pubPair) = settings.loadOrCreateClientNoiseKeypairOffEdt()
+        try {
+            assertTrue(NoiseIkSession.constantTimeEquals(pubOnly, pubPair))
+        } finally {
+            privPair.fill(0)
+        }
+
+        val observedOrder = ArrayList<Int>()
+        val futures = (1..5).map { step ->
+            settings.submitCredentialTransaction {
+                Thread.sleep((6 - step) * 5L)
+                synchronized(observedOrder) {
+                    observedOrder.add(step)
+                }
+            }
+        }
+        futures.forEach { it.get() }
+        assertEquals(listOf(1, 2, 3, 4, 5), observedOrder)
     }
 
     @Test
@@ -415,7 +502,20 @@ class SecretBridgePluginTest {
         }
         val ideSock = runDir.resolve("h.sock")
         val enclaveSock = runDir.resolve("e.sock")
+        val enclaveKeyFile = runDir.resolve("enclave_noise.key")
+        val enclavePubFile = runDir.resolve("enclave_noise.pub")
         val manifestFile = runDir.resolve("secretbridge.json")
+
+        // Provision an independent enclave static identity out-of-band (never trusting SB_HOST_READY)
+        val genExit = ProcessBuilder(
+            sbEnclaveBin.toString(),
+            "--generate-identity",
+            enclaveKeyFile.toString(),
+            enclavePubFile.toString(),
+        ).start().waitFor()
+        assertEquals("sb-enclave --generate-identity must exit 0", 0, genExit)
+        val provisionedPubHex = Files.readString(enclavePubFile, StandardCharsets.UTF_8).trim()
+        val provisionedPub32 = BridgeSettings.decodeHex32(provisionedPubHex)
 
         val (clientPriv, clientPub) = NoiseIkSession.generateStaticKeypair()
         val clientPubHex = BridgeSettings.encodeHexString(clientPub)
@@ -433,6 +533,8 @@ class SecretBridgePluginTest {
             sbEnclaveBin.toString(),
             "--enclave-socket",
             enclaveSock.toString(),
+            "--enclave-key-file",
+            enclaveKeyFile.toString(),
             "--authorized-client-pubkey-hex",
             clientPubHex,
             "--enclave-arg",
@@ -449,7 +551,26 @@ class SecretBridgePluginTest {
                 fail("Expected SB_HOST_READY line from sb-host, stderr was: $errText")
             }
             val parsed = HostSocketTransport.parseReadyBanner(readyLine!!)
-            assertFalse("Enclave Noise public key must be non-zero", parsed.enclavePubkey32.all { it == 0.toByte() })
+            assertTrue(
+                "Enclave banner pubkey must match independently provisioned static pubkey",
+                NoiseIkSession.constantTimeEquals(provisionedPub32, parsed.enclavePubkey32),
+            )
+
+            // Verify a mismatched pinned enclave public key fails closed BEFORE sending credentials
+            val (_, wrongPinnedPub) = NoiseIkSession.generateStaticKeypair()
+            try {
+                HostSocketTransport(
+                    socketPath = parsed.socketPath,
+                    authTokenHex = parsed.authTokenChars,
+                    clientPrivateKey32 = clientPriv,
+                    expectedEnclavePubkey32 = wrongPinnedPub,
+                ).use { mismatchedTransport ->
+                    mismatchedTransport.executeEnclave(EnclaveRequest.Capabilities)
+                    fail("Expected mismatched pinned enclave pubkey to fail closed before Noise_IK handshake")
+                }
+            } catch (expected: EnclaveBridgeException) {
+                assertEquals("unauthorized", expected.code)
+            }
 
             // Verify an unauthorized Kotlin Noise static keypair is rejected by sb-enclave
             val (roguePriv, _) = NoiseIkSession.generateStaticKeypair()
@@ -458,7 +579,7 @@ class SecretBridgePluginTest {
                     socketPath = parsed.socketPath,
                     authTokenHex = parsed.authTokenChars,
                     clientPrivateKey32 = roguePriv,
-                    expectedEnclavePubkey32 = parsed.enclavePubkey32,
+                    expectedEnclavePubkey32 = provisionedPub32,
                 ).use { rogueTransport ->
                     rogueTransport.executeEnclave(EnclaveRequest.Capabilities)
                     fail("Expected unauthorized Noise_IK client keypair to be rejected by sb-enclave")
@@ -472,7 +593,7 @@ class SecretBridgePluginTest {
                 socketPath = parsed.socketPath,
                 authTokenHex = parsed.authTokenChars,
                 clientPrivateKey32 = clientPriv,
-                expectedEnclavePubkey32 = parsed.enclavePubkey32,
+                expectedEnclavePubkey32 = provisionedPub32,
             ).use { transport ->
                 parsed.authTokenChars.fill('\u0000')
 
@@ -562,9 +683,12 @@ class SecretBridgePluginTest {
                 assertTrue((batchResults.last() as EnclaveResult.Capabilities).capabilities.authenticated)
             }
         } finally {
+            provisionedPub32.fill(0)
             clientPriv.fill(0)
             proc.destroyForcibly()
             Files.deleteIfExists(manifestFile)
+            Files.deleteIfExists(enclaveKeyFile)
+            Files.deleteIfExists(enclavePubFile)
             Files.deleteIfExists(ideSock)
             Files.deleteIfExists(enclaveSock)
             Files.deleteIfExists(runDir)

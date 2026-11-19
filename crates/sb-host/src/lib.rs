@@ -521,7 +521,10 @@ fn relay_noise_tunnel(
 mod tests {
     use super::*;
     use crate::capture::MlockedHostBuffer;
-    use crate::vmm::{EnclaveEndpoint, open_and_seal_boot_artifact, verify_boot_artifact_sha256};
+    use crate::vmm::{
+        EnclaveEndpoint, acquire_host_cid_lease_in_dir, open_and_seal_boot_artifact,
+        verify_boot_artifact_sha256,
+    };
     use sb_enclave::aws::InMemoryAwsClient;
     use sb_enclave::github::InMemoryGitHubClient;
     use sb_enclave::service::EnclaveService;
@@ -532,6 +535,8 @@ mod tests {
         CaptureTarget, EnclaveRequest, EnclaveResponse, EnclaveResult, SessionCredentialsInput,
     };
     use sha2::{Digest, Sha256};
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use uuid::Uuid;
 
@@ -592,10 +597,49 @@ mod tests {
         let loaded = load_manifest(&manifest_path).unwrap();
         assert_eq!(loaded, manifest);
 
+        // Leaf symlink must be rejected on both load and save
         let symlink_path = dir.join("evil-link.json");
         std::os::unix::fs::symlink(&manifest_path, &symlink_path).unwrap();
         assert!(load_manifest(&symlink_path).is_err());
         assert!(save_manifest_atomic(&symlink_path, &manifest).is_err());
+
+        // Symlinked ancestor directory must be rejected by `openat(..., O_DIRECTORY | O_NOFOLLOW)`
+        let real_subdir = dir.join("real-sub");
+        std::fs::create_dir(&real_subdir).unwrap();
+        let real_sub_manifest = real_subdir.join("secretbridge.json");
+        save_manifest_atomic(&real_sub_manifest, &manifest).unwrap();
+        let symlink_dir = dir.join("symlink-sub");
+        std::os::unix::fs::symlink(&real_subdir, &symlink_dir).unwrap();
+        let via_symlink_dir = symlink_dir.join("secretbridge.json");
+        assert!(load_manifest(&via_symlink_dir).is_err());
+        assert!(save_manifest_atomic(&via_symlink_dir, &manifest).is_err());
+
+        // Named pipe (FIFO) with no writer must return immediately (`O_NONBLOCK`) and reject non-regular file
+        let fifo_path = dir.join("fifo-manifest.json");
+        let fifo_c = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0);
+        let err = load_manifest(&fifo_path).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Validation);
+    }
+
+    #[test]
+    fn host_cid_lease_allocates_distinct_cids_and_reclaims_on_drop() {
+        let dir = make_test_dir();
+        let _dir_guard = DropGuard::new(dir.clone(), |d| {
+            let _ = std::fs::remove_dir_all(d);
+        });
+
+        let lock_dir = dir.join("cids");
+        let lease_a = acquire_host_cid_lease_in_dir(&lock_dir, 42).unwrap();
+        assert_eq!(lease_a.cid(), 42);
+
+        let lease_b = acquire_host_cid_lease_in_dir(&lock_dir, 42).unwrap();
+        assert_eq!(lease_b.cid(), 43);
+
+        drop(lease_a);
+        let lease_reclaimed = acquire_host_cid_lease_in_dir(&lock_dir, 42).unwrap();
+        assert_eq!(lease_reclaimed.cid(), 42);
     }
 
     #[test]

@@ -74,6 +74,8 @@ OP_UNIFFI_SHA256=<64-hex-sha256> \
   bash vm/build-initramfs.sh
 ```
 
+`vm/build-initramfs.sh` seals a mode-`0400` guest static `Noise_IK` keypair inside the SHA-256-verified initramfs (shredded from `tmpfs` into `mlock` RAM by PID 1 at boot) and writes the corresponding 64-hex public key to `vm/out/enclave-pubkey.txt` (for local daemon development, run `sb-enclave --generate-identity <priv-path> <pub-path>`).
+
 ### 3. JetBrains IDE Plugin (`plugin/`)
 
 ```sh
@@ -82,7 +84,7 @@ OP_UNIFFI_SHA256=<64-hex-sha256> \
 ./plugin/gradlew -p plugin verifyPlugin
 ```
 
-The installable plugin archive is written to `plugin/build/distributions/`. Install it in IntelliJ IDEA / WebStorm / GoLand / PyCharm / RustRover (`2024.3+`) via **Settings -> Plugins -> Gear Icon -> Install Plugin from Disk...**, then configure `sb-host`, microVM image SHA-256 digests, and cloud destination allowlists under **Settings -> Tools -> SecretBridge for 1Password**.
+The installable plugin archive is written to `plugin/build/distributions/`. Install it in IntelliJ IDEA / WebStorm / GoLand / PyCharm / RustRover (`2024.3+`) via **Settings -> Plugins -> Gear Icon -> Install Plugin from Disk...**, then configure `sb-host`, microVM image SHA-256 digests, the required **Pinned enclave pubkey (64-hex)** from `vm/out/enclave-pubkey.txt`, and cloud destination allowlists under **Settings -> Tools -> SecretBridge for 1Password**.
 
 ### 4. Completion Gate
 
@@ -97,7 +99,7 @@ bash .guard/checks/on-stop
 
 ## Manual IDE Verification Checklist
 
-1. Open **Settings -> Tools -> SecretBridge for 1Password**, configure `sb-host` + guest kernel/initramfs paths and 64-hex SHA-256 digests, enter an `OP_SERVICE_ACCOUNT_TOKEN`, click **Apply**, and click **Test Enclave & Service Account Capabilities**.
+1. Open **Settings -> Tools -> SecretBridge for 1Password**, configure `sb-host` + guest kernel/initramfs paths, 64-hex SHA-256 digests, and the 64-hex **Pinned enclave pubkey** (`vm/out/enclave-pubkey.txt`), enter an `OP_SERVICE_ACCOUNT_TOKEN`, click **Apply**, and click **Test Enclave & Service Account Capabilities**.
 2. Open the **SecretBridge** tool window on the right sidebar and click **Refresh**:
    - Confirm **Create Vault...** is disabled with an explanatory tooltip if the Service Account lacks `can_create_vaults`, and enabled otherwise.
    - Confirm Personal/Private vaults are never exposed or mutated, and `LOGIN` items are excluded/rejected by `SAFE_ITEM_CATEGORIES`.

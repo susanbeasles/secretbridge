@@ -195,8 +195,42 @@ object JsonCodec {
         }
     }
 
-    private class ZeroizableByteArrayOutputStream(size: Int) : ByteArrayOutputStream(size) {
+    private class ZeroizableByteArrayOutputStream(initialCapacity: Int) : ByteArrayOutputStream(initialCapacity) {
+        @Synchronized
+        override fun write(b: Int) {
+            ensureWipedCapacity(count + 1)
+            buf[count] = b.toByte()
+            count += 1
+        }
+
+        @Synchronized
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            if (off < 0 || off > b.size || len < 0 || off + len - b.size > 0) {
+                throw IndexOutOfBoundsException()
+            }
+            if (len == 0) return
+            ensureWipedCapacity(count + len)
+            System.arraycopy(b, off, buf, count, len)
+            count += len
+        }
+
+        private fun ensureWipedCapacity(minCapacity: Int) {
+            if (minCapacity <= buf.size) return
+            if (minCapacity < 0) throw OutOfMemoryError()
+            val doubled = buf.size shl 1
+            val newCapacity = when {
+                doubled < 0 -> Int.MAX_VALUE - 8
+                doubled < minCapacity -> minCapacity
+                else -> doubled
+            }
+            val next = ByteArray(maxOf(minCapacity, newCapacity))
+            System.arraycopy(buf, 0, next, 0, count)
+            buf.fill(0)
+            buf = next
+        }
+
         fun toByteArrayCopy(): ByteArray = buf.copyOf(count)
+
         fun wipe() {
             buf.fill(0)
             count = 0

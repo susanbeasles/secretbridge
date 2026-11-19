@@ -1,4 +1,5 @@
 pub mod aws;
+pub mod dhcp;
 pub mod error;
 pub mod github;
 pub mod mem_secret;
@@ -877,5 +878,88 @@ mod tests {
         assert!(decoded.ok);
         drop(c_stream);
         srv_handle.join().unwrap();
+    }
+
+    #[test]
+    fn dhcpv4_cmdline_vsock_port_and_provisioned_enclave_identity() {
+        use crate::dhcp::{
+            DHCP_ACK, DHCP_OFFER, build_dhcpv4_discover, build_dhcpv4_request, parse_dhcpv4_reply,
+        };
+        use crate::vsock::{
+            cmdline_has_token, extract_cmdline_vsock_port, load_enclave_static_keypair,
+            write_generated_enclave_identity,
+        };
+
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let xid = 0xA1B2_C3D4;
+        let discover = build_dhcpv4_discover(xid, mac);
+        assert_eq!(discover[0], 1);
+        assert_eq!(&discover[28..34], &mac);
+        assert_eq!(&discover[236..240], &[99, 130, 83, 99]);
+
+        // Simulate Apple VZNATNetworkDeviceAttachment bootpd DHCPOFFER (192.168.64.2/24, gw/dns 192.168.64.1)
+        let mut reply = vec![0u8; 272];
+        reply[0] = 2; // BOOTREPLY
+        reply[1] = 1;
+        reply[2] = 6;
+        reply[4..8].copy_from_slice(&xid.to_be_bytes());
+        reply[16..20].copy_from_slice(&[192, 168, 64, 2]);
+        reply[28..34].copy_from_slice(&mac);
+        reply[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        let opts = [
+            53, 1, DHCP_OFFER, // Msg type = OFFER
+            54, 4, 192, 168, 64, 1, // Server ID
+            1, 4, 255, 255, 255, 0, // Subnet mask
+            3, 4, 192, 168, 64, 1, // Router
+            6, 4, 192, 168, 64, 1, // DNS
+            255,
+        ];
+        reply[240..240 + opts.len()].copy_from_slice(&opts);
+
+        let (kind, lease) = parse_dhcpv4_reply(&reply, xid, mac).unwrap();
+        assert_eq!(kind, DHCP_OFFER);
+        assert_eq!(lease.yiaddr, [192, 168, 64, 2]);
+        assert_eq!(lease.subnet_mask, [255, 255, 255, 0]);
+        assert_eq!(lease.router, Some([192, 168, 64, 1]));
+        assert_eq!(lease.dns_servers, vec![[192, 168, 64, 1]]);
+        assert_eq!(lease.server_id, Some([192, 168, 64, 1]));
+
+        let req = build_dhcpv4_request(xid, mac, lease.yiaddr, lease.server_id);
+        assert_eq!(req[0], 1);
+        reply[242] = DHCP_ACK;
+        let (ack_kind, _) = parse_dhcpv4_reply(&reply, xid, mac).unwrap();
+        assert_eq!(ack_kind, DHCP_ACK);
+        assert!(parse_dhcpv4_reply(&reply, xid ^ 1, mac).is_none());
+
+        // Kernel command-line vsock port & QEMU fallback token parsing
+        let cmdline = "console=hvc0 ip=dhcp sb.vsock_port=6222 sb.client_pubkey=aa";
+        assert_eq!(extract_cmdline_vsock_port(cmdline).unwrap(), Some(6222));
+        assert!(!cmdline_has_token(cmdline, "sb.net_fallback=qemu_slirp"));
+        assert!(cmdline_has_token(
+            "console=ttyS0 sb.net_fallback=qemu_slirp",
+            "sb.net_fallback=qemu_slirp"
+        ));
+        assert!(extract_cmdline_vsock_port("sb.vsock_port=0").is_err());
+        assert!(extract_cmdline_vsock_port("sb.vsock_port=70000").is_err());
+        assert!(extract_cmdline_vsock_port("sb.vsock_port=bad").is_err());
+
+        // Provisioned static enclave identity survives non-PID1 restarts and shreds on PID1-mode request
+        let home = std::env::var("HOME").unwrap();
+        let test_dir = std::path::PathBuf::from(home)
+            .join(".local")
+            .join("run")
+            .join(format!("sb-id-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let key_path = test_dir.join("enclave.key");
+        let pub_path = test_dir.join("enclave.pub");
+
+        let expected_pub = write_generated_enclave_identity(&key_path, &pub_path).unwrap();
+        let loaded_1 = load_enclave_static_keypair(&key_path, false).unwrap();
+        let loaded_2 = load_enclave_static_keypair(&key_path, true).unwrap();
+        assert_eq!(loaded_1.public, expected_pub);
+        assert_eq!(loaded_2.public, expected_pub);
+        assert!(!key_path.exists(), "shred_after_read must unlink key file");
+        let _ = std::fs::remove_file(&pub_path);
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }
