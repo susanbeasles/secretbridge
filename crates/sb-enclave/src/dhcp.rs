@@ -178,7 +178,10 @@ pub fn parse_dhcpv4_reply(
             }
             OPT_LEASE_TIME if len == 4 => {
                 let raw_secs = u32::from_be_bytes([val[0], val[1], val[2], val[3]]);
-                lease_time_secs = raw_secs.clamp(60, 86_400);
+                if raw_secs == 0 {
+                    return None;
+                }
+                lease_time_secs = raw_secs.min(86_400);
             }
             OPT_SERVER_ID if len == 4 => {
                 server_id = Some([val[0], val[1], val[2], val[3]]);
@@ -204,6 +207,17 @@ pub fn parse_dhcpv4_reply(
 #[cfg(target_os = "linux")]
 pub fn acquire_dhcpv4_lease(
     ifname: &str,
+    total_timeout: Duration,
+) -> Result<DhcpLease, EnclaveError> {
+    let deadline = Instant::now() + total_timeout;
+    let step = (total_timeout / 3).max(Duration::from_millis(100));
+    acquire_dhcpv4_lease_until(ifname, deadline, step)
+}
+
+#[cfg(target_os = "linux")]
+pub fn acquire_dhcpv4_lease_until(
+    ifname: &str,
+    overall_deadline: Instant,
     step_timeout: Duration,
 ) -> Result<DhcpLease, EnclaveError> {
     use std::ffi::CString;
@@ -335,11 +349,37 @@ pub fn acquire_dhcpv4_lease(
         dst
     };
 
+    fn set_bounded_rcvtimeo(fd: i32, deadline: Instant) -> bool {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            return false;
+        }
+        let slice = rem.min(Duration::from_millis(250));
+        let tv_sec = slice.as_secs() as libc::time_t;
+        // On Linux, `SO_RCVTIMEO = {0, 0}` disables the socket timeout; clamp sub-microsecond slices to 1us.
+        let tv_usec =
+            (slice.subsec_micros() as libc::suseconds_t).max(if tv_sec == 0 { 1 } else { 0 });
+        let tv = libc::timeval { tv_sec, tv_usec };
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&raw const tv).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
+        true
+    }
+
     let xid = OsRng.next_u32();
     let discover = build_dhcpv4_discover(xid, mac);
     let mut recv_buf = [0u8; 1500];
 
     for _attempt in 0..3 {
+        if Instant::now() >= overall_deadline {
+            break;
+        }
         let sent = unsafe {
             libc::sendto(
                 fd,
@@ -354,9 +394,9 @@ pub fn acquire_dhcpv4_lease(
             continue;
         }
 
-        let offer_deadline = Instant::now() + step_timeout;
+        let offer_deadline = (Instant::now() + step_timeout).min(overall_deadline);
         let mut offered: Option<DhcpLease> = None;
-        while Instant::now() < offer_deadline {
+        while set_bounded_rcvtimeo(fd, offer_deadline) {
             let n = unsafe { libc::recv(fd, recv_buf.as_mut_ptr().cast(), recv_buf.len(), 0) };
             if n > 0
                 && let Some((DHCP_OFFER, lease)) =
@@ -371,6 +411,9 @@ pub fn acquire_dhcpv4_lease(
             continue;
         };
 
+        if Instant::now() >= overall_deadline {
+            break;
+        }
         let req = build_dhcpv4_request(xid, mac, offer.yiaddr, offer.server_id);
         let req_sent = unsafe {
             libc::sendto(
@@ -386,8 +429,8 @@ pub fn acquire_dhcpv4_lease(
             continue;
         }
 
-        let ack_deadline = Instant::now() + step_timeout;
-        while Instant::now() < ack_deadline {
+        let ack_deadline = (Instant::now() + step_timeout).min(overall_deadline);
+        while set_bounded_rcvtimeo(fd, ack_deadline) {
             let n = unsafe { libc::recv(fd, recv_buf.as_mut_ptr().cast(), recv_buf.len(), 0) };
             if n > 0
                 && let Some((DHCP_ACK, ack_lease)) =
@@ -426,7 +469,7 @@ pub struct DhcpLeaseSchedule {
 
 impl DhcpLeaseSchedule {
     pub fn new(lease: DhcpLease, acquired_at: Instant) -> Self {
-        let secs = u64::from(lease.lease_time_secs).max(4);
+        let secs = u64::from(lease.lease_time_secs).max(1);
         let lease_dur = Duration::from_secs(secs);
         let t1_at = acquired_at + lease_dur / 2;
         let t2_at = acquired_at + (lease_dur * 7) / 8;
@@ -454,10 +497,8 @@ impl DhcpLeaseSchedule {
             .saturating_duration_since(now)
     }
 
-    pub fn attempt_timeout(&self, now: Instant) -> Duration {
-        self.expires_at
-            .saturating_duration_since(now)
-            .min(Duration::from_millis(2_000))
+    pub fn attempt_deadline(&self, now: Instant) -> Instant {
+        (now + Duration::from_millis(2_000)).min(self.expires_at)
     }
 
     /// Schedules the next retry within the remaining `T1..T2` or `T2..expiry` window.
@@ -473,7 +514,7 @@ impl DhcpLeaseSchedule {
         };
         let remaining_to_expiry = self.expires_at.saturating_duration_since(now);
         let span = target.saturating_duration_since(now);
-        let min_step = Duration::from_secs(1).min(remaining_to_expiry);
+        let min_step = Duration::from_millis(100).min(remaining_to_expiry);
         let delay = (span / 2).max(min_step).min(remaining_to_expiry);
         self.next_attempt_at = now + delay;
         false
@@ -517,17 +558,21 @@ pub fn spawn_dhcpv4_renewal_daemon<F, W>(
                         continue;
                     }
 
-                    let timeout = sched.attempt_timeout(attempt_now);
-                    if timeout.is_zero() {
+                    let deadline = sched.attempt_deadline(attempt_now);
+                    let budget = deadline.saturating_duration_since(attempt_now);
+                    if budget.is_zero() {
                         withdraw_lease(&sched.lease);
                         reacquire_backoff = Duration::from_secs(1);
                         continue;
                     }
+                    let step = (budget / 3).max(Duration::from_millis(100)).min(budget);
 
-                    match acquire_dhcpv4_lease(&ifname, timeout) {
+                    match acquire_dhcpv4_lease_until(&ifname, deadline, step) {
                         Ok(renewed) => {
                             let renewed_at = Instant::now();
-                            if sched.lease.router.is_some() && sched.lease.router != renewed.router
+                            if (sched.lease.router.is_some()
+                                && sched.lease.router != renewed.router)
+                                || sched.lease.yiaddr != renewed.yiaddr
                             {
                                 withdraw_lease(&sched.lease);
                             }

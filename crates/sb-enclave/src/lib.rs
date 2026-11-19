@@ -1008,8 +1008,28 @@ mod tests {
     #[test]
     fn noise_ik_rpc_session_and_templates_end_to_end() {
         let (svc, _, _, _) = build_fixture(true);
-        let manifest = sample_manifest();
         let dev: Slug = "dev".parse().unwrap();
+        let mut manifest = sample_manifest();
+        manifest
+            .bind_secret(
+                &dev,
+                "NULL".parse().unwrap(),
+                "op://vault-dev-01/app-db/null_tok".parse().unwrap(),
+                None,
+                Some(true),
+                Some(true),
+            )
+            .unwrap();
+        manifest
+            .bind_secret(
+                &dev,
+                "TRUE".parse().unwrap(),
+                "op://vault-dev-01/app-db/true_tok".parse().unwrap(),
+                None,
+                Some(true),
+                Some(true),
+            )
+            .unwrap();
 
         for kind in [
             TemplateKind::Env,
@@ -1026,6 +1046,29 @@ mod tests {
                 action_sha: Some("0123456789abcdef0123456789abcdef01234567".parse().unwrap()),
             });
             assert!(tpl_resp.ok, "template {kind:?} failed");
+            let Some(EnclaveResult::TemplateRendered { content, .. }) = tpl_resp.result else {
+                panic!("expected TemplateRendered for {kind:?}");
+            };
+            match kind {
+                TemplateKind::WorkflowNative => {
+                    assert!(content.contains("\"NULL\": ${{ secrets.NULL }}"));
+                    assert!(content.contains("\"TRUE\": ${{ secrets.TRUE }}"));
+                }
+                TemplateKind::Workflow1password => {
+                    assert!(content.contains("\"NULL\": \"op://vault-dev-01/app-db/null_tok\""));
+                    assert!(content.contains("\"TRUE\": \"op://vault-dev-01/app-db/true_tok\""));
+                }
+                TemplateKind::Cloudformation => {
+                    let cfn_json: serde_json::Value = serde_json::from_str(&content).unwrap();
+                    let resources = cfn_json["Resources"].as_object().unwrap();
+                    assert!(!resources.is_empty());
+                    assert_eq!(
+                        resources["SecretBridgeReadSecretsPolicy"]["Type"],
+                        "AWS::IAM::ManagedPolicy"
+                    );
+                }
+                _ => {}
+            }
         }
 
         // End-to-end Noise_IK RPC over stream pair
@@ -1110,6 +1153,10 @@ mod tests {
             sched.expires_at.duration_since(t0),
             Duration::from_secs(1_800)
         );
+        assert_eq!(
+            sched.attempt_deadline(t0 + Duration::from_secs(1_799)),
+            t0 + Duration::from_secs(1_800)
+        );
         // Failure at T1 (+900s) retries halfway to T2 (+1237.5s), not another full 900s (+1800s)
         assert!(!sched.record_renewal_failure(t0 + Duration::from_secs(900)));
         assert!(sched.next_attempt_at < sched.t2_at);
@@ -1121,6 +1168,23 @@ mod tests {
         // At or after hard expiry (+1800s), signals immediate stale-config withdrawal
         assert!(sched.record_renewal_failure(t0 + Duration::from_secs(1_800)));
         assert!(sched.is_expired(t0 + Duration::from_secs(1_800)));
+
+        // Short 30s leases must not be lengthened to 60s, and 0s leases must be rejected
+        let mut short_reply = reply.clone();
+        short_reply[251..255].copy_from_slice(&30u32.to_be_bytes());
+        let (_, short_lease) = parse_dhcpv4_reply(&short_reply, xid, mac).unwrap();
+        assert_eq!(short_lease.lease_time_secs, 30);
+        let short_sched = DhcpLeaseSchedule::new(short_lease, t0);
+        assert_eq!(
+            short_sched.t1_at.duration_since(t0),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            short_sched.expires_at.duration_since(t0),
+            Duration::from_secs(30)
+        );
+        short_reply[251..255].copy_from_slice(&0u32.to_be_bytes());
+        assert!(parse_dhcpv4_reply(&short_reply, xid, mac).is_none());
 
         let req = build_dhcpv4_request(xid, mac, lease.yiaddr, lease.server_id);
         assert_eq!(req[0], 1);

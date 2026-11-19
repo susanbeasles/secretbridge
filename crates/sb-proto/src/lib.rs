@@ -84,6 +84,8 @@ mod tests {
                 .is_err()
         );
         assert!("prod/../../admin".parse::<GitHubEnvName>().is_err());
+        assert!("${{ github.ref_name }}".parse::<GitHubEnvName>().is_err());
+        assert!("prod-}}".parse::<GitHubEnvName>().is_err());
 
         let gh = GitHubTarget {
             scope: GitHubScope::Environment,

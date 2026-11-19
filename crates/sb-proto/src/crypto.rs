@@ -34,10 +34,11 @@ pub struct StaticKeypair {
 pub fn derive_noise_keypair_from_private(
     private_bytes: [u8; 32],
 ) -> Result<StaticKeypair, ProtoError> {
-    let sk = SecretKey::from(private_bytes);
+    let priv_guarded = Zeroizing::new(private_bytes);
+    let sk = SecretKey::from(*priv_guarded);
     let public = *sk.public_key().as_bytes();
     Ok(StaticKeypair {
-        private: Zeroizing::new(private_bytes),
+        private: priv_guarded,
         public,
     })
 }
@@ -49,18 +50,21 @@ pub fn generate_noise_keypair() -> Result<StaticKeypair, ProtoError> {
     let kp = Builder::new(params)
         .generate_keypair()
         .map_err(|e| ProtoError::Crypto(format!("noise keygen failed: {e}")))?;
-    let priv_arr: [u8; 32] = kp
-        .private
-        .as_slice()
-        .try_into()
-        .map_err(|_| ProtoError::Crypto("unexpected noise private key length".into()))?;
-    let pub_arr: [u8; 32] = kp
-        .public
+    let kp_priv = Zeroizing::new(kp.private);
+    let kp_pub = kp.public;
+    if kp_priv.len() != 32 {
+        return Err(ProtoError::Crypto(
+            "unexpected noise private key length".into(),
+        ));
+    }
+    let mut priv_out = Zeroizing::new([0u8; 32]);
+    priv_out.copy_from_slice(&kp_priv);
+    let pub_arr: [u8; 32] = kp_pub
         .as_slice()
         .try_into()
         .map_err(|_| ProtoError::Crypto("unexpected noise public key length".into()))?;
     Ok(StaticKeypair {
-        private: Zeroizing::new(priv_arr),
+        private: priv_out,
         public: pub_arr,
     })
 }

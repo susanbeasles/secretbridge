@@ -80,6 +80,16 @@ fn json_quoted(raw: &str) -> Result<String, EnclaveError> {
         .map_err(|e| EnclaveError::new(ErrorCode::InternalError, format!("json quote failed: {e}")))
 }
 
+fn yaml_quoted_literal_no_actions_expr(raw: &str, label: &str) -> Result<String, EnclaveError> {
+    if raw.contains("${{") || raw.contains("}}") {
+        return Err(EnclaveError::new(
+            ErrorCode::Validation,
+            format!("{label} must not contain GitHub Actions expression delimiters"),
+        ));
+    }
+    json_quoted(raw)
+}
+
 #[derive(Serialize)]
 struct CfnParameter {
     #[serde(rename = "Type")]
@@ -96,10 +106,12 @@ struct CfnTemplate {
     format_version: &'static str,
     #[serde(rename = "Description")]
     description: &'static str,
-    #[serde(rename = "Parameters")]
+    #[serde(rename = "Parameters", skip_serializing_if = "BTreeMap::is_empty")]
     parameters: BTreeMap<String, CfnParameter>,
     #[serde(rename = "Resources")]
     resources: BTreeMap<String, serde_json::Value>,
+    #[serde(rename = "Outputs", skip_serializing_if = "BTreeMap::is_empty")]
+    outputs: BTreeMap<String, serde_json::Value>,
 }
 
 pub fn render_template(
@@ -152,14 +164,17 @@ pub fn render_template(
                 && let Some(gh_env) = &gh.environment
             {
                 out.push_str("    environment: ");
-                out.push_str(&json_quoted(gh_env.as_str())?);
+                out.push_str(&yaml_quoted_literal_no_actions_expr(
+                    gh_env.as_str(),
+                    "GitHub environment",
+                )?);
                 out.push('\n');
             }
             out.push_str("    steps:\n      - name: Run application\n        env:\n");
             for (name, spec) in present_specs {
                 if spec.github {
                     out.push_str("          ");
-                    out.push_str(name.as_str());
+                    out.push_str(&json_quoted(name.as_str())?);
                     out.push_str(": ${{ secrets.");
                     out.push_str(name.as_str());
                     out.push_str(" }}\n");
@@ -183,13 +198,16 @@ pub fn render_template(
                 && let Some(gh_env) = &gh.environment
             {
                 out.push_str("    environment: ");
-                out.push_str(&json_quoted(gh_env.as_str())?);
+                out.push_str(&yaml_quoted_literal_no_actions_expr(
+                    gh_env.as_str(),
+                    "GitHub environment",
+                )?);
                 out.push('\n');
             }
             out.push_str("    steps:\n      - name: Load secrets\n        uses: 1Password/load-secrets-action@");
             out.push_str(resolved_sha.as_str());
             out.push_str(
-                "\n        with:\n          export-env: true\n        env:\n          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}\n",
+                "\n        with:\n          export-env: true\n        env:\n          \"OP_SERVICE_ACCOUNT_TOKEN\": ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}\n",
             );
             for (name, spec) in present_specs {
                 if name.as_str() == "OP_SERVICE_ACCOUNT_TOKEN" {
@@ -199,9 +217,12 @@ pub fn render_template(
                     EnclaveError::new(ErrorCode::Validation, "missing op:// reference")
                 })?;
                 out.push_str("          ");
-                out.push_str(name.as_str());
+                out.push_str(&json_quoted(name.as_str())?);
                 out.push_str(": ");
-                out.push_str(&json_quoted(op_ref.as_str())?);
+                out.push_str(&yaml_quoted_literal_no_actions_expr(
+                    op_ref.as_str(),
+                    "1Password reference",
+                )?);
                 out.push('\n');
             }
             out.push_str(
@@ -273,8 +294,14 @@ pub fn render_template(
                 }
                 TemplateKind::Cloudformation => {
                     let mut parameters = BTreeMap::new();
+                    let mut secret_arns = Vec::new();
                     for (idx, (name, resource)) in aws_entries.into_iter().enumerate() {
                         let key = format!("Secret{}", idx + 1);
+                        secret_arns.push(serde_json::json!({
+                            "Fn::Sub": format!(
+                                "arn:${{AWS::Partition}}:secretsmanager:${{AWS::Region}}:${{AWS::AccountId}}:secret:${{{key}}}-??????"
+                            )
+                        }));
                         parameters.insert(
                             key,
                             CfnParameter {
@@ -284,11 +311,52 @@ pub fn render_template(
                             },
                         );
                     }
+                    let mut resources = BTreeMap::new();
+                    let mut outputs = BTreeMap::new();
+                    if secret_arns.is_empty() {
+                        resources.insert(
+                            "SecretBridgeNoSecretsPlaceholder".to_string(),
+                            serde_json::json!({
+                                "Type": "AWS::CloudFormation::WaitConditionHandle"
+                            }),
+                        );
+                    } else {
+                        resources.insert(
+                            "SecretBridgeReadSecretsPolicy".to_string(),
+                            serde_json::json!({
+                                "Type": "AWS::IAM::ManagedPolicy",
+                                "Properties": {
+                                    "Description": "Least-privilege read access to SecretBridge-synced AWS Secrets Manager secrets",
+                                    "PolicyDocument": {
+                                        "Version": "2012-10-17",
+                                        "Statement": [
+                                            {
+                                                "Effect": "Allow",
+                                                "Action": [
+                                                    "secretsmanager:GetSecretValue",
+                                                    "secretsmanager:DescribeSecret"
+                                                ],
+                                                "Resource": secret_arns
+                                            }
+                                        ]
+                                    }
+                                }
+                            }),
+                        );
+                        outputs.insert(
+                            "SecretBridgeReadSecretsPolicyArn".to_string(),
+                            serde_json::json!({
+                                "Description": "Attach this managed policy ARN to runtime IAM roles consuming synced secrets",
+                                "Value": { "Ref": "SecretBridgeReadSecretsPolicy" }
+                            }),
+                        );
+                    }
                     let tpl = CfnTemplate {
                         format_version: "2010-09-09",
-                        description: "Secret name parameters; runtime consumers resolve values.",
+                        description: "Secret name parameters and least-privilege Secrets Manager reader policy.",
                         parameters,
-                        resources: BTreeMap::new(),
+                        resources,
+                        outputs,
                     };
                     let mut serialized = serde_json::to_string_pretty(&tpl).map_err(|e| {
                         EnclaveError::new(

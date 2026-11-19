@@ -492,9 +492,11 @@ impl FromStr for GitHubEnvName {
             || s.contains("..")
             || s.contains('/')
             || s.contains('\\')
+            || s.contains("${{")
+            || s.contains("}}")
         {
             return Err(ProtoError::Validation(
-                "GitHub environment name cannot contain '/', '\\', or '..'".into(),
+                "GitHub environment name cannot contain '/', '\\', '..', or GitHub Actions expression delimiters".into(),
             ));
         }
         Ok(Self(s.to_string()))
