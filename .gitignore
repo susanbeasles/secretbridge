@@ -14,3 +14,9 @@
 
 
 .claude/settings.local.json
+
+/target/
+/plugin/.gradle/
+/plugin/.intellijPlatform/
+/plugin/build/
+/vm/out/

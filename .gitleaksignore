@@ -1,0 +1,3 @@
+# False positive: crates.io SHA-256 package checksum adjacent to "crypto_secretbox" crate name in Cargo.lock
+8317dfacc6c271de735ee893ae99401ec676587e:Cargo.lock:generic-api-key:149
+Cargo.lock:generic-api-key:149

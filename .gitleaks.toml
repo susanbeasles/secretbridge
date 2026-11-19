@@ -1,0 +1,13 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Skip gitignored build/SDK caches and Cargo.lock crate SHA-256 checksums"
+paths = [
+  '''^target/''',
+  '''^plugin/\.gradle/''',
+  '''^plugin/\.intellijPlatform/''',
+  '''^plugin/build/''',
+  '''^vm/out/''',
+  '''^Cargo\.lock$''',
+]
