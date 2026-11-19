@@ -39,13 +39,22 @@ pub fn is_public_unicast_ip(ip: IpAddr) -> bool {
                 return is_public_unicast_ip(IpAddr::V4(mapped_v4));
             }
             let segs = v6.segments();
+            // Block loopback, unspecified, multicast, ULA (fc00::/7), link-local (fe80::/10),
+            // documentation (2001:db8::/32), discard (100::/64), Teredo (2001:0000::/32),
+            // 6to4 (2002::/16), IPv4-compatible/deprecated (::/96), and NAT64 (64:ff9b::/96, 64:ff9b:1::/48).
             !(v6.is_unspecified()
                 || v6.is_loopback()
                 || v6.is_multicast()
                 || (segs[0] & 0xfe00) == 0xfc00
                 || (segs[0] & 0xffc0) == 0xfe80
                 || (segs[0] == 0x2001 && segs[1] == 0x0db8)
-                || (segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0))
+                || (segs[0] == 0x2001 && segs[1] == 0x0000)
+                || segs[0] == 0x2002
+                || (segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0)
+                || segs[..6] == [0, 0, 0, 0, 0, 0]
+                || (segs[0] == 0x0064
+                    && segs[1] == 0xff9b
+                    && (segs[2..6] == [0, 0, 0, 0] || segs[2] == 0x0001)))
         }
     }
 }
@@ -69,6 +78,29 @@ impl ureq::Resolver for PublicIpOnlyResolver {
         }
         Ok(addrs)
     }
+}
+
+/// Builds an enclave `ureq::Agent` with zero redirects, bounded timeouts, and either
+/// the guest loopback `AF_VSOCK` `CONNECT :443` proxy (`SB_GUEST_VSOCK_HTTPS_PROXY`) or
+/// `PublicIpOnlyResolver`.
+pub fn build_enclave_https_agent(has_endpoint_override: bool) -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new()
+        .try_proxy_from_env(false)
+        .redirects(0)
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(30))
+        .timeout_write(Duration::from_secs(30));
+    if !has_endpoint_override {
+        if let Ok(proxy_raw) = std::env::var("SB_GUEST_VSOCK_HTTPS_PROXY")
+            && !proxy_raw.trim().is_empty()
+            && let Ok(proxy) = ureq::Proxy::new(proxy_raw.trim())
+        {
+            builder = builder.proxy(proxy);
+        } else {
+            builder = builder.resolver(PublicIpOnlyResolver);
+        }
+    }
+    builder.build()
 }
 
 pub(crate) fn read_bounded_string(
@@ -208,15 +240,7 @@ impl Default for RestGitHubClient {
 
 impl RestGitHubClient {
     pub fn new(base_url_override: Option<String>) -> Self {
-        let mut builder = ureq::AgentBuilder::new()
-            .redirects(0)
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(30))
-            .timeout_write(Duration::from_secs(30));
-        if base_url_override.is_none() {
-            builder = builder.resolver(PublicIpOnlyResolver);
-        }
-        let agent = builder.build();
+        let agent = build_enclave_https_agent(base_url_override.is_some());
         Self {
             agent,
             base_url_override,

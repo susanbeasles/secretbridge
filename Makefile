@@ -17,7 +17,7 @@ check: check-ascii check-rust check-guard check-plugin
 check-ascii:
 	@if LC_ALL=C grep -I -n '[^[:print:][:space:]]' \
 		Cargo.toml Makefile README.md .gitleaks.toml .gitleaksignore \
-		docs/PROPOSAL.md vm/build-initramfs.sh \
+		docs/PROPOSAL.md vm/build-initramfs.sh vm/macos-vz.entitlements.plist \
 		crates/sb-proto/Cargo.toml crates/sb-proto/src/*.rs \
 		crates/sb-enclave/Cargo.toml crates/sb-enclave/src/*.rs \
 		crates/sb-host/Cargo.toml crates/sb-host/src/*.rs \
@@ -36,7 +36,10 @@ check-rust:
 	cargo clippy --workspace --all-targets $(CARGO_NET_FLAGS) --locked -- -D warnings
 	cargo test --workspace $(CARGO_NET_FLAGS) --locked
 	cargo build --bins $(CARGO_NET_FLAGS) --locked
-	chmod go-w target/debug/sb-host target/debug/sb-enclave
+	chmod go-w target target/debug target/debug/sb-host target/debug/sb-enclave
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		codesign --force --sign - --entitlements vm/macos-vz.entitlements.plist target/debug/sb-host; \
+	fi
 
 check-guard:
 	node --test .guard/tests/guard.ts

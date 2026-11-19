@@ -250,7 +250,7 @@ impl FromStr for OpRef {
         };
         for b in rest.bytes() {
             if !(0x20..=0x7E).contains(&b)
-                || matches!(b, b'"' | b'\'' | b'\\' | b'$' | b'`' | b'?' | b'#')
+                || matches!(b, b'"' | b'\'' | b'\\' | b'$' | b'`' | b'?' | b'#' | b'%')
             {
                 return Err(ProtoError::Validation(
                     "op:// reference contains forbidden characters".into(),
@@ -264,7 +264,7 @@ impl FromStr for OpRef {
             ));
         }
         for part in &parts {
-            if part.is_empty() || *part == "." || *part == ".." || part.starts_with('-') {
+            if part.is_empty() || *part == "." || part.contains("..") || part.starts_with('-') {
                 return Err(ProtoError::Validation(
                     "op:// reference contains invalid path segment".into(),
                 ));
@@ -373,9 +373,11 @@ impl FromStr for GitHubHost {
             }
         }
         let tld = labels[labels.len() - 1];
-        if tld.bytes().all(|b| b.is_ascii_digit()) {
+        // RFC 1123 / IANA TLDs must begin with an ASCII letter; rejecting leading digits
+        // blocks decimal dotted-quads, octal IPv4, and hex IPv4 (`0xa9.0xfe.0xa9.0xfe`, `0x7f.0.0.0x1`).
+        if tld.as_bytes()[0].is_ascii_digit() {
             return Err(ProtoError::Validation(
-                "GitHub hostname top-level label cannot be numeric".into(),
+                "GitHub hostname top-level label must start with an ASCII letter".into(),
             ));
         }
         if matches!(
@@ -701,6 +703,8 @@ pub struct SecretSpec {
     pub aws: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_unmanaged_github_delete: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_unmanaged_github_overwrite: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -983,19 +987,19 @@ impl EnvironmentConfig {
             aws.validate()?;
         }
         for (secret_name, spec) in &self.secrets {
-            if spec.state == SecretState::Present {
-                let Some(op_ref) = &spec.r#ref else {
-                    return Err(ProtoError::Validation(format!(
-                        "{secret_name}: present secret requires op:// reference"
-                    )));
-                };
-                if op_ref.vault() != self.vault {
-                    return Err(ProtoError::Validation(format!(
-                        "{secret_name}: reference vault '{}' must match environment vault '{}'",
-                        op_ref.vault(),
-                        self.vault
-                    )));
-                }
+            if spec.state == SecretState::Present && spec.r#ref.is_none() {
+                return Err(ProtoError::Validation(format!(
+                    "{secret_name}: present secret requires op:// reference"
+                )));
+            }
+            if let Some(op_ref) = &spec.r#ref
+                && op_ref.vault() != self.vault
+            {
+                return Err(ProtoError::Validation(format!(
+                    "{secret_name}: reference vault '{}' must match environment vault '{}'",
+                    op_ref.vault(),
+                    self.vault
+                )));
             }
         }
         Ok(())
@@ -1146,6 +1150,12 @@ impl Manifest {
         let next_group = group.or_else(|| prev.and_then(|p| p.group.clone()));
         let next_github = github.unwrap_or_else(|| prev.map(|p| p.github).unwrap_or(true));
         let next_aws = aws.unwrap_or_else(|| prev.map(|p| p.aws).unwrap_or(true));
+        let next_allow_delete = prev
+            .map(|p| p.allow_unmanaged_github_delete)
+            .unwrap_or(false);
+        let next_allow_overwrite = prev
+            .map(|p| p.allow_unmanaged_github_overwrite)
+            .unwrap_or(false);
         env.secrets.insert(
             name,
             SecretSpec {
@@ -1154,7 +1164,8 @@ impl Manifest {
                 group: next_group,
                 github: next_github,
                 aws: next_aws,
-                allow_unmanaged_github_delete: false,
+                allow_unmanaged_github_delete: next_allow_delete,
+                allow_unmanaged_github_overwrite: next_allow_overwrite,
             },
         );
         self.validate()

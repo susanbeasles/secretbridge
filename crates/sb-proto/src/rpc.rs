@@ -1,4 +1,4 @@
-use crate::error::SanitizedError;
+use crate::error::{ProtoError, SanitizedError};
 use crate::plan::{PlannedOp, SignedPlan, TargetKind};
 use crate::types::{CommitSha40, Manifest, OpRef, SecretName, SecretSpec, Slug};
 use serde::{Deserialize, Serialize};
@@ -25,12 +25,36 @@ pub enum SecretCharset {
     Base64Url,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawGenerateSpec {
+    length: u16,
+    #[serde(default)]
+    charset: SecretCharset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawGenerateSpec")]
 pub struct GenerateSpec {
     pub length: u16,
     #[serde(default)]
     pub charset: SecretCharset,
+}
+
+impl TryFrom<RawGenerateSpec> for GenerateSpec {
+    type Error = ProtoError;
+
+    fn try_from(raw: RawGenerateSpec) -> Result<Self, Self::Error> {
+        if !(16..=1024).contains(&raw.length) {
+            return Err(ProtoError::Validation(
+                "generated secret length must be between 16 and 1024 characters".into(),
+            ));
+        }
+        Ok(Self {
+            length: raw.length,
+            charset: raw.charset,
+        })
+    }
 }
 
 impl Default for GenerateSpec {
@@ -43,7 +67,7 @@ impl Default for GenerateSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CaptureTarget {
     NewItem {
         title: String,
@@ -110,7 +134,7 @@ impl std::fmt::Debug for SessionCredentialsInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "kebab-case")]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum EnclaveRequest {
     ConfigureSession {
         credentials: SessionCredentialsInput,

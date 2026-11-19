@@ -22,6 +22,7 @@ const OPT_SUBNET_MASK: u8 = 1;
 const OPT_ROUTER: u8 = 3;
 const OPT_DNS_SERVERS: u8 = 6;
 const OPT_REQUESTED_IP: u8 = 50;
+const OPT_LEASE_TIME: u8 = 51;
 const OPT_MSG_TYPE: u8 = 53;
 const OPT_SERVER_ID: u8 = 54;
 const OPT_PARAM_REQ_LIST: u8 = 55;
@@ -34,6 +35,7 @@ pub struct DhcpLease {
     pub router: Option<[u8; 4]>,
     pub dns_servers: Vec<[u8; 4]>,
     pub server_id: Option<[u8; 4]>,
+    pub lease_time_secs: u32,
 }
 
 /// Builds a minimal RFC 2131 `DHCPDISCOVER` broadcast frame (300 bytes).
@@ -133,6 +135,7 @@ pub fn parse_dhcpv4_reply(
     let mut router: Option<[u8; 4]> = None;
     let mut dns_servers = Vec::new();
     let mut server_id: Option<[u8; 4]> = None;
+    let mut lease_time_secs: u32 = 3_600;
 
     let mut idx = 240;
     while idx < pkt.len() {
@@ -170,6 +173,10 @@ pub fn parse_dhcpv4_reply(
                     dns_servers.push(chunk);
                 }
             }
+            OPT_LEASE_TIME if len == 4 => {
+                let raw_secs = u32::from_be_bytes([val[0], val[1], val[2], val[3]]);
+                lease_time_secs = raw_secs.clamp(60, 86_400);
+            }
             OPT_SERVER_ID if len == 4 => {
                 server_id = Some([val[0], val[1], val[2], val[3]]);
             }
@@ -186,6 +193,7 @@ pub fn parse_dhcpv4_reply(
             router,
             dns_servers,
             server_id,
+            lease_time_secs,
         },
     ))
 }
@@ -382,6 +390,14 @@ pub fn acquire_dhcpv4_lease(
                 && let Some((DHCP_ACK, ack_lease)) =
                     parse_dhcpv4_reply(&recv_buf[..n as usize], xid, mac)
             {
+                if ack_lease.yiaddr != offer.yiaddr {
+                    continue;
+                }
+                if let Some(expected_srv) = offer.server_id
+                    && ack_lease.server_id.is_some_and(|srv| srv != expected_srv)
+                {
+                    continue;
+                }
                 return Ok(ack_lease);
             }
         }
@@ -392,4 +408,24 @@ pub fn acquire_dhcpv4_lease(
         ErrorCode::TransportFailure,
         format!("timed out waiting for DHCPv4 lease on {ifname}"),
     ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn spawn_dhcpv4_renewal_daemon<F>(ifname: String, initial_lease: DhcpLease, mut apply_lease: F)
+where
+    F: FnMut(&DhcpLease) + Send + 'static,
+{
+    let _ = std::thread::Builder::new()
+        .name("sb-dhcpv4-renew".into())
+        .spawn(move || {
+            let mut current = initial_lease;
+            loop {
+                let t1_secs = u64::from(current.lease_time_secs / 2).max(30);
+                std::thread::sleep(Duration::from_secs(t1_secs));
+                if let Ok(renewed) = acquire_dhcpv4_lease(&ifname, Duration::from_millis(2_000)) {
+                    apply_lease(&renewed);
+                    current = renewed;
+                }
+            }
+        });
 }

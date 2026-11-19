@@ -720,6 +720,7 @@ mod macos_imp {
         });
 
         let deadline = Instant::now() + ttl;
+        let mut last_seen_change_count = initial_change_count;
         while Instant::now() < deadline {
             let iter_pool = unsafe { objc_autoreleasePoolPush() };
             let _iter_pool_guard =
@@ -733,13 +734,16 @@ mod macos_imp {
             {
                 return res.map(|buf| (buf, CaptureInterceptMode::ZeroPasteboard));
             }
-            if !pb.is_null() && unsafe { pasteboard_change_count(pb) } != initial_change_count {
-                let captured_opt = unsafe { pasteboard_read_utf8_mlocked(pb) };
-                unsafe {
-                    pasteboard_restore(pb, prior_snapshot.as_ref());
-                }
-                if let Some(buf) = captured_opt {
-                    return Ok((buf, CaptureInterceptMode::PasteboardFallback));
+            if !pb.is_null() {
+                let current_change = unsafe { pasteboard_change_count(pb) };
+                if current_change != last_seen_change_count {
+                    last_seen_change_count = current_change;
+                    if let Some(buf) = unsafe { pasteboard_read_utf8_mlocked(pb) } {
+                        unsafe {
+                            pasteboard_restore(pb, prior_snapshot.as_ref());
+                        }
+                        return Ok((buf, CaptureInterceptMode::PasteboardFallback));
+                    }
                 }
             }
         }
@@ -1129,8 +1133,20 @@ mod linux_imp {
     }
 
     // ---------------------------------------------------------------------
-    // Direct X11 `libX11.so.6` Implementation (`H6` -- zero `xclip`)
+    // Direct X11 `libX11.so.6` (+ optional `libXfixes.so.3`) Implementation
+    // (`H6`, `V2-H3` -- zero `xclip`, non-fatal XSetErrorHandler, INCR support,
+    // prior-clipboard snapshot & restore, zero destructive root XGrabKey)
     // ---------------------------------------------------------------------
+
+    static X11_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static X11_THREADS_INIT: std::sync::Once = std::sync::Once::new();
+
+    unsafe extern "C" fn swallow_x11_error(
+        _dpy: *mut std::ffi::c_void,
+        _ev: *mut std::ffi::c_void,
+    ) -> std::ffi::c_int {
+        0
+    }
 
     fn capture_x11_armed(
         ttl: Duration,
@@ -1141,38 +1157,16 @@ mod linux_imp {
         type Window = c_ulong;
         type Atom = c_ulong;
         type Time = c_ulong;
-        type KeySym = c_ulong;
-        type KeyCode = u8;
+        type XErrorHandler = Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>;
 
-        const CONTROL_MASK: c_uint = 1 << 2;
-        const LOCK_MASK: c_uint = 1 << 1;
-        const MOD2_MASK: c_uint = 1 << 4;
-        const ANY_MODIFIER: c_uint = 1 << 15;
-        const GRAB_MODE_ASYNC: c_int = 1;
-        const KEY_PRESS: c_int = 2;
+        const PROPERTY_NOTIFY: c_int = 28;
+        const SELECTION_CLEAR: c_int = 29;
+        const SELECTION_REQUEST: c_int = 30;
         const SELECTION_NOTIFY: c_int = 31;
-        const XK_LOWER_C: KeySym = 0x0063;
-        const XK_ESCAPE: KeySym = 0xff1b;
-
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct XKeyEvent {
-            event_type: c_int,
-            serial: c_ulong,
-            send_event: c_int,
-            display: *mut Display,
-            window: Window,
-            root: Window,
-            subwindow: Window,
-            time: Time,
-            x: c_int,
-            y: c_int,
-            x_root: c_int,
-            y_root: c_int,
-            state: c_uint,
-            keycode: c_uint,
-            same_screen: c_int,
-        }
+        const PROPERTY_NEW_VALUE: c_int = 0;
+        const PROPERTY_CHANGE_MASK: c_long = 1 << 22;
+        const PROP_MODE_REPLACE: c_int = 0;
+        const XFIXES_SET_SELECTION_OWNER_NOTIFY_MASK: c_ulong = 1;
 
         #[repr(C)]
         #[derive(Clone, Copy)]
@@ -1189,12 +1183,45 @@ mod linux_imp {
         }
 
         #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct XSelectionRequestEvent {
+            event_type: c_int,
+            serial: c_ulong,
+            send_event: c_int,
+            display: *mut Display,
+            owner: Window,
+            requestor: Window,
+            selection: Atom,
+            target: Atom,
+            property: Atom,
+            time: Time,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct XPropertyEvent {
+            event_type: c_int,
+            serial: c_ulong,
+            send_event: c_int,
+            display: *mut Display,
+            window: Window,
+            atom: Atom,
+            time: Time,
+            state: c_int,
+        }
+
+        #[repr(C)]
         union XEvent {
             event_type: c_int,
-            xkey: XKeyEvent,
             xselection: XSelectionEvent,
+            xselectionrequest: XSelectionRequestEvent,
+            xproperty: XPropertyEvent,
             pad: [c_long; 24],
         }
+
+        let _x11_serial_guard = X11_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // SAFETY: `dlopen` with `RTLD_LAZY | RTLD_LOCAL` loads system `libX11.so.6` without shell/CLI tools.
         let libx11 =
@@ -1218,6 +1245,8 @@ mod linux_imp {
             }
         }
 
+        type FnInitThreads = unsafe extern "C" fn() -> c_int;
+        type FnSetErrorHandler = unsafe extern "C" fn(XErrorHandler) -> XErrorHandler;
         type FnOpenDisplay = unsafe extern "C" fn(*const c_char) -> *mut Display;
         type FnCloseDisplay = unsafe extern "C" fn(*mut Display) -> c_int;
         type FnDefaultRootWindow = unsafe extern "C" fn(*mut Display) -> Window;
@@ -1233,6 +1262,7 @@ mod linux_imp {
             c_ulong,
         ) -> Window;
         type FnDestroyWindow = unsafe extern "C" fn(*mut Display, Window) -> c_int;
+        type FnSelectInput = unsafe extern "C" fn(*mut Display, Window, c_long) -> c_int;
         type FnInternAtom = unsafe extern "C" fn(*mut Display, *const c_char, c_int) -> Atom;
         type FnGetSelectionOwner = unsafe extern "C" fn(*mut Display, Atom) -> Window;
         type FnSetSelectionOwner = unsafe extern "C" fn(*mut Display, Atom, Window, Time) -> c_int;
@@ -1252,12 +1282,20 @@ mod linux_imp {
             *mut c_ulong,
             *mut *mut c_uchar,
         ) -> c_int;
+        type FnChangeProperty = unsafe extern "C" fn(
+            *mut Display,
+            Window,
+            Atom,
+            Atom,
+            c_int,
+            c_int,
+            *const c_uchar,
+            c_int,
+        ) -> c_int;
+        type FnSendEvent =
+            unsafe extern "C" fn(*mut Display, Window, c_int, c_long, *mut XEvent) -> c_int;
         type FnDeleteProperty = unsafe extern "C" fn(*mut Display, Window, Atom) -> c_int;
         type FnFree = unsafe extern "C" fn(*mut c_void) -> c_int;
-        type FnKeysymToKeycode = unsafe extern "C" fn(*mut Display, KeySym) -> KeyCode;
-        type FnGrabKey =
-            unsafe extern "C" fn(*mut Display, c_int, c_uint, Window, c_int, c_int, c_int) -> c_int;
-        type FnUngrabKey = unsafe extern "C" fn(*mut Display, c_int, c_uint, Window) -> c_int;
         type FnPending = unsafe extern "C" fn(*mut Display) -> c_int;
         type FnNextEvent = unsafe extern "C" fn(*mut Display, *mut XEvent) -> c_int;
         type FnCheckTypedWindowEvent =
@@ -1270,6 +1308,13 @@ mod linux_imp {
                 "missing required X11 selection symbols in libX11.so.6",
             )
         };
+        if let Some(x_init_threads) = unsafe { sym::<FnInitThreads>(libx11, c"XInitThreads") } {
+            X11_THREADS_INIT.call_once(|| unsafe {
+                let _ = x_init_threads();
+            });
+        }
+        let x_set_err: FnSetErrorHandler =
+            unsafe { sym(libx11, c"XSetErrorHandler") }.ok_or_else(load_err)?;
         let x_open: FnOpenDisplay = unsafe { sym(libx11, c"XOpenDisplay") }.ok_or_else(load_err)?;
         let x_close: FnCloseDisplay =
             unsafe { sym(libx11, c"XCloseDisplay") }.ok_or_else(load_err)?;
@@ -1279,6 +1324,8 @@ mod linux_imp {
             unsafe { sym(libx11, c"XCreateSimpleWindow") }.ok_or_else(load_err)?;
         let x_destroy_win: FnDestroyWindow =
             unsafe { sym(libx11, c"XDestroyWindow") }.ok_or_else(load_err)?;
+        let x_select_input: FnSelectInput =
+            unsafe { sym(libx11, c"XSelectInput") }.ok_or_else(load_err)?;
         let x_atom: FnInternAtom = unsafe { sym(libx11, c"XInternAtom") }.ok_or_else(load_err)?;
         let x_get_owner: FnGetSelectionOwner =
             unsafe { sym(libx11, c"XGetSelectionOwner") }.ok_or_else(load_err)?;
@@ -1288,18 +1335,24 @@ mod linux_imp {
             unsafe { sym(libx11, c"XConvertSelection") }.ok_or_else(load_err)?;
         let x_get_prop: FnGetWindowProperty =
             unsafe { sym(libx11, c"XGetWindowProperty") }.ok_or_else(load_err)?;
+        let x_change_prop: FnChangeProperty =
+            unsafe { sym(libx11, c"XChangeProperty") }.ok_or_else(load_err)?;
+        let x_send_ev: FnSendEvent = unsafe { sym(libx11, c"XSendEvent") }.ok_or_else(load_err)?;
         let x_del_prop: FnDeleteProperty =
             unsafe { sym(libx11, c"XDeleteProperty") }.ok_or_else(load_err)?;
         let x_free: FnFree = unsafe { sym(libx11, c"XFree") }.ok_or_else(load_err)?;
-        let x_ks2kc: FnKeysymToKeycode =
-            unsafe { sym(libx11, c"XKeysymToKeycode") }.ok_or_else(load_err)?;
-        let x_grab: FnGrabKey = unsafe { sym(libx11, c"XGrabKey") }.ok_or_else(load_err)?;
-        let x_ungrab: FnUngrabKey = unsafe { sym(libx11, c"XUngrabKey") }.ok_or_else(load_err)?;
         let x_pending: FnPending = unsafe { sym(libx11, c"XPending") }.ok_or_else(load_err)?;
         let x_next: FnNextEvent = unsafe { sym(libx11, c"XNextEvent") }.ok_or_else(load_err)?;
         let x_check_win_ev: FnCheckTypedWindowEvent =
             unsafe { sym(libx11, c"XCheckTypedWindowEvent") }.ok_or_else(load_err)?;
         let x_sync: FnSync = unsafe { sym(libx11, c"XSync") }.ok_or_else(load_err)?;
+
+        // Install non-fatal X11 error handler while `X11_CAPTURE_LOCK` is held so `BadWindow` /
+        // `BadAccess` / `BadAtom` can never invoke Xlib's default `exit(1)` (`V2-H3`).
+        let prev_handler = unsafe { x_set_err(Some(swallow_x11_error)) };
+        let _err_guard = DropGuard::new(prev_handler, |prev| unsafe {
+            let _ = x_set_err(prev);
+        });
 
         let dpy = unsafe { x_open(std::ptr::null()) };
         if dpy.is_null() {
@@ -1323,13 +1376,59 @@ mod linux_imp {
         let _win_guard = DropGuard::new(req_win, |w| unsafe {
             let _ = x_destroy_win(dpy, w);
         });
+        unsafe {
+            let _ = x_select_input(dpy, req_win, PROPERTY_CHANGE_MASK);
+        }
 
-        let atom_primary = unsafe { x_atom(dpy, c"PRIMARY".as_ptr(), 0) };
         let atom_clipboard = unsafe { x_atom(dpy, c"CLIPBOARD".as_ptr(), 0) };
         let atom_utf8 = unsafe { x_atom(dpy, c"UTF8_STRING".as_ptr(), 0) };
         let atom_string = unsafe { x_atom(dpy, c"STRING".as_ptr(), 0) };
+        let atom_targets = unsafe { x_atom(dpy, c"TARGETS".as_ptr(), 0) };
+        let atom_atom = unsafe { x_atom(dpy, c"ATOM".as_ptr(), 0) };
         let atom_prop = unsafe { x_atom(dpy, c"SB_ARMED_CAPTURE_PROP".as_ptr(), 0) };
         let atom_incr = unsafe { x_atom(dpy, c"INCR".as_ptr(), 0) };
+
+        // Optional XFixes event-driven `CLIPBOARD` owner-change subscription (`libXfixes.so.3`).
+        let mut xfixes_event_base: Option<c_int> = None;
+        let libxfixes = unsafe {
+            libc::dlopen(
+                c"libXfixes.so.3".as_ptr(),
+                libc::RTLD_LAZY | libc::RTLD_LOCAL,
+            )
+        };
+        let _xfixes_guard = DropGuard::new(libxfixes, |h| {
+            if !h.is_null() {
+                unsafe {
+                    let _ = libc::dlclose(h);
+                }
+            }
+        });
+        if !libxfixes.is_null() {
+            type FnXFixesQueryExt =
+                unsafe extern "C" fn(*mut Display, *mut c_int, *mut c_int) -> c_int;
+            type FnXFixesSelectSelInput = unsafe extern "C" fn(*mut Display, Window, Atom, c_ulong);
+            if let (Some(qf), Some(sel_in)) = unsafe {
+                (
+                    sym::<FnXFixesQueryExt>(libxfixes, c"XFixesQueryExtension"),
+                    sym::<FnXFixesSelectSelInput>(libxfixes, c"XFixesSelectSelectionInput"),
+                )
+            } {
+                let mut ev_base: c_int = 0;
+                let mut err_base: c_int = 0;
+                if unsafe { qf(dpy, &mut ev_base, &mut err_base) } != 0 {
+                    unsafe {
+                        sel_in(
+                            dpy,
+                            req_win,
+                            atom_clipboard,
+                            XFIXES_SET_SELECTION_OWNER_NOTIFY_MASK,
+                        );
+                        let _ = x_sync(dpy, 0);
+                    }
+                    xfixes_event_base = Some(ev_base);
+                }
+            }
+        }
 
         let read_sel = |sel_atom: Atom| -> Option<MlockedHostBuffer> {
             let owner = unsafe { x_get_owner(dpy, sel_atom) };
@@ -1367,7 +1466,7 @@ mod linux_imp {
                         atom_prop,
                         0,
                         (MAX_CAPTURED_SECRET_BYTES as c_long / 4) + 4,
-                        1, // Delete = True
+                        1, // Delete = True (also triggers ICCCM INCR streaming if actual_type == INCR)
                         0, // AnyPropertyType
                         &mut actual_type,
                         &mut actual_fmt,
@@ -1386,7 +1485,75 @@ mod linux_imp {
                     }
                     let _ = x_free(p.cast());
                 });
-                if actual_type == atom_incr || bytes_after > 0 || byte_len == 0 {
+
+                if actual_type == atom_incr {
+                    drop(_prop_guard);
+                    let mut incr_accum = zeroize::Zeroizing::new(Vec::new());
+                    let incr_deadline = Instant::now() + Duration::from_millis(300);
+                    let mut incr_ok = false;
+                    while Instant::now() < incr_deadline {
+                        let mut pev = XEvent { pad: [0; 24] };
+                        if unsafe { x_check_win_ev(dpy, req_win, PROPERTY_NOTIFY, &mut pev) } == 0 {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        if unsafe {
+                            pev.xproperty.atom != atom_prop
+                                || pev.xproperty.state != PROPERTY_NEW_VALUE
+                        } {
+                            continue;
+                        }
+                        let mut c_type: Atom = 0;
+                        let mut c_fmt: c_int = 0;
+                        let mut c_nitems: c_ulong = 0;
+                        let mut c_after: c_ulong = 0;
+                        let mut c_ptr: *mut c_uchar = std::ptr::null_mut();
+                        let crc = unsafe {
+                            x_get_prop(
+                                dpy,
+                                req_win,
+                                atom_prop,
+                                0,
+                                (MAX_CAPTURED_SECRET_BYTES as c_long / 4) + 4,
+                                1,
+                                0,
+                                &mut c_type,
+                                &mut c_fmt,
+                                &mut c_nitems,
+                                &mut c_after,
+                                &mut c_ptr,
+                            )
+                        };
+                        if crc != 0 || c_ptr.is_null() {
+                            break;
+                        }
+                        let c_len = if c_fmt == 8 { c_nitems as usize } else { 0 };
+                        let _chunk_guard = DropGuard::new((c_ptr, c_len), |(p, len)| unsafe {
+                            if len > 0 {
+                                std::slice::from_raw_parts_mut(p, len).zeroize();
+                            }
+                            let _ = x_free(p.cast());
+                        });
+                        if c_nitems == 0 {
+                            incr_ok = !incr_accum.is_empty();
+                            break;
+                        }
+                        if c_fmt != 8
+                            || c_after > 0
+                            || incr_accum.len().saturating_add(c_len) > MAX_CAPTURED_SECRET_BYTES
+                        {
+                            break;
+                        }
+                        let chunk_slice = unsafe { std::slice::from_raw_parts(c_ptr, c_len) };
+                        incr_accum.extend_from_slice(chunk_slice);
+                    }
+                    if incr_ok && let Ok(locked) = MlockedHostBuffer::from_bytes(&incr_accum) {
+                        return Some(locked);
+                    }
+                    continue;
+                }
+
+                if bytes_after > 0 || byte_len == 0 || byte_len > MAX_CAPTURED_SECRET_BYTES {
                     continue;
                 }
                 let slice = unsafe { std::slice::from_raw_parts(prop_ptr, byte_len) };
@@ -1403,81 +1570,130 @@ mod linux_imp {
             let _ = x_sync(dpy, 0);
         };
 
-        let kc_c = c_int::from(unsafe { x_ks2kc(dpy, XK_LOWER_C) });
-        let kc_esc = c_int::from(unsafe { x_ks2kc(dpy, XK_ESCAPE) });
-        let modifiers = [
-            CONTROL_MASK,
-            CONTROL_MASK | MOD2_MASK,
-            CONTROL_MASK | LOCK_MASK,
-            CONTROL_MASK | MOD2_MASK | LOCK_MASK,
-        ];
-        for &m in &modifiers {
+        let restore_or_clear_clipboard = |prior: Option<MlockedHostBuffer>| {
+            let Some(prev_buf) = prior else {
+                clear_sel(atom_clipboard);
+                return;
+            };
+            // Serve the prior clipboard snapshot briefly via ICCCM SelectionRequest so clipboard
+            // managers and user pastes retain the pre-capture text (`V2-H3`), while wiping the
+            // newly copied secret immediately.
             unsafe {
-                let _ = x_grab(dpy, kc_c, m, root, 0, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC);
+                let _ = x_set_owner(dpy, atom_clipboard, req_win, 0);
+                let _ = x_sync(dpy, 0);
             }
-        }
-        unsafe {
-            let _ = x_grab(
-                dpy,
-                kc_esc,
-                ANY_MODIFIER,
-                root,
-                0,
-                GRAB_MODE_ASYNC,
-                GRAB_MODE_ASYNC,
-            );
-            let _ = x_sync(dpy, 0);
-        }
-
-        let _grab_guard = DropGuard::new(dpy, |d| unsafe {
-            for &m in &modifiers {
-                let _ = x_ungrab(d, kc_c, m, root);
+            let serve_until = Instant::now() + Duration::from_millis(120);
+            while Instant::now() < serve_until {
+                while unsafe { x_pending(dpy) } > 0 {
+                    let mut ev = XEvent { pad: [0; 24] };
+                    unsafe {
+                        let _ = x_next(dpy, &mut ev);
+                    }
+                    let ev_type = unsafe { ev.event_type };
+                    if ev_type == SELECTION_CLEAR {
+                        return;
+                    }
+                    if ev_type == SELECTION_REQUEST {
+                        let req = unsafe { ev.xselectionrequest };
+                        let prop = if req.property == 0 {
+                            req.target
+                        } else {
+                            req.property
+                        };
+                        let mut notify_prop: Atom = 0;
+                        if req.target == atom_targets {
+                            let targets = [atom_targets, atom_utf8, atom_string];
+                            unsafe {
+                                let _ = x_change_prop(
+                                    dpy,
+                                    req.requestor,
+                                    prop,
+                                    atom_atom,
+                                    32,
+                                    PROP_MODE_REPLACE,
+                                    targets.as_ptr().cast::<c_uchar>(),
+                                    targets.len() as c_int,
+                                );
+                            }
+                            notify_prop = prop;
+                        } else if req.target == atom_utf8 || req.target == atom_string {
+                            let bytes = prev_buf.as_bytes();
+                            unsafe {
+                                let _ = x_change_prop(
+                                    dpy,
+                                    req.requestor,
+                                    prop,
+                                    req.target,
+                                    8,
+                                    PROP_MODE_REPLACE,
+                                    bytes.as_ptr().cast::<c_uchar>(),
+                                    bytes.len() as c_int,
+                                );
+                            }
+                            notify_prop = prop;
+                        }
+                        let mut reply = XEvent {
+                            xselection: XSelectionEvent {
+                                event_type: SELECTION_NOTIFY,
+                                serial: 0,
+                                send_event: 1,
+                                display: req.display,
+                                requestor: req.requestor,
+                                selection: req.selection,
+                                target: req.target,
+                                property: notify_prop,
+                                time: req.time,
+                            },
+                        };
+                        unsafe {
+                            let _ = x_send_ev(dpy, req.requestor, 0, 0, &mut reply);
+                            let _ = x_sync(dpy, 0);
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
             }
-            let _ = x_ungrab(d, kc_esc, ANY_MODIFIER, root);
-            let _ = x_sync(d, 0);
-        });
+            unsafe {
+                let _ = x_set_owner(dpy, atom_clipboard, 0, 0);
+                let _ = x_sync(dpy, 0);
+            }
+        };
 
-        let initial_clip = read_sel(atom_clipboard);
-        let initial_hash: Option<[u8; 32]> = initial_clip.as_ref().map(|b| {
+        let mut prior_clipboard = read_sel(atom_clipboard);
+        let initial_owner = unsafe { x_get_owner(dpy, atom_clipboard) };
+        let initial_hash: Option<[u8; 32]> = prior_clipboard.as_ref().map(|b| {
             use sha2::{Digest, Sha256};
             Sha256::digest(b.as_bytes()).into()
         });
-        drop(initial_clip);
 
         let deadline = Instant::now() + ttl;
         let mut last_clip_poll = Instant::now();
+        let mut owner_changed_hint = false;
+
         while Instant::now() < deadline {
             while unsafe { x_pending(dpy) } > 0 {
                 let mut ev = XEvent { pad: [0; 24] };
                 unsafe {
                     let _ = x_next(dpy, &mut ev);
                 }
-                if unsafe { ev.event_type } == KEY_PRESS {
-                    let pressed_kc = unsafe { ev.xkey.keycode } as c_int;
-                    if pressed_kc == kc_esc {
-                        return Err(HostError::new(
-                            ErrorCode::CaptureExpired,
-                            "Armed Copy cancelled by user (Esc)",
-                        ));
-                    }
-                    if pressed_kc == kc_c
-                        && let Some(primary) = read_sel(atom_primary)
-                    {
-                        clear_sel(atom_primary);
-                        return Ok((primary, CaptureInterceptMode::ZeroPasteboard));
-                    }
+                if let Some(base) = xfixes_event_base
+                    && unsafe { ev.event_type } == base
+                {
+                    owner_changed_hint = true;
                 }
             }
 
-            if last_clip_poll.elapsed() >= Duration::from_millis(10) {
+            if owner_changed_hint || last_clip_poll.elapsed() >= Duration::from_millis(5) {
+                owner_changed_hint = false;
                 last_clip_poll = Instant::now();
+                let cur_owner = unsafe { x_get_owner(dpy, atom_clipboard) };
                 if let Some(cur_clip) = read_sel(atom_clipboard) {
                     let cur_hash: [u8; 32] = {
                         use sha2::{Digest, Sha256};
                         Sha256::digest(cur_clip.as_bytes()).into()
                     };
-                    if initial_hash.as_ref() != Some(&cur_hash) {
-                        clear_sel(atom_clipboard);
+                    if cur_owner != initial_owner || initial_hash.as_ref() != Some(&cur_hash) {
+                        restore_or_clear_clipboard(prior_clipboard.take());
                         return Ok((cur_clip, CaptureInterceptMode::PasteboardFallback));
                     }
                 }

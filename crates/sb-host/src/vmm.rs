@@ -2,14 +2,18 @@ use crate::manifest_io::HostError;
 use sb_proto::crypto::constant_time_eq_32;
 use sb_proto::error::ErrorCode;
 use sha2::{Digest, Sha256};
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::DropGuard;
+use std::net::{IpAddr, Ipv4Addr};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_GUEST_CID: u32 = 42;
@@ -26,14 +30,24 @@ pub fn default_vmm_binary_path() -> PathBuf {
     }
 }
 
-/// Verifies an executable host binary (`qemu-system-*` or `sb-enclave`) before spawning:
-/// rejects leading `-`, requires an absolute path, opens with `O_NOFOLLOW`, verifies regular
-/// executable file permissions without world-write bit, and optionally pins SHA-256 (`H4`).
-pub fn verify_executable_binary(
-    path: &Path,
-    expected_sha256: Option<&[u8; 32]>,
-    label: &str,
-) -> Result<PathBuf, HostError> {
+/// Verified host executable handle (`V2-H6`):
+/// - Walks every ancestor directory from `/` with `openat(..., O_DIRECTORY | O_NOFOLLOW)` rejecting
+///   symlinked or world-writable (`0o002`) parent directories.
+/// - On Linux, copies the verified executable into a write-sealed `memfd_create` (`MFD_EXEC`)
+///   executed via `/proc/self/fd/<fd>` when supported by the host kernel's `vm.memfd_noexec` policy,
+///   eliminating path-reopen TOCTOU between SHA-256 verification and `execve`.
+pub struct VerifiedExecutable {
+    exec_path: PathBuf,
+    _backing_file: File,
+}
+
+impl VerifiedExecutable {
+    pub fn exec_path(&self) -> &Path {
+        &self.exec_path
+    }
+}
+
+fn open_verified_executable_file(path: &Path, label: &str) -> Result<File, HostError> {
     let raw_str = path.to_string_lossy();
     if raw_str.is_empty() || raw_str.starts_with('-') {
         return Err(HostError::new(
@@ -48,16 +62,116 @@ pub fn verify_executable_binary(
         ));
     }
 
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| {
+    let mut segments = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(HostError::new(
+                    ErrorCode::Validation,
+                    format!("{label} binary path must not contain '..' or path prefixes"),
+                ));
+            }
+            Component::Normal(seg) => segments.push(seg),
+        }
+    }
+    let leaf_os = segments.pop().ok_or_else(|| {
+        HostError::new(
+            ErrorCode::Validation,
+            format!("{label} binary path must name an executable file"),
+        )
+    })?;
+    let leaf_cstr = CString::new(leaf_os.as_bytes()).map_err(|_| {
+        HostError::new(
+            ErrorCode::Validation,
+            format!("NUL byte in {label} binary filename"),
+        )
+    })?;
+
+    // SAFETY: `c"/"` is a static NUL-terminated root path.
+    let root_raw = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_raw < 0 {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            format!(
+                "unable to open '/' while verifying {label}: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    // SAFETY: `root_raw` is newly opened and owned solely by `cur_dir`.
+    let mut cur_dir = unsafe { OwnedFd::from_raw_fd(root_raw) };
+
+    for seg in segments {
+        let seg_cstr = CString::new(seg.as_bytes()).map_err(|_| {
             HostError::new(
                 ErrorCode::Validation,
-                format!("unable to open {label} binary '{}': {e}", path.display()),
+                format!("NUL byte in {label} ancestor directory"),
             )
         })?;
+        // SAFETY: `cur_dir` is a valid directory fd and `seg_cstr` is NUL-terminated.
+        let next_raw = unsafe {
+            libc::openat(
+                cur_dir.as_raw_fd(),
+                seg_cstr.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if next_raw < 0 {
+            return Err(HostError::new(
+                ErrorCode::Validation,
+                format!(
+                    "refusing to traverse symlinked or inaccessible ancestor '{}' for {label}: {}",
+                    seg.to_string_lossy(),
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+        // SAFETY: `next_raw` is newly opened and replaces `cur_dir`.
+        cur_dir = unsafe { OwnedFd::from_raw_fd(next_raw) };
+        let mut dir_st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(cur_dir.as_raw_fd(), &mut dir_st) } != 0 {
+            return Err(HostError::new(
+                ErrorCode::Validation,
+                format!("unable to stat ancestor directory for {label}"),
+            ));
+        }
+        if (dir_st.st_mode & 0o002) != 0 {
+            return Err(HostError::new(
+                ErrorCode::Validation,
+                format!(
+                    "refusing to execute {label} inside world-writable ancestor directory '{}'",
+                    seg.to_string_lossy()
+                ),
+            ));
+        }
+    }
+
+    // SAFETY: Opens leaf executable inside verified `cur_dir` without following symlinks.
+    let bin_raw = unsafe {
+        libc::openat(
+            cur_dir.as_raw_fd(),
+            leaf_cstr.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if bin_raw < 0 {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            format!(
+                "unable to open {label} binary '{}': {}",
+                path.display(),
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    // SAFETY: `bin_raw` is newly opened and owned solely by `file`.
+    let file = unsafe { File::from_raw_fd(bin_raw) };
     let meta = file.metadata().map_err(|e| {
         HostError::new(
             ErrorCode::Validation,
@@ -82,6 +196,96 @@ pub fn verify_executable_binary(
             ErrorCode::Validation,
             format!("refusing to execute world-writable {label} binary"),
         ));
+    }
+    unsafe {
+        let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+    Ok(file)
+}
+
+/// Verifies an executable host binary (`qemu-system-*` or `sb-enclave`) before spawning and seals
+/// it into an immutable executable `memfd` on Linux (`V2-H6`).
+pub fn open_and_seal_executable_binary(
+    path: &Path,
+    expected_sha256: Option<&[u8; 32]>,
+    label: &str,
+) -> Result<VerifiedExecutable, HostError> {
+    let mut file = open_verified_executable_file(path, label)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        const MFD_EXEC_FLAG: libc::c_uint = 0x0010;
+        // SAFETY: `c"sb_verified_exec"` is NUL-terminated. Try `MFD_EXEC` (Linux >= 6.3) first,
+        // falling back to standard `MFD_CLOEXEC | MFD_ALLOW_SEALING` on older kernels (`EINVAL`).
+        let mut raw_memfd = unsafe {
+            libc::memfd_create(
+                c"sb_verified_exec".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | MFD_EXEC_FLAG,
+            )
+        };
+        if raw_memfd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+            raw_memfd = unsafe {
+                libc::memfd_create(
+                    c"sb_verified_exec".as_ptr(),
+                    libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                )
+            };
+        }
+        if raw_memfd >= 0 {
+            // SAFETY: `raw_memfd` was freshly created by `memfd_create`.
+            let mut memfd_file = unsafe { File::from_raw_fd(raw_memfd) };
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 32 * 1024];
+            loop {
+                let n = file.read(&mut buf).map_err(|e| {
+                    HostError::new(
+                        ErrorCode::Validation,
+                        format!("error reading {label} binary: {e}"),
+                    )
+                })?;
+                if n == 0 {
+                    break;
+                }
+                if expected_sha256.is_some() {
+                    hasher.update(&buf[..n]);
+                }
+                memfd_file.write_all(&buf[..n]).map_err(|e| {
+                    HostError::new(
+                        ErrorCode::InternalError,
+                        format!("failed copying {label} binary into sealed memfd: {e}"),
+                    )
+                })?;
+            }
+            if let Some(expected) = expected_sha256 {
+                let actual: [u8; 32] = hasher.finalize().into();
+                if !constant_time_eq_32(&actual, expected) {
+                    return Err(HostError::new(
+                        ErrorCode::CryptoFailure,
+                        format!("{label} binary SHA-256 verification failed against pinned digest"),
+                    ));
+                }
+            }
+            let _ = memfd_file.seek(SeekFrom::Start(0));
+            let _ = unsafe { libc::fchmod(memfd_file.as_raw_fd(), 0o500) };
+            let seals =
+                libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+            if unsafe { libc::fcntl(memfd_file.as_raw_fd(), libc::F_ADD_SEALS, seals) } == 0 {
+                let fd_num = memfd_file.as_raw_fd();
+                return Ok(VerifiedExecutable {
+                    exec_path: PathBuf::from(format!("/proc/self/fd/{fd_num}")),
+                    _backing_file: memfd_file,
+                });
+            }
+            file.seek(SeekFrom::Start(0)).map_err(|e| {
+                HostError::new(
+                    ErrorCode::InternalError,
+                    format!("failed rewinding {label} binary: {e}"),
+                )
+            })?;
+        }
     }
 
     if let Some(expected) = expected_sha256 {
@@ -108,6 +312,18 @@ pub fn verify_executable_binary(
         }
     }
 
+    Ok(VerifiedExecutable {
+        exec_path: path.to_path_buf(),
+        _backing_file: file,
+    })
+}
+
+pub fn verify_executable_binary(
+    path: &Path,
+    expected_sha256: Option<&[u8; 32]>,
+    label: &str,
+) -> Result<PathBuf, HostError> {
+    let _verified = open_and_seal_executable_binary(path, expected_sha256, label)?;
     Ok(path.to_path_buf())
 }
 
@@ -420,6 +636,11 @@ fn open_and_stage_private_copy(
 pub enum RawEnclaveStream {
     Unix(std::os::unix::net::UnixStream),
     SocketFile(File),
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    MacosVz {
+        file: File,
+        conn: Arc<macos_vz::RetainedVzConnection>,
+    },
 }
 
 impl RawEnclaveStream {
@@ -427,26 +648,36 @@ impl RawEnclaveStream {
         match self {
             Self::Unix(s) => s.try_clone().map(Self::Unix),
             Self::SocketFile(f) => f.try_clone().map(Self::SocketFile),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::MacosVz { file, conn } => Ok(Self::MacosVz {
+                file: file.try_clone()?,
+                conn: Arc::clone(conn),
+            }),
         }
     }
 
     pub fn shutdown_write(&self) {
-        use std::os::fd::AsRawFd;
         match self {
             Self::Unix(s) => {
                 let _ = s.shutdown(std::net::Shutdown::Write);
             }
             Self::SocketFile(f) => {
-                // SAFETY: `f` wraps a valid stream socket fd (`AF_VSOCK` or `VZVirtioSocketConnection`).
+                // SAFETY: `f` wraps a valid stream socket fd (`AF_VSOCK`).
                 unsafe {
                     let _ = libc::shutdown(f.as_raw_fd(), libc::SHUT_WR);
+                }
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::MacosVz { file, .. } => {
+                // SAFETY: `file` wraps a valid `VZVirtioSocketConnection` stream fd.
+                unsafe {
+                    let _ = libc::shutdown(file.as_raw_fd(), libc::SHUT_WR);
                 }
             }
         }
     }
 
     pub fn shutdown_both(&self) {
-        use std::os::fd::AsRawFd;
         match self {
             Self::Unix(s) => {
                 let _ = s.shutdown(std::net::Shutdown::Both);
@@ -455,6 +686,13 @@ impl RawEnclaveStream {
                 // SAFETY: `f` wraps a valid stream socket fd.
                 unsafe {
                     let _ = libc::shutdown(f.as_raw_fd(), libc::SHUT_RDWR);
+                }
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::MacosVz { file, .. } => {
+                // SAFETY: `file` wraps a valid stream socket fd.
+                unsafe {
+                    let _ = libc::shutdown(file.as_raw_fd(), libc::SHUT_RDWR);
                 }
             }
         }
@@ -466,6 +704,8 @@ impl Read for RawEnclaveStream {
         match self {
             Self::Unix(s) => s.read(buf),
             Self::SocketFile(f) => f.read(buf),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::MacosVz { file, .. } => file.read(buf),
         }
     }
 }
@@ -475,6 +715,8 @@ impl Write for RawEnclaveStream {
         match self {
             Self::Unix(s) => s.write(buf),
             Self::SocketFile(f) => f.write(buf),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::MacosVz { file, .. } => file.write(buf),
         }
     }
 
@@ -482,6 +724,8 @@ impl Write for RawEnclaveStream {
         match self {
             Self::Unix(s) => s.flush(),
             Self::SocketFile(f) => f.flush(),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::MacosVz { file, .. } => file.flush(),
         }
     }
 }
@@ -596,12 +840,389 @@ pub fn acquire_host_cid_lease_in_dir(
     ))
 }
 
+/// Returns `true` iff `ip` is a globally routable public unicast IPv4/IPv6 address (`V2-H5`, `V2-H6`).
+pub fn is_public_unicast_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_unicast_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_public_unicast_v4(mapped_v4);
+            }
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            let segs = v6.segments();
+            if segs[0] == 0
+                && segs[1] == 0
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0
+                && segs[5] == 0
+            {
+                return false;
+            }
+            if (segs[0] == 0x0064
+                && segs[1] == 0xff9b
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0
+                && segs[5] == 0)
+                || (segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001)
+            {
+                return false;
+            }
+            if segs[0] == 0x2002 {
+                return false;
+            }
+            if segs[0] == 0x2001 && segs[1] == 0x0000 {
+                return false;
+            }
+            if (segs[0] & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            if (segs[0] & 0xffc0) == 0xfe80 || (segs[0] & 0xffc0) == 0xfec0 {
+                return false;
+            }
+            if segs[0] == 0x2001 && segs[1] == 0x0db8 {
+                return false;
+            }
+            true
+        }
+    }
+}
+
+fn is_public_unicast_v4(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    if v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || v4.is_unspecified()
+        || v4.is_multicast()
+    {
+        return false;
+    }
+    if o[0] == 0 {
+        return false;
+    }
+    if o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000 {
+        return false;
+    }
+    if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+        return false;
+    }
+    if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+        return false;
+    }
+    if o[0] >= 240 {
+        return false;
+    }
+    true
+}
+
+/// Validates an HTTP `CONNECT <host>:443 HTTP/1.x` request line from the guest enclave's
+/// `AF_VSOCK` egress bridge (`V2-H6`). Rejects non-`CONNECT` verbs, ports other than `443`,
+/// IP literals, numeric/hex/octal TLDs, and internal/loopback suffixes.
+pub fn validate_https_connect_target(request_line: &str) -> Result<String, HostError> {
+    let trimmed = request_line.trim_end_matches(['\r', '\n']);
+    let mut parts = trimmed.split_ascii_whitespace();
+    let method = parts.next().unwrap_or("");
+    let authority = parts.next().unwrap_or("");
+    let version = parts.next().unwrap_or("");
+    if parts.next().is_some()
+        || method != "CONNECT"
+        || (version != "HTTP/1.1" && version != "HTTP/1.0")
+    {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            "host AF_VSOCK egress proxy only accepts HTTP/1.x CONNECT requests",
+        ));
+    }
+    let (host_raw, port_raw) = authority.rsplit_once(':').ok_or_else(|| {
+        HostError::new(
+            ErrorCode::Validation,
+            "CONNECT authority must include explicit :443 port",
+        )
+    })?;
+    if port_raw != "443" {
+        return Err(HostError::new(
+            ErrorCode::Unauthorized,
+            "host AF_VSOCK egress proxy restricts outbound traffic strictly to TCP port 443",
+        ));
+    }
+    if host_raw.starts_with('[') || host_raw.ends_with(']') {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            "IP literals are not permitted in host AF_VSOCK egress proxy",
+        ));
+    }
+    let validated_host: sb_proto::types::GitHubHost = host_raw.parse().map_err(|_| {
+        HostError::new(
+            ErrorCode::Validation,
+            "CONNECT target must be a valid public DNS hostname",
+        )
+    })?;
+    Ok(validated_host.as_str().to_string())
+}
+
+pub struct HostVsockHttpsEgressProxy {
+    port: u32,
+    listener_fd: OwnedFd,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl HostVsockHttpsEgressProxy {
+    pub fn port(&self) -> u32 {
+        self.port
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn bind_for_guest_cid(expected_guest_cid: u32) -> Result<Self, HostError> {
+        // SAFETY: Creates a host `AF_VSOCK` stream socket with `SOCK_CLOEXEC`.
+        let raw_fd =
+            unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if raw_fd < 0 {
+            return Err(HostError::new(
+                ErrorCode::TransportFailure,
+                format!(
+                    "AF_VSOCK egress proxy socket() failed: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+        // SAFETY: `raw_fd` is newly created and owned solely by `listener_fd`.
+        let listener_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_cid = libc::VMADDR_CID_ANY;
+        addr.svm_port = libc::VMADDR_PORT_ANY;
+
+        if unsafe {
+            libc::bind(
+                listener_fd.as_raw_fd(),
+                (&raw const addr).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+            )
+        } < 0
+        {
+            return Err(HostError::new(
+                ErrorCode::TransportFailure,
+                format!(
+                    "AF_VSOCK egress proxy bind() failed: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+
+        let mut bound_addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+        let mut bound_len = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockname(
+                listener_fd.as_raw_fd(),
+                (&raw mut bound_addr).cast::<libc::sockaddr>(),
+                &raw mut bound_len,
+            )
+        } < 0
+        {
+            return Err(HostError::new(
+                ErrorCode::TransportFailure,
+                format!(
+                    "AF_VSOCK egress proxy getsockname() failed: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+
+        if unsafe { libc::listen(listener_fd.as_raw_fd(), 16) } < 0 {
+            return Err(HostError::new(
+                ErrorCode::TransportFailure,
+                format!(
+                    "AF_VSOCK egress proxy listen() failed: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+
+        let dup_raw = unsafe { libc::fcntl(listener_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if dup_raw < 0 {
+            return Err(HostError::new(
+                ErrorCode::InternalError,
+                format!(
+                    "dup(AF_VSOCK egress listener) failed: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+        // SAFETY: `dup_raw` was freshly duplicated for the accept thread.
+        let accept_fd = unsafe { OwnedFd::from_raw_fd(dup_raw) };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_worker = Arc::clone(&shutdown);
+        let active_conns = Arc::new(AtomicUsize::new(0));
+        let assigned_port = bound_addr.svm_port;
+
+        std::thread::spawn(move || {
+            while !shutdown_worker.load(Ordering::Relaxed) {
+                let mut peer_addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+                let mut peer_len = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+                let client_raw = unsafe {
+                    libc::accept4(
+                        accept_fd.as_raw_fd(),
+                        (&raw mut peer_addr).cast::<libc::sockaddr>(),
+                        &raw mut peer_len,
+                        libc::SOCK_CLOEXEC,
+                    )
+                };
+                if client_raw < 0 {
+                    if shutdown_worker.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                // SAFETY: `client_raw` was freshly returned by `accept4`.
+                let client_file = File::from(unsafe { OwnedFd::from_raw_fd(client_raw) });
+                if peer_addr.svm_cid != expected_guest_cid {
+                    drop(client_file);
+                    continue;
+                }
+                if active_conns.fetch_add(1, Ordering::AcqRel) >= 16 {
+                    active_conns.fetch_sub(1, Ordering::AcqRel);
+                    drop(client_file);
+                    continue;
+                }
+                let active_clone = Arc::clone(&active_conns);
+                std::thread::spawn(move || {
+                    let _slot_guard = DropGuard::new(active_clone, |cnt| {
+                        cnt.fetch_sub(1, Ordering::AcqRel);
+                    });
+                    handle_https_connect_tunnel(client_file);
+                });
+            }
+        });
+
+        Ok(Self {
+            port: assigned_port,
+            listener_fd,
+            shutdown,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn bind_for_guest_cid(_expected_guest_cid: u32) -> Result<Self, HostError> {
+        Err(HostError::new(
+            ErrorCode::TransportFailure,
+            "AF_VSOCK host egress proxy is only supported on Linux",
+        ))
+    }
+}
+
+impl Drop for HostVsockHttpsEgressProxy {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        unsafe {
+            let _ = libc::shutdown(self.listener_fd.as_raw_fd(), libc::SHUT_RDWR);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn handle_https_connect_tunnel(mut guest_stream: File) {
+    use std::net::ToSocketAddrs;
+
+    apply_socket_timeouts(guest_stream.as_raw_fd());
+    let mut header_buf = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while header_buf.len() < 4096 {
+        match guest_stream.read(&mut byte) {
+            Ok(0) => return,
+            Ok(_) => {
+                header_buf.push(byte[0]);
+                if header_buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
+    if !header_buf.ends_with(b"\r\n\r\n") {
+        let _ = guest_stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+        return;
+    }
+    let Ok(header_str) = std::str::from_utf8(&header_buf) else {
+        let _ = guest_stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+        return;
+    };
+    let first_line = header_str.lines().next().unwrap_or("");
+    let Ok(host) = validate_https_connect_target(first_line) else {
+        let _ = guest_stream.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        return;
+    };
+
+    let Ok(resolved_iter) = (host.as_str(), 443u16).to_socket_addrs() else {
+        let _ = guest_stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+        return;
+    };
+    let addrs: Vec<std::net::SocketAddr> = resolved_iter.collect();
+    if addrs.is_empty() || !addrs.iter().all(|a| is_public_unicast_ip(a.ip())) {
+        let _ = guest_stream.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        return;
+    }
+
+    let mut upstream = None;
+    for candidate in addrs {
+        if let Ok(tcp) = std::net::TcpStream::connect_timeout(&candidate, Duration::from_secs(10)) {
+            let _ = tcp.set_read_timeout(Some(Duration::from_secs(45)));
+            let _ = tcp.set_write_timeout(Some(Duration::from_secs(45)));
+            upstream = Some(tcp);
+            break;
+        }
+    }
+    let Some(mut tcp_stream) = upstream else {
+        let _ = guest_stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+        return;
+    };
+
+    if guest_stream
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .is_err()
+        || guest_stream.flush().is_err()
+    {
+        return;
+    }
+
+    let Ok(mut guest_reader) = guest_stream.try_clone() else {
+        return;
+    };
+    let Ok(mut tcp_writer) = tcp_stream.try_clone() else {
+        return;
+    };
+
+    let t_up = std::thread::spawn(move || {
+        let _ = io::copy(&mut guest_reader, &mut tcp_writer);
+        let _ = tcp_writer.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = io::copy(&mut tcp_stream, &mut guest_stream);
+    unsafe {
+        let _ = libc::shutdown(guest_stream.as_raw_fd(), libc::SHUT_WR);
+    }
+    let _ = t_up.join();
+}
+
 pub struct ManagedEnclaveHandle {
     endpoint: EnclaveEndpoint,
     enclave_pubkey: [u8; 32],
     child_vm: Option<Child>,
     _boot_artifacts: Vec<SealedBootArtifact>,
+    _verified_executables: Vec<VerifiedExecutable>,
     _cid_lease: Option<HostCidLease>,
+    _egress_proxy: Option<HostVsockHttpsEgressProxy>,
 }
 
 impl Drop for ManagedEnclaveHandle {
@@ -636,7 +1257,9 @@ impl ManagedEnclaveHandle {
             enclave_pubkey,
             child_vm: None,
             _boot_artifacts: Vec::new(),
+            _verified_executables: Vec::new(),
             _cid_lease: None,
+            _egress_proxy: None,
         }
     }
 
@@ -655,11 +1278,12 @@ impl ManagedEnclaveHandle {
         }
     }
 
-    /// Verifies VMM binary + seals kernel & initramfs into immutable `memfd`s (`H4`), then boots
-    /// a separate-kernel Linux KVM microVM bound to `spec.authorized_client_pubkey` (`C2`).
+    /// Verifies & seals VMM binary + kernel & initramfs into immutable `memfd`s (`H4`, `V2-H6`),
+    /// restricts QEMU SLIRP (`restrict=on`) so guest packets can never reach host loopback, and
+    /// exposes a public-unicast-only `:443` `CONNECT` bridge over `AF_VSOCK`.
     pub fn boot_kvm_microvm(spec: &MicroVmLaunchSpec) -> Result<Self, HostError> {
         let verified_vmm =
-            verify_executable_binary(&spec.vmm_binary, spec.vmm_sha256.as_ref(), "VMM")?;
+            open_and_seal_executable_binary(&spec.vmm_binary, spec.vmm_sha256.as_ref(), "VMM")?;
         let sealed_kernel = open_and_seal_boot_artifact(
             &spec.kernel_path,
             &spec.kernel_sha256,
@@ -693,10 +1317,6 @@ impl ManagedEnclaveHandle {
         } else {
             ("q35,accel=kvm", "ttyS0")
         };
-        let cmdline = format!(
-            "console={console_dev} reboot=k panic=1 nomodules quiet rdinit=/init ip=dhcp sb.net_fallback=qemu_slirp sb.vsock_port={} sb.client_pubkey={client_pk_hex}",
-            spec.vsock_port
-        );
 
         let mut skipped_leases = Vec::new();
         let mut preferred_cid = spec.guest_cid;
@@ -705,8 +1325,14 @@ impl ManagedEnclaveHandle {
         for attempt in 0..MAX_CID_ATTEMPTS {
             let cid_lease = acquire_host_cid_lease_in_dir(&cid_lock_dir, preferred_cid)?;
             let leased_cid = cid_lease.cid();
+            let egress_proxy = HostVsockHttpsEgressProxy::bind_for_guest_cid(leased_cid)?;
+            let cmdline = format!(
+                "console={console_dev} reboot=k panic=1 nomodules quiet rdinit=/init ip=dhcp sb.net_fallback=qemu_slirp sb.vsock_port={} sb.egress_vsock_port={} sb.client_pubkey={client_pk_hex}",
+                spec.vsock_port,
+                egress_proxy.port()
+            );
 
-            let mut cmd = Command::new(&verified_vmm);
+            let mut cmd = Command::new(verified_vmm.exec_path());
             cmd.args([
                 "-machine",
                 arch_machine,
@@ -733,7 +1359,7 @@ impl ManagedEnclaveHandle {
                 "-device",
                 "virtio-rng-pci,rng=rng0",
                 "-netdev",
-                "user,id=net0,restrict=off",
+                "user,id=net0,restrict=on",
                 "-device",
                 "virtio-net-pci,netdev=net0",
                 "-device",
@@ -778,7 +1404,7 @@ impl ManagedEnclaveHandle {
                     ErrorCode::TransportFailure,
                     format!(
                         "failed to launch microVM VMM '{}': {e}",
-                        verified_vmm.display()
+                        spec.vmm_binary.display()
                     ),
                 )
             })?;
@@ -807,11 +1433,14 @@ impl ManagedEnclaveHandle {
                         enclave_pubkey,
                         child_vm: Some(confirmed_child),
                         _boot_artifacts: vec![sealed_kernel, sealed_initramfs],
+                        _verified_executables: vec![verified_vmm],
                         _cid_lease: Some(cid_lease),
+                        _egress_proxy: Some(egress_proxy),
                     });
                 }
                 Err(boot_err) => {
                     drop(child_guard);
+                    drop(egress_proxy);
                     let stderr_snapshot = stderr_capture
                         .lock()
                         .map(|s| s.to_ascii_lowercase())
@@ -879,7 +1508,9 @@ impl ManagedEnclaveHandle {
             enclave_pubkey,
             child_vm: None,
             _boot_artifacts: vec![sealed_kernel, sealed_initramfs],
+            _verified_executables: Vec::new(),
             _cid_lease: None,
+            _egress_proxy: None,
         })
     }
 
@@ -890,10 +1521,10 @@ impl ManagedEnclaveHandle {
         authorized_client_pubkey: [u8; 32],
         extra_args: &[String],
     ) -> Result<Self, HostError> {
-        let verified_bin = verify_executable_binary(enclave_bin, None, "sb-enclave")?;
+        let verified_bin = open_and_seal_executable_binary(enclave_bin, None, "sb-enclave")?;
         let client_pk_hex = hex::encode(authorized_client_pubkey);
 
-        let mut cmd = Command::new(&verified_bin);
+        let mut cmd = Command::new(verified_bin.exec_path());
         cmd.arg("--unix-socket")
             .arg(socket_path)
             .arg("--authorized-client-pubkey-hex")
@@ -953,7 +1584,9 @@ impl ManagedEnclaveHandle {
             enclave_pubkey,
             child_vm: Some(confirmed_child),
             _boot_artifacts: Vec::new(),
+            _verified_executables: vec![verified_bin],
             _cid_lease: None,
+            _egress_proxy: None,
         })
     }
 
@@ -981,8 +1614,12 @@ impl ManagedEnclaveHandle {
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             EnclaveEndpoint::MacosVz { vm, port } => {
-                let conn_file = vm.connect_vsock_port(*port)?;
-                Ok(RawEnclaveStream::SocketFile(conn_file))
+                let (conn_file, retained_conn) =
+                    macos_vz::VzVmRuntime::connect_vsock_port(vm, *port)?;
+                Ok(RawEnclaveStream::MacosVz {
+                    file: conn_file,
+                    conn: Arc::new(retained_conn),
+                })
             }
         }
     }
@@ -1207,7 +1844,7 @@ mod macos_vz {
     #[link(name = "Foundation", kind = "framework")]
     #[link(name = "objc")]
     unsafe extern "C" {
-        static _NSConcreteStackBlock: *const c_void;
+        static _NSConcreteStackBlock: [*const c_void; 32];
 
         fn objc_getClass(name: *const c_char) -> Id;
         fn sel_registerName(name: *const c_char) -> Sel;
@@ -1433,6 +2070,36 @@ mod macos_vz {
     unsafe impl Send for VzVmRuntime {}
     unsafe impl Sync for VzVmRuntime {}
 
+    /// Keeps `VZVirtioSocketConnection` retained for the entire lifetime of `RawEnclaveStream` (`V2-C3`),
+    /// preventing `-dealloc` from tearing down the virtio-vsock stream while `dup`ed fds are active.
+    pub struct RetainedVzConnection {
+        conn_obj: Id,
+        vm: Arc<VzVmRuntime>,
+    }
+
+    unsafe impl Send for RetainedVzConnection {}
+    unsafe impl Sync for RetainedVzConnection {}
+
+    unsafe extern "C" fn release_obj_on_queue(raw_obj: *mut c_void) {
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let release_fn: unsafe extern "C" fn(Id, Sel) =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            release_fn(raw_obj as Id, sel(c"release"));
+            objc_autoreleasePoolPop(pool);
+        }
+    }
+
+    impl Drop for RetainedVzConnection {
+        fn drop(&mut self) {
+            if !self.conn_obj.is_null() {
+                unsafe {
+                    dispatch_async_f(self.vm.queue, self.conn_obj, release_obj_on_queue);
+                }
+            }
+        }
+    }
+
     struct StartContext {
         kernel_path: PathBuf,
         initrd_path: PathBuf,
@@ -1476,6 +2143,11 @@ mod macos_vz {
             let pool = objc_autoreleasePoolPush();
             let _pool_guard = DropGuard::new(pool, |p| objc_autoreleasePoolPop(p));
 
+            // Track pipe FD ownership explicitly so `NSFileHandle(closeOnDealloc: YES)` never
+            // double-closes an FD if `validateWithError:` or VM allocation fails (`V2-C3`).
+            let mut unowned_stdin_fd = Some(ctx.guest_stdin_read_fd);
+            let mut unowned_stdout_fd = Some(ctx.guest_stdout_write_fd);
+
             let setup_res: Result<Id, HostError> = (|| {
                 let msg0: unsafe extern "C" fn(Id, Sel) -> Id =
                     std::mem::transmute(objc_msgSend as *const c_void);
@@ -1515,13 +2187,28 @@ mod macos_vz {
                     ctx.guest_stdin_read_fd,
                     1,
                 );
+                if fh_read.is_null() {
+                    return Err(HostError::new(
+                        ErrorCode::InternalError,
+                        "NSFileHandle(stdin) allocation failed",
+                    ));
+                }
+                unowned_stdin_fd = None;
                 msg0(fh_read, sel(c"autorelease"));
+
                 let fh_write = init_fh(
                     msg0(cls(c"NSFileHandle"), sel(c"alloc")),
                     sel(c"initWithFileDescriptor:closeOnDealloc:"),
                     ctx.guest_stdout_write_fd,
                     1,
                 );
+                if fh_write.is_null() {
+                    return Err(HostError::new(
+                        ErrorCode::InternalError,
+                        "NSFileHandle(stdout) allocation failed",
+                    ));
+                }
+                unowned_stdout_fd = None;
                 msg0(fh_write, sel(c"autorelease"));
 
                 let serial_att = init_serial(
@@ -1637,7 +2324,7 @@ mod macos_vz {
                         };
                     let payload = Arc::new((Arc::clone(&ctx.signal), vm as usize));
                     let mut block = ArcStackBlock1 {
-                        isa: _NSConcreteStackBlock,
+                        isa: (&raw const _NSConcreteStackBlock).cast::<c_void>(),
                         flags: BLOCK_HAS_COPY_DISPOSE,
                         reserved: 0,
                         invoke: on_vm_started,
@@ -1653,8 +2340,12 @@ mod macos_vz {
                     );
                 }
                 Err(e) => {
-                    let _ = libc::close(ctx.guest_stdin_read_fd);
-                    let _ = libc::close(ctx.guest_stdout_write_fd);
+                    if let Some(fd) = unowned_stdin_fd.take() {
+                        let _ = libc::close(fd);
+                    }
+                    if let Some(fd) = unowned_stdout_fd.take() {
+                        let _ = libc::close(fd);
+                    }
                     complete_signal(&ctx.signal, Err(e));
                 }
             }
@@ -1664,11 +2355,11 @@ mod macos_vz {
     struct ConnectContext {
         vm_obj: Id,
         port: u32,
-        signal: CompletionSignal<c_int>,
+        signal: CompletionSignal<(c_int, usize)>,
     }
 
     unsafe extern "C" fn on_vsock_connected(
-        block: *mut ArcStackBlock2<CompletionSignal<c_int>>,
+        block: *mut ArcStackBlock2<CompletionSignal<(c_int, usize)>>,
         conn: Id,
         err: Id,
     ) {
@@ -1687,6 +2378,10 @@ mod macos_vz {
                 );
                 return;
             }
+            let retain_fn: unsafe extern "C" fn(Id, Sel) -> Id =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let release_fn: unsafe extern "C" fn(Id, Sel) =
+                std::mem::transmute(objc_msgSend as *const c_void);
             let fd_fn: unsafe extern "C" fn(Id, Sel) -> c_int =
                 std::mem::transmute(objc_msgSend as *const c_void);
             let src_fd = fd_fn(conn, sel(c"fileDescriptor"));
@@ -1700,8 +2395,10 @@ mod macos_vz {
                 );
                 return;
             }
+            let retained_conn = retain_fn(conn, sel(c"retain"));
             let dup_fd = libc::fcntl(src_fd, libc::F_DUPFD_CLOEXEC, 0);
             if dup_fd < 0 {
+                release_fn(retained_conn, sel(c"release"));
                 complete_signal(
                     sig,
                     Err(HostError::new(
@@ -1711,7 +2408,7 @@ mod macos_vz {
                 );
                 return;
             }
-            complete_signal(sig, Ok(dup_fd));
+            complete_signal(sig, Ok((dup_fd, retained_conn as usize)));
         }
     }
 
@@ -1741,15 +2438,16 @@ mod macos_vz {
             }
             let sock_dev = idx_fn(devs, sel(c"objectAtIndex:"), 0);
 
-            static DESC: BlockDescriptor<ArcStackBlock2<CompletionSignal<c_int>>> =
+            static DESC: BlockDescriptor<ArcStackBlock2<CompletionSignal<(c_int, usize)>>> =
                 BlockDescriptor {
                     reserved: 0,
-                    size: std::mem::size_of::<ArcStackBlock2<CompletionSignal<c_int>>>() as c_ulong,
+                    size: std::mem::size_of::<ArcStackBlock2<CompletionSignal<(c_int, usize)>>>()
+                        as c_ulong,
                     copy_helper: copy_block2,
                     dispose_helper: dispose_block2,
                 };
             let mut block = ArcStackBlock2 {
-                isa: _NSConcreteStackBlock,
+                isa: (&raw const _NSConcreteStackBlock).cast::<c_void>(),
                 flags: BLOCK_HAS_COPY_DISPOSE,
                 reserved: 0,
                 invoke: on_vsock_connected,
@@ -1862,8 +2560,11 @@ mod macos_vz {
             ))
         }
 
-        pub fn connect_vsock_port(&self, port: u32) -> Result<File, HostError> {
-            let signal = new_signal::<c_int>();
+        pub fn connect_vsock_port(
+            self: &Arc<Self>,
+            port: u32,
+        ) -> Result<(File, RetainedVzConnection), HostError> {
+            let signal = new_signal::<(c_int, usize)>();
             let ctx = Box::new(ConnectContext {
                 vm_obj: self.vm_obj,
                 port,
@@ -1876,11 +2577,19 @@ mod macos_vz {
                     connect_vsock_on_queue,
                 );
             }
-            let raw_fd = wait_signal(&signal, Duration::from_secs(15), "VZVirtioSocket connect")?;
+            let (raw_fd, conn_addr) =
+                wait_signal(&signal, Duration::from_secs(15), "VZVirtioSocket connect")?;
             apply_socket_timeouts(raw_fd);
-            // SAFETY: `raw_fd` was `F_DUPFD_CLOEXEC`'d exclusively for this caller.
+            // SAFETY: `raw_fd` was `F_DUPFD_CLOEXEC`'d exclusively for this caller;
+            // `conn_addr` was explicitly `-retain`ed on the VZ GCD queue.
             let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-            Ok(File::from(owned))
+            Ok((
+                File::from(owned),
+                RetainedVzConnection {
+                    conn_obj: conn_addr as Id,
+                    vm: Arc::clone(self),
+                },
+            ))
         }
     }
 

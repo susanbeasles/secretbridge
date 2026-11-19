@@ -3,7 +3,7 @@ pub mod manifest_io;
 pub mod vmm;
 
 use crate::capture::{ArmedCaptureProvider, DEFAULT_ARMED_COPY_TTL, execute_armed_capture};
-use crate::manifest_io::{HostError, load_manifest, save_manifest_atomic};
+use crate::manifest_io::{HostError, load_manifest, save_manifest_atomic, with_manifest_lock};
 use crate::vmm::{ManagedEnclaveHandle, RawEnclaveStream};
 use sb_proto::crypto::{constant_time_eq_32, read_raw_frame, write_raw_frame};
 use sb_proto::error::{ErrorCode, ProtoError, SanitizedError};
@@ -37,7 +37,7 @@ impl Drop for AuthenticatedHostEnvelope {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "host_op", rename_all = "kebab-case")]
+#[serde(tag = "host_op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum HostCommand {
     /// Opens an authenticated blind frame relay to the enclave's `Noise_IK` responder port (`C2`).
     /// `sb-host` never holds the client Noise keypair and never sees decrypted RPC payloads.
@@ -45,11 +45,13 @@ pub enum HostCommand {
     /// Queries host bridge liveness and the guest enclave's `Noise_IK` static public key.
     Status,
     /// Runs the 15-second native Armed Copy Hijack (`mlock` -> X25519 seal to `pk_capture_b64`),
-    /// returning only ciphertext + `CaptureInterceptMode` (`C2`, `H2`).
+    /// returning only ciphertext + `CaptureInterceptMode` (`C2`, `H2`, `V2-H4`).
     CaptureAndSeal {
         pk_capture_b64: String,
         #[serde(default)]
         ttl_ms: Option<u64>,
+        #[serde(default)]
+        notify_armed: bool,
     },
     /// Safely reads and validates `secretbridge.json` on the host (`O_NOFOLLOW`, no symlink ancestors).
     ManifestLoad { manifest_path: String },
@@ -213,6 +215,7 @@ impl HostBridge {
             HostCommand::CaptureAndSeal {
                 pk_capture_b64,
                 ttl_ms,
+                notify_armed: _,
             } => {
                 let requested = ttl_ms
                     .map(|ms| Duration::from_millis(ms.max(50)))
@@ -226,15 +229,21 @@ impl HostBridge {
                 ))
             }
             HostCommand::ManifestLoad { manifest_path } => {
-                let manifest = load_manifest(Path::new(manifest_path))?;
-                Ok(HostResponse::from_manifest(manifest))
+                let path = Path::new(manifest_path);
+                with_manifest_lock(path, || {
+                    let manifest = load_manifest(path)?;
+                    Ok(HostResponse::from_manifest(manifest))
+                })
             }
             HostCommand::ManifestSave {
                 manifest_path,
                 manifest,
             } => {
-                save_manifest_atomic(Path::new(manifest_path), manifest)?;
-                Ok(HostResponse::from_manifest(manifest.clone()))
+                let path = Path::new(manifest_path);
+                with_manifest_lock(path, || {
+                    save_manifest_atomic(path, manifest)?;
+                    Ok(HostResponse::from_manifest(manifest.clone()))
+                })
             }
             HostCommand::ManifestBind {
                 manifest_path,
@@ -246,17 +255,19 @@ impl HostBridge {
                 aws,
             } => {
                 let path = PathBuf::from(manifest_path);
-                let mut manifest = load_manifest(&path)?;
-                manifest.bind_secret(
-                    environment,
-                    name.clone(),
-                    r#ref.clone(),
-                    group.clone(),
-                    *github,
-                    *aws,
-                )?;
-                save_manifest_atomic(&path, &manifest)?;
-                Ok(HostResponse::from_manifest(manifest))
+                with_manifest_lock(&path, || {
+                    let mut manifest = load_manifest(&path)?;
+                    manifest.bind_secret(
+                        environment,
+                        name.clone(),
+                        r#ref.clone(),
+                        group.clone(),
+                        *github,
+                        *aws,
+                    )?;
+                    save_manifest_atomic(&path, &manifest)?;
+                    Ok(HostResponse::from_manifest(manifest))
+                })
             }
             HostCommand::ManifestMarkAbsent {
                 manifest_path,
@@ -264,10 +275,12 @@ impl HostBridge {
                 name,
             } => {
                 let path = PathBuf::from(manifest_path);
-                let mut manifest = load_manifest(&path)?;
-                manifest.mark_secret_absent(environment, name)?;
-                save_manifest_atomic(&path, &manifest)?;
-                Ok(HostResponse::from_manifest(manifest))
+                with_manifest_lock(&path, || {
+                    let mut manifest = load_manifest(&path)?;
+                    manifest.mark_secret_absent(environment, name)?;
+                    save_manifest_atomic(&path, &manifest)?;
+                    Ok(HostResponse::from_manifest(manifest))
+                })
             }
         }
     }
@@ -442,6 +455,23 @@ impl HostBridge {
                     write_json_line(&mut stream, &HostResponse::err(err.into_sanitized()));
                 }
             },
+            HostCommand::CaptureAndSeal {
+                ttl_ms,
+                notify_armed: true,
+                ..
+            } => {
+                let requested = ttl_ms
+                    .map(|ms| Duration::from_millis(ms.max(50)))
+                    .unwrap_or(DEFAULT_ARMED_COPY_TTL);
+                let ttl = requested.min(DEFAULT_ARMED_COPY_TTL);
+                let _ = stream.set_write_timeout(Some(ttl + Duration::from_secs(10)));
+                let ack = format!("{{\"armed\":true,\"ttl_ms\":{}}}\n", ttl.as_millis());
+                if stream.write_all(ack.as_bytes()).is_err() || stream.flush().is_err() {
+                    return;
+                }
+                let resp = self.execute_command(&env.command);
+                write_json_line(&mut stream, &resp);
+            }
             other => {
                 let resp = self.execute_command(other);
                 write_json_line(&mut stream, &resp);
@@ -559,14 +589,17 @@ mod tests {
     }
 
     fn make_test_dir() -> PathBuf {
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let vm_out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("crates dir")
             .parent()
             .expect("repo root")
-            .join("vm/out")
-            .join(format!("test-{}", Uuid::new_v4().simple()));
+            .join("vm/out");
+        std::fs::create_dir_all(&vm_out).expect("create vm/out");
+        let _ = std::fs::set_permissions(&vm_out, std::fs::Permissions::from_mode(0o700));
+        let base = vm_out.join(format!("test-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&base).expect("create test scratch dir under vm/out");
+        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
         base
     }
 
@@ -597,8 +630,15 @@ mod tests {
         let loaded = load_manifest(&manifest_path).unwrap();
         assert_eq!(loaded, manifest);
 
-        // Leaf symlink must be rejected on both load and save
-        let symlink_path = dir.join("evil-link.json");
+        // Arbitrary filenames must be rejected (`V2-M3`)
+        let arbitrary_path = dir.join("evil-link.json");
+        assert!(load_manifest(&arbitrary_path).is_err());
+        assert!(save_manifest_atomic(&arbitrary_path, &manifest).is_err());
+
+        // Leaf symlink named `secretbridge.json` must be rejected on both load and save
+        let leaf_link_dir = dir.join("leaf-link-dir");
+        std::fs::create_dir(&leaf_link_dir).unwrap();
+        let symlink_path = leaf_link_dir.join("secretbridge.json");
         std::os::unix::fs::symlink(&manifest_path, &symlink_path).unwrap();
         assert!(load_manifest(&symlink_path).is_err());
         assert!(save_manifest_atomic(&symlink_path, &manifest).is_err());
@@ -614,8 +654,10 @@ mod tests {
         assert!(load_manifest(&via_symlink_dir).is_err());
         assert!(save_manifest_atomic(&via_symlink_dir, &manifest).is_err());
 
-        // Named pipe (FIFO) with no writer must return immediately (`O_NONBLOCK`) and reject non-regular file
-        let fifo_path = dir.join("fifo-manifest.json");
+        // Named pipe (FIFO) named `secretbridge.json` with no writer must return immediately (`O_NONBLOCK`)
+        let fifo_dir = dir.join("fifo-dir");
+        std::fs::create_dir(&fifo_dir).unwrap();
+        let fifo_path = fifo_dir.join("secretbridge.json");
         let fifo_c = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
         let rc = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
         assert_eq!(rc, 0);
@@ -819,7 +861,8 @@ mod tests {
         let enc_shutdown = Arc::new(AtomicBool::new(false));
         let enc_shutdown_srv = Arc::clone(&enc_shutdown);
         let enc_sock_srv = enclave_sock.clone();
-        let enc_priv = enclave_kp.private.clone();
+        let enc_priv =
+            Arc::new(sb_enclave::mem_secret::MemSecret::from_slice(&*enclave_kp.private).unwrap());
         let cli_pub = client_kp.public;
         let enc_thread = std::thread::spawn(move || {
             serve_unix_listener(&enc_sock_srv, svc, enc_priv, cli_pub, enc_shutdown_srv).unwrap();
@@ -885,14 +928,14 @@ mod tests {
                     aws_secret_access_key: None,
                     aws_session_token: None,
                     allowed_github_hosts: vec![],
-                    allowed_github_owners: vec![],
-                    allowed_aws_account_ids: vec![],
+                    allowed_github_owners: vec!["anthonyvespoli".into()],
+                    allowed_aws_account_ids: vec!["123456789012".parse().unwrap()],
                 },
             },
         );
         assert!(cfg_resp.ok);
 
-        // 3. Three-step E2E Armed Copy Hijack:
+        // 3. Three-step E2E Armed Copy Hijack (with `notify_armed: true` readiness ack -- `V2-H4`):
         //    (a) IDE -> Enclave (E2E Noise_IK): BeginCapture
         let begin_resp = call_enclave_over_blind_tunnel(
             &ide_sock,
@@ -914,15 +957,29 @@ mod tests {
             panic!("expected CaptureStarted");
         };
 
-        //    (b) IDE -> sb-host: CaptureAndSeal (`mlock` -> X25519 seal to `pk_capture_b64`, ciphertext only)
-        let seal_resp = send_host_cmd(
-            &ide_sock,
-            &auth_hex,
-            HostCommand::CaptureAndSeal {
-                pk_capture_b64: challenge.pk_capture_b64,
-                ttl_ms: Some(challenge.expires_in_ms),
-            },
-        );
+        //    (b) IDE -> sb-host: CaptureAndSeal (`notify_armed: true` emits `{"armed":true,...}` line first)
+        let seal_resp: HostResponse = {
+            let mut stream = UnixStream::connect(&ide_sock).unwrap();
+            let env = AuthenticatedHostEnvelope {
+                auth_token_hex: auth_hex.clone(),
+                command: HostCommand::CaptureAndSeal {
+                    pk_capture_b64: challenge.pk_capture_b64,
+                    ttl_ms: Some(challenge.expires_in_ms),
+                    notify_armed: true,
+                },
+            };
+            let mut line = serde_json::to_vec(&env).unwrap();
+            line.push(b'\n');
+            stream.write_all(&line).unwrap();
+            stream.flush().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut ack_line = String::new();
+            reader.read_line(&mut ack_line).unwrap();
+            assert!(ack_line.contains("\"armed\":true"));
+            let mut resp_line = String::new();
+            reader.read_line(&mut resp_line).unwrap();
+            serde_json::from_str(&resp_line).unwrap()
+        };
         assert!(seal_resp.ok);
         let seal_wire = serde_json::to_string(&seal_resp).unwrap();
         assert!(!seal_wire.contains("copied-secret-from-mlock-never-in-jvm"));
@@ -976,5 +1033,64 @@ mod tests {
         enc_shutdown.store(true, Ordering::Release);
         host_thread.join().unwrap();
         enc_thread.join().unwrap();
+    }
+
+    #[test]
+    fn vsock_egress_connect_validator_and_sealed_exec_reject_ssrf_and_tampering_v2_h6() {
+        use crate::vmm::{
+            is_public_unicast_ip, open_and_seal_executable_binary, validate_https_connect_target,
+        };
+
+        assert_eq!(
+            validate_https_connect_target("CONNECT api.github.com:443 HTTP/1.1\r\n").unwrap(),
+            "api.github.com"
+        );
+        assert_eq!(
+            validate_https_connect_target(
+                "CONNECT secretsmanager.us-east-1.amazonaws.com:443 HTTP/1.1"
+            )
+            .unwrap(),
+            "secretsmanager.us-east-1.amazonaws.com"
+        );
+        // Non-443 ports, non-CONNECT verbs, IP literals, hex IPv4, and localhost must fail closed
+        assert!(validate_https_connect_target("CONNECT api.github.com:80 HTTP/1.1").is_err());
+        assert!(validate_https_connect_target("CONNECT api.github.com:8443 HTTP/1.1").is_err());
+        assert!(validate_https_connect_target("GET https://api.github.com/ HTTP/1.1").is_err());
+        assert!(validate_https_connect_target("CONNECT 127.0.0.1:443 HTTP/1.1").is_err());
+        assert!(validate_https_connect_target("CONNECT 0x7f.0.0.1:443 HTTP/1.1").is_err());
+        assert!(validate_https_connect_target("CONNECT localhost:443 HTTP/1.1").is_err());
+        assert!(validate_https_connect_target("CONNECT [::1]:443 HTTP/1.1").is_err());
+
+        // IPv6 transition prefixes (NAT64, 6to4, Teredo) and loopback/CGNAT must be rejected
+        assert!(!is_public_unicast_ip("64:ff9b::7f00:1".parse().unwrap()));
+        assert!(!is_public_unicast_ip("2002:7f00:0001::1".parse().unwrap()));
+        assert!(!is_public_unicast_ip(
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2".parse().unwrap()
+        ));
+        assert!(!is_public_unicast_ip("100.64.0.1".parse().unwrap()));
+        assert!(is_public_unicast_ip("140.82.112.6".parse().unwrap()));
+
+        let dir = make_test_dir();
+        let _dir_guard = DropGuard::new(dir.clone(), |d| {
+            let _ = std::fs::remove_dir_all(d);
+        });
+        let bin_path = dir.join("mock-vmm");
+        let bin_bytes = b"#!/bin/sh\nexit 0\n";
+        std::fs::write(&bin_path, bin_bytes).unwrap();
+        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let digest: [u8; 32] = Sha256::digest(bin_bytes).into();
+        let sealed_exec = open_and_seal_executable_binary(&bin_path, Some(&digest), "VMM").unwrap();
+        std::fs::write(&bin_path, b"#!/bin/sh\necho tampered\n").unwrap();
+        let exec_contents = std::fs::read(sealed_exec.exec_path()).unwrap();
+        assert_eq!(exec_contents.as_slice(), bin_bytes);
+
+        // World-writable ancestor directory must be rejected
+        let ww_dir = dir.join("world-writable");
+        std::fs::create_dir(&ww_dir).unwrap();
+        std::fs::set_permissions(&ww_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let ww_bin = ww_dir.join("evil-vmm");
+        std::fs::write(&ww_bin, bin_bytes).unwrap();
+        std::fs::set_permissions(&ww_bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(open_and_seal_executable_binary(&ww_bin, None, "VMM").is_err());
     }
 }

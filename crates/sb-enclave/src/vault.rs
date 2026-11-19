@@ -180,19 +180,41 @@ pub struct RustCallStatus {
     pub error_buf: RustBuffer,
 }
 
+pub type UniffiContractVersionFn = unsafe extern "C" fn() -> u32;
 pub type RustBufferFromBytesFn =
     unsafe extern "C" fn(ForeignBytes, *mut RustCallStatus) -> RustBuffer;
 pub type RustBufferFreeFn = unsafe extern "C" fn(RustBuffer, *mut RustCallStatus);
 pub type UniffiBufToBufFn = unsafe extern "C" fn(RustBuffer, *mut RustCallStatus) -> RustBuffer;
-pub type UniffiBufToVoidFn = unsafe extern "C" fn(RustBuffer, *mut RustCallStatus);
+pub type UniffiAsyncBufFn = unsafe extern "C" fn(RustBuffer) -> u64;
+pub type UniffiFutureContinuationCallback = extern "C" fn(callback_data: u64, poll_result: i8);
+pub type UniffiFuturePollRustBufferFn = unsafe extern "C" fn(
+    handle: u64,
+    callback: UniffiFutureContinuationCallback,
+    callback_data: u64,
+);
+pub type UniffiFutureCompleteRustBufferFn =
+    unsafe extern "C" fn(handle: u64, out_status: *mut RustCallStatus) -> RustBuffer;
+pub type UniffiFutureFreeRustBufferFn = unsafe extern "C" fn(handle: u64);
+pub type UniffiReleaseClientFn = unsafe extern "C" fn(u64, *mut RustCallStatus);
+
+#[derive(Clone, Copy)]
+pub enum UniffiBufCall {
+    Sync(UniffiBufToBufFn),
+    Async {
+        start: UniffiAsyncBufFn,
+        poll: UniffiFuturePollRustBufferFn,
+        complete: UniffiFutureCompleteRustBufferFn,
+        free: UniffiFutureFreeRustBufferFn,
+    },
+}
 
 #[derive(Clone, Copy)]
 pub struct UniffiSymbolTable {
     pub rustbuffer_from_bytes: RustBufferFromBytesFn,
     pub rustbuffer_free: RustBufferFreeFn,
-    pub init_client: UniffiBufToBufFn,
-    pub invoke_sync: UniffiBufToBufFn,
-    pub release_client: UniffiBufToVoidFn,
+    pub init_client: UniffiBufCall,
+    pub invoke: UniffiBufCall,
+    pub release_client: UniffiReleaseClientFn,
 }
 
 enum CoreFfiBackend {
@@ -293,7 +315,26 @@ unsafe fn zeroize_and_free_rustbuffer(free_fn: RustBufferFreeFn, buf: RustBuffer
     }
 }
 
-fn unescape_json_string_to_mem_secret(quoted_json: &[u8]) -> Result<MemSecret, EnclaveError> {
+fn parse_hex_u16_4(raw4: &[u8]) -> Option<u16> {
+    if raw4.len() != 4 {
+        return None;
+    }
+    let mut acc = 0u16;
+    for &b in raw4 {
+        let nibble = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return None,
+        };
+        acc = (acc << 4) | u16::from(nibble);
+    }
+    Some(acc)
+}
+
+pub(crate) fn unescape_json_string_to_mem_secret(
+    quoted_json: &[u8],
+) -> Result<MemSecret, EnclaveError> {
     let trimmed = std::str::from_utf8(quoted_json)
         .map_err(|_| EnclaveError::new(ErrorCode::UpstreamFailure, "invalid UTF-8 from core FFI"))?
         .trim();
@@ -342,7 +383,7 @@ fn unescape_json_string_to_mem_secret(quoted_json: &[u8]) -> Result<MemSecret, E
                             "truncated unicode escape in secret response",
                         ));
                     }
-                    let hi = u16::from_str_radix(&inner[i + 1..i + 5], 16).map_err(|_| {
+                    let hi = parse_hex_u16_4(&bytes[i + 1..i + 5]).ok_or_else(|| {
                         EnclaveError::new(ErrorCode::UpstreamFailure, "bad unicode escape")
                     })?;
                     i += 4;
@@ -353,7 +394,7 @@ fn unescape_json_string_to_mem_secret(quoted_json: &[u8]) -> Result<MemSecret, E
                                 "unpaired high surrogate in secret response",
                             ));
                         }
-                        let lo = u16::from_str_radix(&inner[i + 3..i + 7], 16).map_err(|_| {
+                        let lo = parse_hex_u16_4(&bytes[i + 3..i + 7]).ok_or_else(|| {
                             EnclaveError::new(ErrorCode::UpstreamFailure, "bad low surrogate")
                         })?;
                         if !(0xDC00..=0xDFFF).contains(&lo) {
@@ -782,6 +823,24 @@ impl UniffiCoreVaultProvider {
         // SAFETY: `lib` stays alive inside `CoreFfiBackend::Dynamic` for the entire lifetime of `Self`,
         // and `Library::drop` only runs when `Self` is dropped.
         let symbols = unsafe {
+            let contract_version_fn = *lib
+                .get::<UniffiContractVersionFn>(
+                    b"ffi_op_uniffi_core_uniffi_contract_version\0",
+                )
+                .map_err(|_| {
+                    EnclaveError::new(
+                        ErrorCode::UpstreamFailure,
+                        "missing ffi_op_uniffi_core_uniffi_contract_version in libop_uniffi_core.so",
+                    )
+                })?;
+            let contract_version = contract_version_fn();
+            if !(26..=32).contains(&contract_version) {
+                return Err(EnclaveError::new(
+                    ErrorCode::UpstreamFailure,
+                    "unsupported libop_uniffi_core.so UniFFI contract version (expected 26..=32 for 64-bit RustBuffer ABI)",
+                ));
+            }
+
             let rustbuffer_from_bytes = *lib
                 .get::<RustBufferFromBytesFn>(b"ffi_op_uniffi_core_rustbuffer_from_bytes\0")
                 .map_err(|_| {
@@ -798,27 +857,76 @@ impl UniffiCoreVaultProvider {
                         "missing ffi_op_uniffi_core_rustbuffer_free in libop_uniffi_core.so",
                     )
                 })?;
-            let init_client = *lib
-                .get::<UniffiBufToBufFn>(b"uniffi_op_uniffi_core_fn_func_init_client_blocking\0")
-                .or_else(|_| {
-                    lib.get::<UniffiBufToBufFn>(b"uniffi_op_uniffi_core_fn_func_init_client\0")
-                })
+
+            let future_poll = *lib
+                .get::<UniffiFuturePollRustBufferFn>(
+                    b"ffi_op_uniffi_core_rust_future_poll_rust_buffer\0",
+                )
                 .map_err(|_| {
                     EnclaveError::new(
                         ErrorCode::UpstreamFailure,
-                        "missing uniffi_op_uniffi_core_fn_func_init_client_blocking in libop_uniffi_core.so",
+                        "missing ffi_op_uniffi_core_rust_future_poll_rust_buffer in libop_uniffi_core.so",
                     )
                 })?;
-            let invoke_sync = *lib
-                .get::<UniffiBufToBufFn>(b"uniffi_op_uniffi_core_fn_func_invoke_sync\0")
+            let future_complete = *lib
+                .get::<UniffiFutureCompleteRustBufferFn>(
+                    b"ffi_op_uniffi_core_rust_future_complete_rust_buffer\0",
+                )
                 .map_err(|_| {
                     EnclaveError::new(
                         ErrorCode::UpstreamFailure,
-                        "missing uniffi_op_uniffi_core_fn_func_invoke_sync in libop_uniffi_core.so",
+                        "missing ffi_op_uniffi_core_rust_future_complete_rust_buffer in libop_uniffi_core.so",
                     )
                 })?;
+            let future_free = *lib
+                .get::<UniffiFutureFreeRustBufferFn>(
+                    b"ffi_op_uniffi_core_rust_future_free_rust_buffer\0",
+                )
+                .map_err(|_| {
+                    EnclaveError::new(
+                        ErrorCode::UpstreamFailure,
+                        "missing ffi_op_uniffi_core_rust_future_free_rust_buffer in libop_uniffi_core.so",
+                    )
+                })?;
+
+            let init_client_start = *lib
+                .get::<UniffiAsyncBufFn>(b"uniffi_op_uniffi_core_fn_func_init_client\0")
+                .map_err(|_| {
+                    EnclaveError::new(
+                        ErrorCode::UpstreamFailure,
+                        "missing uniffi_op_uniffi_core_fn_func_init_client in libop_uniffi_core.so",
+                    )
+                })?;
+            let init_client = UniffiBufCall::Async {
+                start: init_client_start,
+                poll: future_poll,
+                complete: future_complete,
+                free: future_free,
+            };
+
+            let invoke = if let Ok(sync_fn) =
+                lib.get::<UniffiBufToBufFn>(b"uniffi_op_uniffi_core_fn_func_invoke_sync\0")
+            {
+                UniffiBufCall::Sync(*sync_fn)
+            } else {
+                let async_invoke = *lib
+                    .get::<UniffiAsyncBufFn>(b"uniffi_op_uniffi_core_fn_func_invoke\0")
+                    .map_err(|_| {
+                        EnclaveError::new(
+                            ErrorCode::UpstreamFailure,
+                            "missing invoke_sync/invoke in libop_uniffi_core.so",
+                        )
+                    })?;
+                UniffiBufCall::Async {
+                    start: async_invoke,
+                    poll: future_poll,
+                    complete: future_complete,
+                    free: future_free,
+                }
+            };
+
             let release_client = *lib
-                .get::<UniffiBufToVoidFn>(b"uniffi_op_uniffi_core_fn_func_release_client\0")
+                .get::<UniffiReleaseClientFn>(b"uniffi_op_uniffi_core_fn_func_release_client\0")
                 .map_err(|_| {
                     EnclaveError::new(
                         ErrorCode::UpstreamFailure,
@@ -829,7 +937,7 @@ impl UniffiCoreVaultProvider {
                 rustbuffer_from_bytes,
                 rustbuffer_free,
                 init_client,
-                invoke_sync,
+                invoke,
                 release_client,
             }
         };
@@ -893,7 +1001,7 @@ impl UniffiCoreVaultProvider {
 
     fn call_buf_to_mem_secret(
         &self,
-        func: UniffiBufToBufFn,
+        target: UniffiBufCall,
         arg_payload: &MemSecret,
         err_code_on_call_error: ErrorCode,
         err_msg: &'static str,
@@ -901,9 +1009,18 @@ impl UniffiCoreVaultProvider {
         let syms = self.symbols();
         let arg_buf = self.lower_bytes_to_rustbuffer(arg_payload.as_bytes())?;
         let mut status = RustCallStatus::default();
-        // SAFETY: UniFFI `uniffi_*_fn_func_*` consumes `arg_buf` by value and populates `status`
-        // or returns an owned `RustBuffer` when `status.code == 0`.
-        let ret_buf = unsafe { func(arg_buf, &raw mut status) };
+        let ret_buf = match target {
+            UniffiBufCall::Sync(func) => {
+                // SAFETY: Sync UniFFI function consumes `arg_buf` and populates `status` / returns `RustBuffer`.
+                unsafe { func(arg_buf, &raw mut status) }
+            }
+            UniffiBufCall::Async {
+                start,
+                poll,
+                complete,
+                free,
+            } => drive_uniffi_rustbuffer_future(arg_buf, start, poll, complete, free, &mut status)?,
+        };
         if status.code != 0 {
             // SAFETY: Free `status.error_buf` without echoing raw upstream error text across vsock.
             unsafe {
@@ -930,15 +1047,12 @@ impl UniffiCoreVaultProvider {
 
     fn call_release_client(&self, client_id: u64) {
         let syms = self.symbols();
-        let rel_json = format!("{{\"client_id\":{client_id}}}");
-        if let Ok(arg_buf) = self.lower_bytes_to_rustbuffer(rel_json.as_bytes()) {
-            let mut status = RustCallStatus::default();
-            // SAFETY: `release_client` consumes `arg_buf` and returns `()` void (`C3`).
-            unsafe {
-                (syms.release_client)(arg_buf, &raw mut status);
-                if status.code != 0 {
-                    zeroize_and_free_rustbuffer(syms.rustbuffer_free, status.error_buf);
-                }
+        let mut status = RustCallStatus::default();
+        // SAFETY: `release_client(client_id: u64, *mut RustCallStatus)` takes `client_id` directly.
+        unsafe {
+            (syms.release_client)(client_id, &raw mut status);
+            if status.code != 0 {
+                zeroize_and_free_rustbuffer(syms.rustbuffer_free, status.error_buf);
             }
         }
     }
@@ -1010,12 +1124,125 @@ impl UniffiCoreVaultProvider {
     fn invoke_raw_envelope(&self, envelope_mem: &MemSecret) -> Result<MemSecret, EnclaveError> {
         let syms = self.symbols();
         self.call_buf_to_mem_secret(
-            syms.invoke_sync,
+            syms.invoke,
             envelope_mem,
             ErrorCode::UpstreamFailure,
             "1Password SDK Core invocation failed",
         )
     }
+}
+
+struct UniffiFutureWaker {
+    poll_state: std::sync::Mutex<Option<i8>>,
+    cvar: std::sync::Condvar,
+}
+
+impl UniffiFutureWaker {
+    fn new() -> Self {
+        Self {
+            poll_state: std::sync::Mutex::new(None),
+            cvar: std::sync::Condvar::new(),
+        }
+    }
+}
+
+extern "C" fn uniffi_future_continuation_cb(callback_data: u64, poll_result: i8) {
+    if callback_data == 0 {
+        return;
+    }
+    // SAFETY: `callback_data` was produced by `Arc::into_raw` right before `poll` and is consumed once per callback.
+    let waker =
+        unsafe { std::sync::Arc::from_raw(callback_data as usize as *const UniffiFutureWaker) };
+    if let Ok(mut guard) = waker.poll_state.lock() {
+        *guard = Some(poll_result);
+        waker.cvar.notify_all();
+    }
+}
+
+fn drive_uniffi_rustbuffer_future(
+    arg_buf: RustBuffer,
+    start: UniffiAsyncBufFn,
+    poll: UniffiFuturePollRustBufferFn,
+    complete: UniffiFutureCompleteRustBufferFn,
+    free: UniffiFutureFreeRustBufferFn,
+    out_status: &mut RustCallStatus,
+) -> Result<RustBuffer, EnclaveError> {
+    use std::time::Duration;
+
+    // SAFETY: `start` consumes `arg_buf` and returns an owned UniFFI `RustFuture` handle.
+    let handle = unsafe { start(arg_buf) };
+    if handle == 0 {
+        return Err(EnclaveError::new(
+            ErrorCode::UpstreamFailure,
+            "UniFFI async function returned null future handle",
+        ));
+    }
+    let handle_guard = DropGuard::new(handle, |h| {
+        // SAFETY: Every UniFFI `RustFuture` handle must be freed once via `rust_future_free_*`.
+        unsafe {
+            free(h);
+        }
+    });
+
+    let waker = std::sync::Arc::new(UniffiFutureWaker::new());
+    const MAX_POLL_ROUNDS: usize = 4_096;
+    for _ in 0..MAX_POLL_ROUNDS {
+        {
+            let mut guard = waker
+                .poll_state
+                .lock()
+                .map_err(|_| EnclaveError::new(ErrorCode::InternalError, "waker lock poisoned"))?;
+            *guard = None;
+        }
+        let cb_data = std::sync::Arc::into_raw(std::sync::Arc::clone(&waker)) as usize as u64;
+        // SAFETY: `handle_guard` is live; `uniffi_future_continuation_cb` reclaims `cb_data` once.
+        unsafe {
+            poll(*handle_guard, uniffi_future_continuation_cb, cb_data);
+        }
+
+        let mut guard = waker
+            .poll_state
+            .lock()
+            .map_err(|_| EnclaveError::new(ErrorCode::InternalError, "waker lock poisoned"))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        while guard.is_none() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(EnclaveError::new(
+                    ErrorCode::UpstreamFailure,
+                    "timed out polling 1Password UniFFI async future",
+                ));
+            }
+            let (next_guard, _) = waker
+                .cvar
+                .wait_timeout(guard, deadline - now)
+                .map_err(|_| EnclaveError::new(ErrorCode::InternalError, "waker wait poisoned"))?;
+            guard = next_guard;
+        }
+        match *guard {
+            Some(0) => {
+                drop(guard);
+                // SAFETY: `poll` reported `READY (0)`, so `complete` may be called once before `free`.
+                let ret = unsafe { complete(*handle_guard, &raw mut *out_status) };
+                return Ok(ret);
+            }
+            Some(1) => {
+                // `WAKE (1)`: poll again.
+                continue;
+            }
+            _ => {
+                return Err(EnclaveError::new(
+                    ErrorCode::UpstreamFailure,
+                    "unexpected UniFFI future poll status",
+                ));
+            }
+        }
+    }
+
+    Err(EnclaveError::new(
+        ErrorCode::UpstreamFailure,
+        "exceeded maximum UniFFI async poll iterations",
+    ))
 }
 
 fn parse_client_id_from_mem_secret(resp: &MemSecret) -> Result<u64, EnclaveError> {

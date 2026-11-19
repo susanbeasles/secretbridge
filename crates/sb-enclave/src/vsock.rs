@@ -1,4 +1,5 @@
 use crate::error::EnclaveError;
+use crate::mem_secret::MemSecret;
 use crate::service::EnclaveService;
 use sb_proto::crypto::NoiseSession;
 use sb_proto::error::{ErrorCode, ProtoError, SanitizedError};
@@ -8,10 +9,31 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const DEFAULT_VSOCK_PORT: u32 = 5190;
 const MAX_CONCURRENT_SESSIONS: usize = 16;
+
+/// Enclave `Noise_IK` static identity whose 32-byte private key resides strictly inside
+/// `memfd_secret(2)` / `mlock(2)` + `MADV_DONTDUMP` RAM (`MemSecret`, `V2-C1`).
+#[derive(Clone)]
+pub struct MlockedNoiseIdentity {
+    pub private: Arc<MemSecret>,
+    pub public: [u8; 32],
+}
+
+/// Generates a fresh per-boot ephemeral `Noise_IK` static keypair inside locked enclave RAM (`V2-C1`).
+/// Never writes any private key material to `initramfs` or host disk.
+pub fn generate_ephemeral_enclave_identity() -> Result<MlockedNoiseIdentity, EnclaveError> {
+    let mut kp = sb_proto::crypto::generate_noise_keypair()?;
+    let locked_priv = MemSecret::from_slice(&*kp.private)?;
+    let pub_key = kp.public;
+    kp.private.zeroize();
+    Ok(MlockedNoiseIdentity {
+        private: Arc::new(locked_priv),
+        public: pub_key,
+    })
+}
 
 /// Parses a 64-character hex Noise static public key (e.g. from kernel cmdline `sb.client_pubkey=`).
 pub fn parse_pubkey_hex(hex_str: &str) -> Result<[u8; 32], EnclaveError> {
@@ -42,21 +64,24 @@ pub fn extract_cmdline_client_pubkey(cmdline: &str) -> Option<&str> {
     None
 }
 
-/// Extracts and validates `sb.vsock_port=<1..=65535>` from `/proc/cmdline`.
-pub fn extract_cmdline_vsock_port(cmdline: &str) -> Result<Option<u32>, EnclaveError> {
+fn extract_cmdline_port_param(
+    cmdline: &str,
+    prefix: &str,
+    label: &str,
+) -> Result<Option<u32>, EnclaveError> {
     let mut found: Option<u32> = None;
     for token in cmdline.split_whitespace() {
-        if let Some(val) = token.strip_prefix("sb.vsock_port=") {
+        if let Some(val) = token.strip_prefix(prefix) {
             let port = val.parse::<u32>().map_err(|_| {
                 EnclaveError::new(
                     ErrorCode::Validation,
-                    "invalid sb.vsock_port integer on kernel command line",
+                    format!("invalid {label} integer on kernel command line"),
                 )
             })?;
             if !(1..=65_535).contains(&port) {
                 return Err(EnclaveError::new(
                     ErrorCode::Validation,
-                    "sb.vsock_port on kernel command line must be in 1..=65535",
+                    format!("{label} on kernel command line must be in 1..=65535"),
                 ));
             }
             found = Some(port);
@@ -65,108 +90,28 @@ pub fn extract_cmdline_vsock_port(cmdline: &str) -> Result<Option<u32>, EnclaveE
     Ok(found)
 }
 
+/// Extracts and validates `sb.vsock_port=<1..=65535>` from `/proc/cmdline`.
+pub fn extract_cmdline_vsock_port(cmdline: &str) -> Result<Option<u32>, EnclaveError> {
+    extract_cmdline_port_param(cmdline, "sb.vsock_port=", "sb.vsock_port")
+}
+
+/// Extracts and validates `sb.egress_vsock_port=<1..=65535>` from `/proc/cmdline`.
+pub fn extract_cmdline_egress_vsock_port(cmdline: &str) -> Result<Option<u32>, EnclaveError> {
+    extract_cmdline_port_param(cmdline, "sb.egress_vsock_port=", "sb.egress_vsock_port")
+}
+
 /// Checks whether an exact space-delimited token (e.g. `sb.net_fallback=qemu_slirp`) appears on `/proc/cmdline`.
 pub fn cmdline_has_token(cmdline: &str, expected_token: &str) -> bool {
     cmdline.split_whitespace().any(|tok| tok == expected_token)
 }
 
-pub const DEFAULT_ENCLAVE_KEY_PATH: &str = "/etc/secretbridge/enclave_noise.key";
-
-/// Generates a persistent 32-byte X25519 enclave static identity (`0400`, `O_NOFOLLOW`) for
-/// sealing inside `initramfs` (or local dev key storage) and writes its 64-hex public key to `pub_hex_path`.
-pub fn write_generated_enclave_identity(
-    priv_path: &Path,
-    pub_hex_path: &Path,
-) -> Result<[u8; 32], EnclaveError> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let kp = sb_proto::crypto::generate_noise_keypair()?;
-    if let Some(parent) = priv_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            EnclaveError::new(
-                ErrorCode::InternalError,
-                format!("failed creating enclave identity directory: {e}"),
-            )
-        })?;
-    }
-    if let Some(pub_parent) = pub_hex_path.parent()
-        && !pub_parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(pub_parent).map_err(|e| {
-            EnclaveError::new(
-                ErrorCode::InternalError,
-                format!("failed creating enclave pubkey directory: {e}"),
-            )
-        })?;
-    }
-
-    let _ = std::fs::remove_file(priv_path);
-    let mut priv_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o400)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(priv_path)
-        .map_err(|e| {
-            EnclaveError::new(
-                ErrorCode::InternalError,
-                format!("failed creating enclave static key file: {e}"),
-            )
-        })?;
-    std::fs::set_permissions(priv_path, std::fs::Permissions::from_mode(0o400)).map_err(|e| {
-        EnclaveError::new(
-            ErrorCode::InternalError,
-            format!("failed setting 0400 mode on enclave static key: {e}"),
-        )
-    })?;
-    priv_file.write_all(&*kp.private).map_err(|e| {
-        EnclaveError::new(
-            ErrorCode::InternalError,
-            format!("failed writing enclave static key: {e}"),
-        )
-    })?;
-    priv_file.sync_all().map_err(|e| {
-        EnclaveError::new(
-            ErrorCode::InternalError,
-            format!("failed syncing enclave static key: {e}"),
-        )
-    })?;
-
-    let mut pub_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(pub_hex_path)
-        .map_err(|e| {
-            EnclaveError::new(
-                ErrorCode::InternalError,
-                format!("failed creating enclave pubkey file: {e}"),
-            )
-        })?;
-    writeln!(pub_file, "{}", hex::encode(kp.public)).map_err(|e| {
-        EnclaveError::new(
-            ErrorCode::InternalError,
-            format!("failed writing enclave pubkey hex: {e}"),
-        )
-    })?;
-    Ok(kp.public)
-}
-
-/// Loads a provisioned 32-byte X25519 enclave static keypair (`O_NOFOLLOW | O_NONBLOCK`, owner-only mode)
-/// so the guest enclave maintains a deterministic authenticated identity across managed restarts.
-/// When `shred_after_read` is true (guest PID 1), overwrites and unlinks the `tmpfs` copy immediately.
-pub fn load_enclave_static_keypair(
-    key_path: &Path,
-    shred_after_read: bool,
-) -> Result<sb_proto::crypto::StaticKeypair, EnclaveError> {
+/// Loads an optional out-of-band 32-byte X25519 enclave static key file (`O_NOFOLLOW | O_NONBLOCK`,
+/// owner-only mode) directly into locked `MemSecret` RAM (used only when explicitly passed via
+/// `--enclave-key-file` on external HSM/volume-mounted enclaves; never embedded in `initramfs`).
+pub fn load_enclave_static_keypair(key_path: &Path) -> Result<MlockedNoiseIdentity, EnclaveError> {
     use std::ffi::CString;
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let c_path = CString::new(key_path.as_os_str().as_bytes())
         .map_err(|_| EnclaveError::new(ErrorCode::Validation, "invalid enclave key path"))?;
@@ -181,7 +126,7 @@ pub fn load_enclave_static_keypair(
         return Err(EnclaveError::new(
             ErrorCode::Unauthorized,
             format!(
-                "missing provisioned enclave static key at {} (build initramfs with vm/build-initramfs.sh or pass --enclave-key-file)",
+                "unable to open enclave static key at {}",
                 key_path.display()
             ),
         ));
@@ -208,6 +153,12 @@ pub fn load_enclave_static_keypair(
             "enclave static key file must be exactly 32 raw bytes",
         ));
     }
+    let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe {
+            let _ = libc::fcntl(raw_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
 
     let mut priv_bytes = Zeroizing::new([0u8; 32]);
     file.read_exact(&mut *priv_bytes).map_err(|e| {
@@ -218,20 +169,97 @@ pub fn load_enclave_static_keypair(
     })?;
     drop(file);
 
-    if shred_after_read {
-        let _ = std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600));
-        if let Ok(mut wipe_file) = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(key_path)
-        {
-            let _ = wipe_file.write_all(&[0u8; 32]);
-            let _ = wipe_file.sync_all();
-        }
-        let _ = std::fs::remove_file(key_path);
-    }
+    let derived = sb_proto::crypto::derive_noise_keypair_from_private(*priv_bytes)?;
+    let locked_priv = MemSecret::from_slice(&*priv_bytes)?;
+    Ok(MlockedNoiseIdentity {
+        private: Arc::new(locked_priv),
+        public: derived.public,
+    })
+}
 
-    sb_proto::crypto::derive_noise_keypair_from_private(*priv_bytes).map_err(EnclaveError::from)
+/// Binds a guest-internal loopback proxy (`127.0.0.1:0`) forwarding HTTPS `CONNECT` streams over
+/// `AF_VSOCK` (`VMADDR_CID_HOST = 2`, `host_egress_port`) so QEMU can run with `-netdev restrict=on`
+/// while `libop_uniffi_core.so` and `ureq` retain end-to-end guest-terminated TLS (`V2-H6`).
+#[cfg(target_os = "linux")]
+pub fn spawn_guest_vsock_https_proxy(host_egress_port: u32) -> Result<String, EnclaveError> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| {
+        EnclaveError::new(
+            ErrorCode::TransportFailure,
+            format!("failed binding guest loopback HTTPS proxy: {e}"),
+        )
+    })?;
+    let local_addr = listener.local_addr().map_err(|e| {
+        EnclaveError::new(
+            ErrorCode::TransportFailure,
+            format!("failed reading guest loopback proxy address: {e}"),
+        )
+    })?;
+
+    let _ = thread::Builder::new()
+        .name("sb-guest-egress-vsock".into())
+        .spawn(move || {
+            for incoming in listener.incoming().flatten() {
+                thread::spawn(move || {
+                    let _ = relay_guest_tcp_to_host_vsock(incoming, host_egress_port);
+                });
+            }
+        });
+
+    Ok(format!("http://127.0.0.1:{}", local_addr.port()))
+}
+
+#[cfg(target_os = "linux")]
+fn relay_guest_tcp_to_host_vsock(
+    mut tcp_stream: std::net::TcpStream,
+    host_egress_port: u32,
+) -> std::io::Result<()> {
+    use std::mem::DropGuard;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::time::Duration;
+
+    let _ = tcp_stream.set_read_timeout(Some(Duration::from_secs(45)));
+    let _ = tcp_stream.set_write_timeout(Some(Duration::from_secs(45)));
+
+    let raw_fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd_guard = DropGuard::new(raw_fd, |fd| unsafe {
+        let _ = libc::close(fd);
+    });
+
+    let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+    addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+    addr.svm_cid = libc::VMADDR_CID_HOST;
+    addr.svm_port = host_egress_port;
+
+    let rc = unsafe {
+        libc::connect(
+            *fd_guard,
+            (&raw const addr).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let confirmed_fd = DropGuard::dismiss(fd_guard);
+    let vsock_owned = unsafe { OwnedFd::from_raw_fd(confirmed_fd) };
+    let mut vsock_writer = std::fs::File::from(vsock_owned);
+    let mut vsock_reader = vsock_writer.try_clone()?;
+    let mut tcp_writer = tcp_stream.try_clone()?;
+
+    let t1 = thread::spawn(move || {
+        let _ = std::io::copy(&mut tcp_stream, &mut vsock_writer);
+        unsafe {
+            use std::os::fd::AsRawFd;
+            let _ = libc::shutdown(vsock_writer.as_raw_fd(), libc::SHUT_WR);
+        }
+    });
+    let _ = std::io::copy(&mut vsock_reader, &mut tcp_writer);
+    let _ = tcp_writer.shutdown(std::net::Shutdown::Both);
+    let _ = t1.join();
+    Ok(())
 }
 
 /// Handles a single mutually-authenticated `Noise_IK` RPC session.
@@ -281,7 +309,7 @@ pub fn serve_noise_connection<S: Read + Write>(
 pub fn serve_unix_listener(
     socket_path: &Path,
     service: Arc<EnclaveService>,
-    enclave_private: Zeroizing<[u8; 32]>,
+    enclave_private: Arc<MemSecret>,
     authorized_client_pubkey: [u8; 32],
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), EnclaveError> {
@@ -347,18 +375,20 @@ pub fn serve_unix_listener(
                 }
                 active.fetch_add(1, Ordering::AcqRel);
                 let svc = Arc::clone(&service);
-                let priv_copy = enclave_private.clone();
+                let priv_ref = Arc::clone(&enclave_private);
                 let act = Arc::clone(&active);
                 thread::spawn(move || {
                     let _slot_guard = std::mem::DropGuard::new(act, |counter| {
                         counter.fetch_sub(1, Ordering::AcqRel);
                     });
-                    let _ = serve_noise_connection(
-                        stream,
-                        svc.as_ref(),
-                        &priv_copy,
-                        &authorized_client_pubkey,
-                    );
+                    if let Ok(key32) = priv_ref.as_bytes().try_into() {
+                        let _ = serve_noise_connection(
+                            stream,
+                            svc.as_ref(),
+                            key32,
+                            &authorized_client_pubkey,
+                        );
+                    }
                 });
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -381,7 +411,7 @@ pub fn serve_unix_listener(
 pub fn serve_vsock_listener(
     port: u32,
     service: Arc<EnclaveService>,
-    enclave_private: Zeroizing<[u8; 32]>,
+    enclave_private: Arc<MemSecret>,
     authorized_client_pubkey: [u8; 32],
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), EnclaveError> {
@@ -503,14 +533,16 @@ pub fn serve_vsock_listener(
         }
         active.fetch_add(1, Ordering::AcqRel);
         let svc = Arc::clone(&service);
-        let priv_copy = enclave_private.clone();
+        let priv_ref = Arc::clone(&enclave_private);
         let act = Arc::clone(&active);
         thread::spawn(move || {
             let _slot_guard = DropGuard::new(act, |counter| {
                 counter.fetch_sub(1, Ordering::AcqRel);
             });
-            let _ =
-                serve_noise_connection(stream, svc.as_ref(), &priv_copy, &authorized_client_pubkey);
+            if let Ok(key32) = priv_ref.as_bytes().try_into() {
+                let _ =
+                    serve_noise_connection(stream, svc.as_ref(), key32, &authorized_client_pubkey);
+            }
         });
     }
     Ok(())

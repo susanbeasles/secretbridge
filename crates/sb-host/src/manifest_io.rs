@@ -7,9 +7,12 @@ use std::mem::DropGuard;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path};
+use std::sync::Mutex;
 use uuid::Uuid;
 
 const MAX_MANIFEST_BYTES: u64 = 512 * 1024; // 512 KiB ceiling
+
+static MANIFEST_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone)]
 pub struct HostError {
@@ -103,6 +106,12 @@ fn open_verified_parent_dirfd(path: &Path) -> Result<(OwnedFd, CString, String),
         .filter(|s| !s.is_empty() && !s.contains('/'))
         .ok_or_else(|| HostError::new(ErrorCode::Validation, "invalid manifest filename"))?
         .to_string();
+    if leaf_str != "secretbridge.json" {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            "manifest path must target a file named secretbridge.json",
+        ));
+    }
     let leaf_cstr = CString::new(leaf_os.as_bytes())
         .map_err(|_| HostError::new(ErrorCode::Validation, "NUL byte in manifest filename"))?;
 
@@ -164,6 +173,62 @@ fn open_verified_parent_dirfd(path: &Path) -> Result<(OwnedFd, CString, String),
     }
 
     Ok((cur_dir, leaf_cstr, leaf_str))
+}
+
+/// Serializes manifest read-modify-write and save operations both within `sb-host` (`Mutex<()>`)
+/// and across concurrent processes (`openat(..., ".secretbridge.json.lock", O_NOFOLLOW) + flock(LOCK_EX)`).
+pub fn with_manifest_lock<T>(
+    path: &Path,
+    f: impl FnOnce() -> Result<T, HostError>,
+) -> Result<T, HostError> {
+    let _proc_guard = MANIFEST_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (parent_fd, _, _) = open_verified_parent_dirfd(path)?;
+    // SAFETY: Opens or creates `.secretbridge.json.lock` inside `parent_fd` without following symlinks.
+    let lock_raw = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            c".secretbridge.json.lock".as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if lock_raw < 0 {
+        let err = io::Error::last_os_error();
+        if is_symlink_errno(err.raw_os_error()) {
+            return Err(HostError::new(
+                ErrorCode::Validation,
+                "refusing to open symlinked .secretbridge.json.lock",
+            ));
+        }
+        return Err(HostError::new(
+            ErrorCode::ManifestIo,
+            format!("unable to open .secretbridge.json.lock: {err}"),
+        ));
+    }
+    // SAFETY: `lock_raw` is newly opened and owned solely by `lock_fd`.
+    let lock_fd = unsafe { OwnedFd::from_raw_fd(lock_raw) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(lock_fd.as_raw_fd(), &mut st) } != 0
+        || (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+    {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            ".secretbridge.json.lock must be a regular file",
+        ));
+    }
+    // SAFETY: Acquires an exclusive advisory lock held until `lock_fd` drops at scope exit.
+    if unsafe { libc::flock(lock_fd.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(HostError::new(
+            ErrorCode::ManifestIo,
+            format!(
+                "unable to lock .secretbridge.json.lock: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    f()
 }
 
 /// Loads and strictly validates `secretbridge.json` relative to a verified directory descriptor

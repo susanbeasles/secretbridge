@@ -26,6 +26,7 @@ import java.awt.BorderLayout
 import java.awt.FlowLayout
 import java.awt.GridLayout
 import java.awt.datatransfer.StringSelection
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.swing.DefaultListModel
 import javax.swing.JButton
 import javax.swing.JComponent
@@ -33,6 +34,7 @@ import javax.swing.JPanel
 import javax.swing.JSpinner
 import javax.swing.ListSelectionModel
 import javax.swing.SpinnerNumberModel
+import javax.swing.SwingUtilities
 import javax.swing.Timer
 import javax.swing.table.AbstractTableModel
 
@@ -507,14 +509,28 @@ class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout
             CaptureTarget.NewItem(title = itemTitle, fieldName = secName)
         }
         val shouldBind = autoBindCheck.isSelected
+        val captureActive = AtomicBoolean(true)
 
-        startCaptureCountdownBanner()
+        stopCaptureCountdownBanner()
+        captureCountdownLabel.text = "Preparing enclave & arming capture hook (do NOT copy yet)..."
         EnclaveClient.runBackgroundTask(
             project = project,
             title = "Armed Copy Capture (15s TTL)",
             work = {
                 val client = EnclaveClient.getInstance(project)
-                val receipt = client.executeArmedCaptureOffEdt(manifest, env, target)
+                val receipt = client.executeArmedCaptureOffEdt(
+                    manifest = manifest,
+                    environment = env,
+                    target = target,
+                    onArmed = { ttlMs ->
+                        val seconds = ((ttlMs + 999L) / 1000L).toInt().coerceIn(1, 15)
+                        SwingUtilities.invokeLater {
+                            if (captureActive.get()) {
+                                startCaptureCountdownBanner(seconds)
+                            }
+                        }
+                    },
+                )
                 if (shouldBind) {
                     client.executeHostCommandOffEdt(
                         HostCommand.ManifestBind(
@@ -528,6 +544,7 @@ class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout
                 receipt
             },
             onSuccessEdt = { receipt ->
+                captureActive.set(false)
                 stopCaptureCountdownBanner()
                 refreshVfsManifest()
                 val badge = receipt.interceptMode?.badgeText ?: "Sealed X25519 Capture"
@@ -535,15 +552,16 @@ class SecretsToolWindowPanel(private val project: Project) : JPanel(BorderLayout
                 reloadManifestAndVaultState()
             },
             onErrorEdt = { err ->
+                captureActive.set(false)
                 stopCaptureCountdownBanner()
                 captureCountdownLabel.text = "Armed capture disarmed: ${err.message}"
             },
         )
     }
 
-    private fun startCaptureCountdownBanner() {
+    private fun startCaptureCountdownBanner(initialSeconds: Int = 15) {
         stopCaptureCountdownBanner()
-        var secondsLeft = 15
+        var secondsLeft = initialSeconds.coerceIn(1, 15)
         captureCountdownLabel.text = "ARMED (${secondsLeft}s remaining): Copy external secret now..."
         countdownTimer = Timer(1000) {
             secondsLeft -= 1

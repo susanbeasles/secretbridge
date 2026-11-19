@@ -6,9 +6,10 @@ use sb_enclave::service::EnclaveService;
 use sb_enclave::vault::{InMemoryVaultProvider, parse_sha256_allowlist_csv};
 use sb_enclave::vault::{UniffiCoreVaultProvider, VaultProvider, compiled_op_core_allowlist};
 use sb_enclave::vsock::{
-    DEFAULT_ENCLAVE_KEY_PATH, DEFAULT_VSOCK_PORT, cmdline_has_token, extract_cmdline_client_pubkey,
-    extract_cmdline_vsock_port, load_enclave_static_keypair, parse_pubkey_hex, serve_unix_listener,
-    write_generated_enclave_identity,
+    DEFAULT_VSOCK_PORT, cmdline_has_token, extract_cmdline_client_pubkey,
+    extract_cmdline_egress_vsock_port, extract_cmdline_vsock_port,
+    generate_ephemeral_enclave_identity, load_enclave_static_keypair, parse_pubkey_hex,
+    serve_unix_listener,
 };
 use sb_proto::error::ErrorCode;
 use std::io::Write;
@@ -16,18 +17,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-enum EnclaveMode {
-    GenerateIdentity {
-        priv_path: PathBuf,
-        pub_hex_path: PathBuf,
-    },
-    Serve(CliConfig),
-}
-
 struct CliConfig {
     vsock_port: u32,
     unix_socket: Option<PathBuf>,
-    enclave_key_file: PathBuf,
+    enclave_key_file: Option<PathBuf>,
     authorized_client_pubkey: [u8; 32],
     op_core_lib: PathBuf,
     op_core_sha256: Vec<[u8; 32]>,
@@ -185,32 +178,49 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
 
         match sb_enclave::dhcp::acquire_dhcpv4_lease(&primary_nic, Duration::from_millis(1_500)) {
             Ok(lease) => {
-                if !set_if_ipv4_up(sock, &primary_nic, lease.yiaddr, lease.subnet_mask) {
+                let apply_lease_cfg = |nic: &str, l: &sb_enclave::dhcp::DhcpLease| -> bool {
+                    let s_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+                    if s_fd < 0 {
+                        return false;
+                    }
+                    let _s_guard = DropGuard::new(s_fd, |fd| unsafe {
+                        let _ = libc::close(fd);
+                    });
+                    if !set_if_ipv4_up(s_fd, nic, l.yiaddr, l.subnet_mask) {
+                        return false;
+                    }
+                    if let Some(gw) = l.router {
+                        add_default_gateway(s_fd, gw);
+                    }
+                    let mut resolv = String::new();
+                    let dns_list = if !l.dns_servers.is_empty() {
+                        l.dns_servers.clone()
+                    } else if let Some(gw) = l.router {
+                        vec![gw]
+                    } else {
+                        Vec::new()
+                    };
+                    for ip in dns_list {
+                        resolv.push_str(&format!(
+                            "nameserver {}.{}.{}.{}\n",
+                            ip[0], ip[1], ip[2], ip[3]
+                        ));
+                    }
+                    if !resolv.is_empty() {
+                        let _ = std::fs::write("/etc/resolv.conf", resolv);
+                    }
+                    true
+                };
+                if !apply_lease_cfg(&primary_nic, &lease) {
                     return Err(EnclaveError::new(
                         ErrorCode::TransportFailure,
                         format!("failed applying DHCPv4 lease address on {primary_nic}"),
                     ));
                 }
-                if let Some(gw) = lease.router {
-                    add_default_gateway(sock, gw);
-                }
-                let mut resolv = String::new();
-                let dns_list = if !lease.dns_servers.is_empty() {
-                    lease.dns_servers
-                } else if let Some(gw) = lease.router {
-                    vec![gw]
-                } else {
-                    Vec::new()
-                };
-                for ip in dns_list {
-                    resolv.push_str(&format!(
-                        "nameserver {}.{}.{}.{}\n",
-                        ip[0], ip[1], ip[2], ip[3]
-                    ));
-                }
-                if !resolv.is_empty() {
-                    let _ = std::fs::write("/etc/resolv.conf", resolv);
-                }
+                let renew_nic = primary_nic.clone();
+                sb_enclave::dhcp::spawn_dhcpv4_renewal_daemon(renew_nic.clone(), lease, move |l| {
+                    let _ = apply_lease_cfg(&renew_nic, l);
+                });
             }
             Err(dhcp_err) => {
                 let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
@@ -228,16 +238,45 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
         }
     }
 
+    // Reap any orphaned/transient child processes while running as Linux PID 1 (`V2-H2`).
+    let _ = std::thread::Builder::new()
+        .name("sb-pid1-reaper".into())
+        .spawn(|| {
+            loop {
+                loop {
+                    let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+                    if pid <= 0 {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+
+    // If booted with `sb.egress_vsock_port=<port>` (Linux QEMU `-netdev restrict=on`), bind a
+    // guest loopback HTTPS proxy relaying `CONNECT <host>:443` + TLS 1.3 ciphertext over `AF_VSOCK`.
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline")
+        && let Some(egress_port) = extract_cmdline_egress_vsock_port(&cmdline)?
+    {
+        let proxy_url = sb_enclave::vsock::spawn_guest_vsock_https_proxy(egress_port)?;
+        // SAFETY: Executed single-threaded during early PID-1 initialization before worker threads spawn HTTP clients.
+        unsafe {
+            std::env::set_var("HTTPS_PROXY", &proxy_url);
+            std::env::set_var("https_proxy", &proxy_url);
+            std::env::set_var("SB_GUEST_VSOCK_HTTPS_PROXY", &proxy_url);
+        }
+    }
+
     Ok(())
 }
 
-fn parse_args() -> Result<EnclaveMode, EnclaveError> {
+fn parse_args() -> Result<CliConfig, EnclaveError> {
     let mut cli_vsock_port: Option<u32> = None;
     let mut unix_socket: Option<PathBuf> = None;
-    let mut enclave_key_file = PathBuf::from(
-        std::env::var("SB_ENCLAVE_KEY_FILE")
-            .unwrap_or_else(|_| DEFAULT_ENCLAVE_KEY_PATH.to_string()),
-    );
+    let mut enclave_key_file: Option<PathBuf> = std::env::var("SB_ENCLAVE_KEY_FILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from);
     let mut client_pk_hex: Option<String> = std::env::var("SB_AUTHORIZED_CLIENT_PUBKEY_HEX").ok();
     let mut op_core_lib = PathBuf::from(
         std::env::var("SB_OP_CORE_LIB")
@@ -252,29 +291,11 @@ fn parse_args() -> Result<EnclaveMode, EnclaveError> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--generate-identity" => {
-                let priv_path = PathBuf::from(args.next().ok_or_else(|| {
-                    EnclaveError::new(
-                        ErrorCode::Validation,
-                        "missing <private_key_path> after --generate-identity",
-                    )
-                })?);
-                let pub_hex_path = PathBuf::from(args.next().ok_or_else(|| {
-                    EnclaveError::new(
-                        ErrorCode::Validation,
-                        "missing <pubkey_hex_path> after --generate-identity",
-                    )
-                })?);
-                return Ok(EnclaveMode::GenerateIdentity {
-                    priv_path,
-                    pub_hex_path,
-                });
-            }
             "--enclave-key-file" => {
                 let val = args.next().ok_or_else(|| {
                     EnclaveError::new(ErrorCode::Validation, "missing --enclave-key-file path")
                 })?;
-                enclave_key_file = PathBuf::from(val);
+                enclave_key_file = Some(PathBuf::from(val));
             }
             "--vsock-port" => {
                 let val = args.next().ok_or_else(|| {
@@ -388,7 +409,7 @@ fn parse_args() -> Result<EnclaveMode, EnclaveError> {
         list
     };
 
-    Ok(EnclaveMode::Serve(CliConfig {
+    Ok(CliConfig {
         vsock_port,
         unix_socket,
         enclave_key_file,
@@ -397,7 +418,7 @@ fn parse_args() -> Result<EnclaveMode, EnclaveError> {
         op_core_sha256,
         #[cfg(debug_assertions)]
         in_memory_test_token,
-    }))
+    })
 }
 
 fn run() -> Result<(), EnclaveError> {
@@ -406,16 +427,7 @@ fn run() -> Result<(), EnclaveError> {
         init_guest_pid1_environment()?;
     }
 
-    let cfg = match parse_args()? {
-        EnclaveMode::GenerateIdentity {
-            priv_path,
-            pub_hex_path,
-        } => {
-            write_generated_enclave_identity(&priv_path, &pub_hex_path)?;
-            return Ok(());
-        }
-        EnclaveMode::Serve(cfg) => cfg,
-    };
+    let cfg = parse_args()?;
 
     #[cfg(debug_assertions)]
     let vault_provider: Arc<dyn VaultProvider> = match cfg.in_memory_test_token {
@@ -444,7 +456,12 @@ fn run() -> Result<(), EnclaveError> {
         github_client,
     ));
 
-    let enclave_kp = load_enclave_static_keypair(&cfg.enclave_key_file, std::process::id() == 1)?;
+    // Generate a fresh ephemeral Noise_IK static keypair strictly inside guest `MemSecret`
+    // (`memfd_secret`/`mlock`) RAM on every boot unless an explicit external HSM/volume key path was given (`V2-C1`).
+    let enclave_kp = match &cfg.enclave_key_file {
+        Some(path) => load_enclave_static_keypair(path)?,
+        None => generate_ephemeral_enclave_identity()?,
+    };
     let pubkey_hex = hex::encode(enclave_kp.public);
     println!("SB_ENCLAVE_NOISE_PUBKEY={pubkey_hex}");
     let _ = std::io::stdout().flush();
@@ -483,6 +500,18 @@ fn run() -> Result<(), EnclaveError> {
 fn main() {
     if let Err(err) = run() {
         eprintln!("sb-enclave error [{:?}]: {}", err.code, err.message);
+        let _ = std::io::stderr().flush();
+        #[cfg(target_os = "linux")]
+        if std::process::id() == 1 {
+            // Avoid `Kernel panic - not syncing: Attempted to kill init!` (`V2-H2`).
+            unsafe {
+                libc::sync();
+                let _ = libc::reboot(libc::RB_POWER_OFF);
+            }
+            loop {
+                std::thread::park();
+            }
+        }
         std::process::exit(1);
     }
 }

@@ -4,8 +4,8 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 import java.security.KeyFactory
-import java.security.KeyPairGenerator
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.AEADBadTagException
@@ -151,20 +151,17 @@ class NoiseIkSession private constructor(
             0x30, 0x2E, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x6E, 0x04, 0x22, 0x04, 0x20,
         )
         private val X25519_BASEPOINT = ByteArray(32).apply { this[0] = 9 }
+        private val SECURE_RANDOM = SecureRandom()
 
         fun generateStaticKeypair(): Pair<ByteArray, ByteArray> {
-            val kpg = KeyPairGenerator.getInstance("X25519")
-            val kp = kpg.generateKeyPair()
-            val pkcs8 = kp.private.encoded
-            val x509 = kp.public.encoded
+            val priv = ByteArray(32)
+            SECURE_RANDOM.nextBytes(priv)
             return try {
-                require(pkcs8.size >= 48 && x509.size == 44) { "Unexpected JCA X25519 key encoding length" }
-                val priv = pkcs8.copyOfRange(pkcs8.size - 32, pkcs8.size)
-                val pub = x509.copyOfRange(12, 44)
+                val pub = derivePublicKey(priv)
                 priv to pub
-            } finally {
-                pkcs8.fill(0)
-                x509.fill(0)
+            } catch (t: Throwable) {
+                priv.fill(0)
+                throw t
             }
         }
 
@@ -298,10 +295,18 @@ class NoiseIkSession private constructor(
             System.arraycopy(X509_X25519_PREFIX, 0, x509, 0, X509_X25519_PREFIX.size)
             System.arraycopy(pub32, 0, x509, X509_X25519_PREFIX.size, 32)
             return try {
-                val kf = KeyFactory.getInstance("X25519")
+                val kf = try {
+                    KeyFactory.getInstance("X25519", "SunEC")
+                } catch (_: Exception) {
+                    KeyFactory.getInstance("X25519")
+                }
                 val privKey = kf.generatePrivate(PKCS8EncodedKeySpec(pkcs8))
                 val pubKey = kf.generatePublic(X509EncodedKeySpec(x509))
-                val ka = KeyAgreement.getInstance("X25519")
+                val ka = try {
+                    KeyAgreement.getInstance("X25519", "SunEC")
+                } catch (_: Exception) {
+                    KeyAgreement.getInstance("X25519")
+                }
                 ka.init(privKey)
                 ka.doPhase(pubKey, true)
                 ka.generateSecret()

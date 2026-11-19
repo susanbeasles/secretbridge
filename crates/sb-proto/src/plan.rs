@@ -78,7 +78,7 @@ pub enum PlanAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "target", rename_all = "lowercase")]
+#[serde(tag = "target", rename_all = "lowercase", deny_unknown_fields)]
 pub enum PlannedOp {
     Github {
         name: SecretName,
@@ -145,7 +145,7 @@ const MAX_CONSUMED_PLAN_IDS: usize = 4_096;
 
 struct SignerInner {
     key: Zeroizing<[u8; 32]>,
-    consumed_plan_ids: std::collections::BTreeSet<String>,
+    consumed_plan_ids: BTreeMap<String, u64>,
 }
 
 /// Per-session enclave HMAC signer preventing forged, replayed, or stale plans from executing in `apply`.
@@ -159,7 +159,7 @@ impl PlanSigner {
         Self {
             inner: std::sync::Mutex::new(SignerInner {
                 key: Zeroizing::new(key),
-                consumed_plan_ids: std::collections::BTreeSet::new(),
+                consumed_plan_ids: BTreeMap::new(),
             }),
             ttl_secs,
         }
@@ -188,8 +188,10 @@ impl PlanSigner {
     }
 
     pub fn sign(&self, plan: UnsignedPlan) -> Result<SignedPlan, ProtoError> {
-        if plan.plan_id.trim().is_empty() {
-            return Err(ProtoError::Validation("plan_id must not be empty".into()));
+        if plan.plan_id.trim().is_empty() || plan.plan_id.len() > 128 {
+            return Err(ProtoError::Validation(
+                "plan_id must be non-empty and <= 128 bytes".into(),
+            ));
         }
         let canonical = canonical_json_bytes(&plan)?;
         let guard = self
@@ -227,7 +229,9 @@ impl PlanSigner {
             )
         })?;
 
-        if guard.consumed_plan_ids.contains(&signed.plan.plan_id) {
+        if let Some(&exp) = guard.consumed_plan_ids.get(&signed.plan.plan_id)
+            && exp >= now_unix_secs
+        {
             return Err(ProtoError::StalePlan(
                 "plan has already been consumed; preview sync again before applying".into(),
             ));
@@ -246,14 +250,17 @@ impl PlanSigner {
     }
 
     pub fn verify(&self, signed: &SignedPlan, now_unix_secs: u64) -> Result<(), ProtoError> {
-        let guard = self
+        let mut guard = self
             .inner
             .lock()
             .map_err(|_| ProtoError::Crypto("plan signer lock poisoned".into()))?;
+        guard
+            .consumed_plan_ids
+            .retain(|_, &mut exp| exp >= now_unix_secs);
         self.verify_locked(&guard, signed, now_unix_secs)
     }
 
-    /// Atomically verifies `signed` and marks `plan_id` consumed so it can never be replayed.
+    /// Atomically prunes expired replay entries, verifies `signed`, and marks `plan_id` consumed.
     pub fn consume_verified(
         &self,
         signed: &SignedPlan,
@@ -263,13 +270,22 @@ impl PlanSigner {
             .inner
             .lock()
             .map_err(|_| ProtoError::Crypto("plan signer lock poisoned".into()))?;
+        guard
+            .consumed_plan_ids
+            .retain(|_, &mut exp| exp >= now_unix_secs);
         self.verify_locked(&guard, signed, now_unix_secs)?;
         if guard.consumed_plan_ids.len() >= MAX_CONSUMED_PLAN_IDS {
             return Err(ProtoError::StalePlan(
                 "plan replay cache full; preview sync again".into(),
             ));
         }
-        guard.consumed_plan_ids.insert(signed.plan.plan_id.clone());
+        let expires_at = signed
+            .plan
+            .issued_at_unix_secs
+            .saturating_add(self.ttl_secs);
+        guard
+            .consumed_plan_ids
+            .insert(signed.plan.plan_id.clone(), expires_at);
         Ok(())
     }
 }

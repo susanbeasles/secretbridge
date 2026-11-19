@@ -1,5 +1,5 @@
 use crate::error::EnclaveError;
-use crate::github::{PublicIpOnlyResolver, read_bounded_string};
+use crate::github::read_bounded_string;
 use crate::mem_secret::MemSecret;
 use hmac::{Hmac, Mac};
 use sb_proto::error::ErrorCode;
@@ -152,15 +152,7 @@ impl Default for SigV4AwsClient {
 
 impl SigV4AwsClient {
     pub fn new(endpoint_override: Option<String>) -> Self {
-        let mut builder = ureq::AgentBuilder::new()
-            .redirects(0)
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(30))
-            .timeout_write(Duration::from_secs(30));
-        if endpoint_override.is_none() {
-            builder = builder.resolver(PublicIpOnlyResolver);
-        }
-        let agent = builder.build();
+        let agent = crate::github::build_enclave_https_agent(endpoint_override.is_some());
         Self {
             agent,
             endpoint_override,

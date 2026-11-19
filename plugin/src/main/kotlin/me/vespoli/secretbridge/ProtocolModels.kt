@@ -136,6 +136,7 @@ data class SecretSpec(
     val github: Boolean = true,
     val aws: Boolean = true,
     val allowUnmanagedGithubDelete: Boolean = false,
+    val allowUnmanagedGithubOverwrite: Boolean = false,
 ) {
     fun toJson(): JsonObj {
         val m = LinkedHashMap<String, JsonValue>()
@@ -146,6 +147,9 @@ data class SecretSpec(
         m["aws"] = JsonBool(aws)
         if (allowUnmanagedGithubDelete) {
             m["allow_unmanaged_github_delete"] = JsonBool(true)
+        }
+        if (allowUnmanagedGithubOverwrite) {
+            m["allow_unmanaged_github_overwrite"] = JsonBool(true)
         }
         return JsonObj(m)
     }
@@ -158,6 +162,7 @@ data class SecretSpec(
             github = obj.bool("github") ?: true,
             aws = obj.bool("aws") ?: true,
             allowUnmanagedGithubDelete = obj.bool("allow_unmanaged_github_delete") ?: false,
+            allowUnmanagedGithubOverwrite = obj.bool("allow_unmanaged_github_overwrite") ?: false,
         )
     }
 }
@@ -645,6 +650,7 @@ sealed interface HostCommand {
     data class CaptureAndSeal(
         val pkCaptureB64: String,
         val ttlMs: Long? = null,
+        val notifyArmed: Boolean = false,
     ) : HostCommand {
         override fun toJson(): JsonObj {
             val m = LinkedHashMap<String, JsonValue>()
@@ -652,6 +658,9 @@ sealed interface HostCommand {
             m["pk_capture_b64"] = JsonStr(pkCaptureB64)
             if (ttlMs != null) {
                 m["ttl_ms"] = JsonNum(ttlMs)
+            }
+            if (notifyArmed) {
+                m["notify_armed"] = JsonBool(true)
             }
             return JsonObj(m)
         }

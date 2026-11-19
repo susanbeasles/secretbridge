@@ -179,7 +179,35 @@ mod tests {
     fn rejects_op_ref_injection_and_vault_mismatch_closing_s7_and_s10() {
         assert!("op://v/i/f\"\nMALICIOUS=1".parse::<OpRef>().is_err());
         assert!("op://v/../f".parse::<OpRef>().is_err());
+        assert!("op://v/foo..bar/f".parse::<OpRef>().is_err());
+        assert!("op://v/item%2f/f".parse::<OpRef>().is_err());
         assert!("op://v/-flag/f".parse::<OpRef>().is_err());
+        assert!(
+            "0xa9.0xfe.0xa9.0xfe"
+                .parse::<crate::types::GitHubHost>()
+                .is_err()
+        );
+        assert!("0x7f.0.0.0x1".parse::<crate::types::GitHubHost>().is_err());
+        assert!(serde_json::from_str::<crate::rpc::GenerateSpec>(r#"{"length":8}"#).is_err());
+        assert!(
+            serde_json::from_str::<crate::rpc::GenerateSpec>(r#"{"length":40,"extra":true}"#)
+                .is_err()
+        );
+
+        let absent_mismatch = r#"{
+          "version": 2,
+          "project": "demo",
+          "account": "vespoli.1password.com",
+          "environments": {
+            "dev": {
+              "vault": "vault-dev-01",
+              "secrets": {
+                "OLD_KEY": { "ref": "op://wrong-vault/item/f", "state": "absent" }
+              }
+            }
+          }
+        }"#;
+        assert!(Manifest::from_json_str(absent_mismatch).is_err());
 
         let mut m = Manifest::from_json_str(sample_valid_manifest_json()).unwrap();
         let dev: Slug = "dev".parse().unwrap();
@@ -256,6 +284,12 @@ mod tests {
                 observed_updated_at: None,
             }],
         };
+
+        // Oversized plan_id (> 128 bytes) rejected at sign() time
+        let mut oversized = unsigned.clone();
+        oversized.plan_id = "p".repeat(129);
+        assert!(signer.sign(oversized).is_err());
+
         let mut signed = signer.sign(unsigned.clone()).unwrap();
         assert!(signer.verify(&signed, 1_300).is_ok());
         // Expired after 300s default TTL
@@ -264,6 +298,16 @@ mod tests {
         assert!(signer.consume_verified(&signed, 1_120).is_ok());
         assert!(signer.verify(&signed, 1_120).is_err());
         assert!(signer.consume_verified(&signed, 1_120).is_err());
+
+        // Eviction prevents DoS past 4,096 plans once earlier plans expire
+        for idx in 0..4_100usize {
+            let mut batch_plan = unsigned.clone();
+            batch_plan.plan_id = format!("evict-plan-{idx}");
+            batch_plan.issued_at_unix_secs = if idx < 2_050 { 1_000 } else { 2_000 };
+            let batch_signed = signer.sign(batch_plan).unwrap();
+            let now = if idx < 2_050 { 1_100 } else { 2_100 };
+            assert!(signer.consume_verified(&batch_signed, now).is_ok());
+        }
 
         // Key rotation invalidates newly signed plans from prior key
         let mut u2 = unsigned;

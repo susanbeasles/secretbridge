@@ -373,7 +373,16 @@ impl EnclaveService {
                 if let Some(gh) = &env.github {
                     Self::ensure_github_target_allowed(&sess, gh)?;
                 }
-                let gh_tok = if sess.allowed_github_host.as_str() == "github.com" {
+                if kind == sb_proto::rpc::TemplateKind::Workflow1password
+                    && action_sha.is_none()
+                    && !sess.allowed_github_host.is_default_github_com()
+                {
+                    return Err(EnclaveError::new(
+                        ErrorCode::Validation,
+                        "action_sha (pinnedLoadSecretsActionSha) is required when rendering Workflow1password for non-github.com enterprise hosts",
+                    ));
+                }
+                let gh_tok = if sess.allowed_github_host.is_default_github_com() {
                     sess.github_token.as_deref()
                 } else {
                     None
@@ -444,30 +453,34 @@ impl EnclaveService {
                 ),
             ));
         }
-        if !sess.allowed_github_owners.is_empty() {
-            let owner_lower = match target.scope {
-                GitHubScope::Repository | GitHubScope::Environment => target
-                    .repository
-                    .as_ref()
-                    .expect("validated")
-                    .owner()
-                    .as_str()
-                    .to_ascii_lowercase(),
-                GitHubScope::Organization => target
-                    .organization
-                    .as_ref()
-                    .expect("validated")
-                    .as_str()
-                    .to_ascii_lowercase(),
-            };
-            if !sess.allowed_github_owners.contains(&owner_lower) {
-                return Err(EnclaveError::new(
-                    ErrorCode::Unauthorized,
-                    format!(
-                        "GitHub owner/organization '{owner_lower}' is not in the session allowlist"
-                    ),
-                ));
-            }
+        if sess.allowed_github_owners.is_empty() {
+            return Err(EnclaveError::new(
+                ErrorCode::Unauthorized,
+                "allowed_github_owners allowlist must be configured in enclave session before accessing GitHub targets",
+            ));
+        }
+        let owner_lower = match target.scope {
+            GitHubScope::Repository | GitHubScope::Environment => target
+                .repository
+                .as_ref()
+                .expect("validated")
+                .owner()
+                .as_str()
+                .to_ascii_lowercase(),
+            GitHubScope::Organization => target
+                .organization
+                .as_ref()
+                .expect("validated")
+                .as_str()
+                .to_ascii_lowercase(),
+        };
+        if !sess.allowed_github_owners.contains(&owner_lower) {
+            return Err(EnclaveError::new(
+                ErrorCode::Unauthorized,
+                format!(
+                    "GitHub owner/organization '{owner_lower}' is not in the session allowlist"
+                ),
+            ));
         }
         Ok(())
     }
@@ -477,10 +490,15 @@ impl EnclaveService {
         target: &AwsTarget,
     ) -> Result<(), EnclaveError> {
         target.validate()?;
-        if !sess.allowed_aws_accounts.is_empty()
-            && !sess
-                .allowed_aws_accounts
-                .contains(target.account_id.as_str())
+        if sess.allowed_aws_accounts.is_empty() {
+            return Err(EnclaveError::new(
+                ErrorCode::Unauthorized,
+                "allowed_aws_accounts allowlist must be configured in enclave session before accessing AWS targets",
+            ));
+        }
+        if !sess
+            .allowed_aws_accounts
+            .contains(target.account_id.as_str())
         {
             return Err(EnclaveError::new(
                 ErrorCode::Unauthorized,
@@ -932,9 +950,15 @@ impl EnclaveService {
             ));
         };
         let prepared = self.github.prepare_environment(tok, gh)?;
+        for (name, spec) in &env.secrets {
+            if spec.github && spec.state == SecretState::Present {
+                self.record_github_secret_managed(gh, name, true)?;
+            }
+        }
         Ok(EnclaveResult::GithubPrepared {
             prepared,
-            notice: "GitHub deployment environment verified".into(),
+            notice: "GitHub deployment environment verified and declared secrets marked managed"
+                .into(),
         })
     }
 
@@ -1012,7 +1036,19 @@ impl EnclaveService {
                 }
                 match spec.state {
                     SecretState::Present => {
-                        let observed_updated_at = remote_gh.get(name.as_str()).cloned().flatten();
+                        let remote_entry = remote_gh.get(name.as_str());
+                        if remote_entry.is_some() {
+                            let is_managed = self.is_github_secret_managed(gh, name)?;
+                            if !is_managed && !spec.allow_unmanaged_github_overwrite {
+                                return Err(EnclaveError::new(
+                                    ErrorCode::OwnershipConflict,
+                                    format!(
+                                        "refusing to overwrite pre-existing unmanaged GitHub secret '{name}'; run prepare-github or set allow_unmanaged_github_overwrite=true if intended"
+                                    ),
+                                ));
+                            }
+                        }
+                        let observed_updated_at = remote_entry.cloned().flatten();
                         operations.push(PlannedOp::Github {
                             name: name.clone(),
                             action: PlanAction::Set,

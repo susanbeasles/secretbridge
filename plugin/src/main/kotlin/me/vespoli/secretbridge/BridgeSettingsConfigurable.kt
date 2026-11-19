@@ -13,6 +13,7 @@ import com.intellij.ui.components.JBTextField
 import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
+import java.lang.ref.WeakReference
 import javax.swing.DefaultListCellRenderer
 import javax.swing.JButton
 import javax.swing.JComponent
@@ -20,6 +21,152 @@ import javax.swing.JPanel
 import javax.swing.JSpinner
 import javax.swing.SpinnerNumberModel
 import javax.swing.SwingUtilities
+import javax.swing.text.AbstractDocument
+import javax.swing.text.BadLocationException
+import javax.swing.text.PlainDocument
+import javax.swing.text.Position
+import javax.swing.text.Segment
+import javax.swing.undo.UndoableEdit
+
+/**
+ * Custom [AbstractDocument.Content] backing [JBPasswordField] with an explicitly zeroized
+ * `CharArray` (`V2-M4`). Unlike Swing's default `GapContent` (which merely moves gap indices on
+ * `remove()` and retains `UndoableEdit` `String` snapshots), every resize, deletion, and `wipe()`
+ * overwrites character slots in place with `'\u0000'`.
+ */
+internal class ZeroizingPasswordContent(initialCapacity: Int = 64) : AbstractDocument.Content {
+    private var buf = CharArray(maxOf(16, initialCapacity)).also { it[0] = '\n' }
+    private var usedLen = 1
+    private val positions = ArrayList<WeakReference<TrackedPos>>()
+
+    private class TrackedPos(@Volatile var off: Int) : Position {
+        override fun getOffset(): Int = off
+    }
+
+    override fun length(): Int = usedLen
+
+    override fun createPosition(offset: Int): Position {
+        if (offset < 0 || offset > usedLen) {
+            throw BadLocationException("Invalid position offset", offset)
+        }
+        pruneDeadPositions()
+        val pos = TrackedPos(offset)
+        positions.add(WeakReference(pos))
+        return pos
+    }
+
+    override fun insertString(where: Int, str: String): UndoableEdit? {
+        if (where < 0 || where > usedLen) {
+            throw BadLocationException("Invalid insert offset", where)
+        }
+        if (str.isEmpty()) return null
+        ensureCapacity(usedLen + str.length)
+        System.arraycopy(buf, where, buf, where + str.length, usedLen - where)
+        for (i in str.indices) {
+            buf[where + i] = str[i]
+        }
+        usedLen += str.length
+        updatePositionsForInsert(where, str.length)
+        return null
+    }
+
+    override fun remove(where: Int, nitems: Int): UndoableEdit? {
+        if (where < 0 || nitems < 0 || where + nitems >= usedLen) {
+            throw BadLocationException("Invalid remove range", where)
+        }
+        if (nitems == 0) return null
+        val tailCount = usedLen - (where + nitems)
+        System.arraycopy(buf, where + nitems, buf, where, tailCount)
+        buf.fill('\u0000', usedLen - nitems, usedLen)
+        usedLen -= nitems
+        updatePositionsForRemove(where, nitems)
+        return null
+    }
+
+    override fun getString(where: Int, len: Int): String {
+        if (where < 0 || len < 0 || where + len > usedLen) {
+            throw BadLocationException("Invalid getString range", where)
+        }
+        return String(buf, where, len)
+    }
+
+    override fun getChars(where: Int, len: Int, txt: Segment) {
+        if (where < 0 || len < 0 || where + len > usedLen) {
+            throw BadLocationException("Invalid getChars range", where)
+        }
+        txt.array = buf
+        txt.offset = where
+        txt.count = len
+    }
+
+    fun wipe() {
+        buf.fill('\u0000')
+        buf[0] = '\n'
+        usedLen = 1
+        val it = positions.iterator()
+        while (it.hasNext()) {
+            val p = it.next().get()
+            if (p == null) {
+                it.remove()
+            } else {
+                p.off = 0
+            }
+        }
+    }
+
+    internal fun rawBufferSnapshotForTest(): CharArray = buf.copyOf()
+
+    private fun ensureCapacity(required: Int) {
+        if (required <= buf.size) return
+        var nextCap = buf.size
+        while (nextCap < required) {
+            nextCap *= 2
+        }
+        val next = CharArray(nextCap)
+        System.arraycopy(buf, 0, next, 0, usedLen)
+        buf.fill('\u0000')
+        buf = next
+    }
+
+    private fun pruneDeadPositions() {
+        positions.removeIf { it.get() == null }
+    }
+
+    private fun updatePositionsForInsert(where: Int, len: Int) {
+        val it = positions.iterator()
+        while (it.hasNext()) {
+            val p = it.next().get()
+            if (p == null) {
+                it.remove()
+            } else if (p.off >= where && p.off != 0) {
+                p.off += len
+            }
+        }
+    }
+
+    private fun updatePositionsForRemove(where: Int, len: Int) {
+        val end = where + len
+        val it = positions.iterator()
+        while (it.hasNext()) {
+            val p = it.next().get()
+            if (p == null) {
+                it.remove()
+            } else if (p.off > end) {
+                p.off -= len
+            } else if (p.off > where) {
+                p.off = where
+            }
+        }
+    }
+}
+
+private class ZeroizingPasswordField(
+    val zeroizingContent: ZeroizingPasswordContent = ZeroizingPasswordContent(),
+) : JBPasswordField() {
+    init {
+        document = PlainDocument(zeroizingContent)
+    }
+}
 
 class BridgeSettingsConfigurable : Configurable {
     private val sbHostBinaryField = JBTextField()
@@ -46,11 +193,11 @@ class BridgeSettingsConfigurable : Configurable {
     private val defaultGenCharsetCombo = ComboBox(SecretCharset.entries.toTypedArray())
     private val pinnedActionShaField = JBTextField()
 
-    private val opTokenField = JBPasswordField()
-    private val githubTokenField = JBPasswordField()
-    private val awsAccessKeyField = JBPasswordField()
-    private val awsSecretKeyField = JBPasswordField()
-    private val awsSessionTokenField = JBPasswordField()
+    private val opTokenField = ZeroizingPasswordField()
+    private val githubTokenField = ZeroizingPasswordField()
+    private val awsAccessKeyField = ZeroizingPasswordField()
+    private val awsSecretKeyField = ZeroizingPasswordField()
+    private val awsSessionTokenField = ZeroizingPasswordField()
     private val clearStoredCredentialsCheck = JBCheckBox("Clear stored OS Keychain credentials on Apply")
     private val credentialStatusLabel = JBLabel("Checking OS Keychain status...")
 
@@ -73,12 +220,12 @@ class BridgeSettingsConfigurable : Configurable {
         }
         vmmSha256Field.emptyText.text = "Optional 64-hex SHA-256 of QEMU binary (Linux KVM)"
         pinnedEnclavePubkeyHexField.emptyText.text =
-            "Required 64-hex guest enclave Noise pubkey (vm/out/enclave-pubkey.txt)"
+            "Optional 64-hex HSM/static pin (blank = ephemeral per-boot guest MemSecret keypair)"
         enclaveKeyFileField.emptyText.text =
-            "Mode-0400 enclave Noise key file (provisioned via sb-enclave --generate-identity)"
+            "Optional mode-0400 enclave Noise key file (blank = ephemeral MemSecret keypair)"
         allowedGithubHostField.emptyText.text = "github.com (single authorized host)"
-        allowedGithubOwnersField.emptyText.text = "Optional comma-separated GitHub orgs/owners"
-        allowedAwsAccountsField.emptyText.text = "Optional comma-separated 12-digit AWS account IDs"
+        allowedGithubOwnersField.emptyText.text = "Required for GitHub sync: comma-separated GitHub orgs/owners"
+        allowedAwsAccountsField.emptyText.text = "Required for AWS sync: comma-separated 12-digit AWS account IDs"
         opTokenField.emptyText.text = "Leave blank to keep existing OS Keychain token"
         githubTokenField.emptyText.text = "Leave blank to keep existing GitHub token"
         awsAccessKeyField.emptyText.text = "Optional (leave blank to keep existing)"
@@ -104,7 +251,7 @@ class BridgeSettingsConfigurable : Configurable {
             .addLabeledComponent("Guest AF_VSOCK port:", vsockPortSpinner, 1, false)
             .addLabeledComponent("MicroVM RAM (MiB):", memoryMibSpinner, 1, false)
             .addLabeledComponent("Existing enclave pubkey (64-hex):", enclavePubkeyHexField, 1, false)
-            .addLabeledComponent("Pinned enclave pubkey (64-hex, required):", pinnedEnclavePubkeyHexField, 1, false)
+            .addLabeledComponent("Pinned enclave pubkey (64-hex, optional):", pinnedEnclavePubkeyHexField, 1, false)
             .addLabeledComponent("Local sb-enclave binary:", enclaveBinaryField, 1, false)
             .addLabeledComponent("Local enclave key file:", enclaveKeyFileField, 1, false)
             .addSeparator()
@@ -209,24 +356,22 @@ class BridgeSettingsConfigurable : Configurable {
         wipePasswordField(awsSessionTokenField)
     }
 
-    private fun wipePasswordField(field: JBPasswordField) {
+    private fun wipePasswordField(field: ZeroizingPasswordField) {
         try {
             val doc = field.document
             val len = doc.length
             if (len > 0) {
                 doc.remove(0, len)
-                doc.insertString(0, "0".repeat(len), null)
-                doc.remove(0, doc.length)
             }
         } catch (_: Exception) {
         }
-        field.text = ""
+        field.zeroizingContent.wipe()
     }
 
     override fun apply() {
         val settings = BridgeSettings.getInstance()
         val s = settings.state
-        s.sbHostBinaryPath = sbHostBinaryField.text.trim().ifEmpty { "sb-host" }
+        s.sbHostBinaryPath = sbHostBinaryField.text.trim().ifEmpty { "/usr/local/bin/sb-host" }
         s.backendMode = (backendModeCombo.selectedItem as? HostBackendMode ?: HostBackendMode.KVM_MICROVM).wireValue
         s.vmmBinaryPath = vmmBinaryField.text.trim()
         s.vmmSha256 = vmmSha256Field.text.trim()

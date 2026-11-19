@@ -78,6 +78,44 @@ class HostSocketTransport(
         }
     }
 
+    @Synchronized
+    fun executeCaptureAndSeal(
+        command: HostCommand.CaptureAndSeal,
+        onArmed: ((Long) -> Unit)? = null,
+    ): HostResponse {
+        check(tokenChars.isNotEmpty()) { "HostSocketTransport has already been closed" }
+        val envelope = AuthenticatedHostEnvelope(tokenChars, command)
+        val requestBytes = JsonCodec.encodeUtf8(envelope.toJson(), appendNewline = true)
+        try {
+            openTimedUnixChannel(socketPath, ioTimeoutMs).use { io ->
+                io.writeFully(requestBytes)
+                val firstLine = io.readUtf8Line(MAX_RESPONSE_BYTES)
+                if (firstLine.isBlank()) {
+                    throw EnclaveBridgeException(
+                        "transport_failure",
+                        "Empty response received from sb-host during CaptureAndSeal",
+                    )
+                }
+                val firstJson = JsonCodec.parseObject(firstLine)
+                if (command.notifyArmed && firstJson.bool("armed") == true) {
+                    val effectiveTtlMs = firstJson.long("ttl_ms") ?: command.ttlMs ?: 15_000L
+                    onArmed?.invoke(effectiveTtlMs)
+                    val secondLine = io.readUtf8Line(MAX_RESPONSE_BYTES)
+                    if (secondLine.isBlank()) {
+                        throw EnclaveBridgeException(
+                            "transport_failure",
+                            "Empty completion response from sb-host after armed capture",
+                        )
+                    }
+                    return HostResponse.fromJson(JsonCodec.parseObject(secondLine))
+                }
+                return HostResponse.fromJson(firstJson)
+            }
+        } finally {
+            requestBytes.fill(0)
+        }
+    }
+
     /**
      * Opens a blind [HostCommand.NoiseTunnel] through `sb-host`, verifies `enclave_pubkey_hex` in
      * constant time, performs a fresh `Noise_IK` handshake directly with `sb-enclave`, and executes
@@ -432,7 +470,9 @@ class HostSocketTransport(
 @Service(Service.Level.PROJECT)
 class EnclaveClient(private val project: Project) : Disposable {
     private val lock = Any()
-    private var managedProcess: ManagedHostProcess? = null
+    private val managedProcessRef = AtomicReference<ManagedHostProcess?>(null)
+    @Volatile
+    private var disposed = false
 
     fun manifestPathOrNull(): Path? {
         val basePath = project.basePath ?: return null
@@ -456,15 +496,17 @@ class EnclaveClient(private val project: Project) : Disposable {
     }
 
     /**
-     * Executes the 3-step zero-trust Armed Copy Hijack (`C2`, `H2`):
+     * Executes the 3-step zero-trust Armed Copy Hijack (`C2`, `H2`, `V2-H4`):
      * 1. `BeginCapture` over E2E `Noise_IK` -> receives ephemeral `pk_capture_b64`
-     * 2. `HostCommand.CaptureAndSeal` on `sb-host` (`mlock` -> X25519 seal -> ciphertext only)
+     * 2. `HostCommand.CaptureAndSeal(notifyArmed = true)` on `sb-host` -> fires [onArmed] ONLY once
+     *    the native capture hook is armed (`{"armed":true,...}`), then seals in `mlock` RAM
      * 3. `CompleteCapture` over E2E `Noise_IK` -> guest enclave unseals & writes to 1Password
      */
     fun executeArmedCaptureOffEdt(
         manifest: Manifest,
         environment: String,
         target: CaptureTarget,
+        onArmed: ((Long) -> Unit)? = null,
     ): SecretMutationReceipt {
         assertOffEdt()
         val session = ensureRunningSession()
@@ -473,11 +515,13 @@ class EnclaveClient(private val project: Project) : Disposable {
         ) as? EnclaveResult.CaptureStarted
             ?: throw EnclaveBridgeException("internal_error", "Unexpected BeginCapture response")
 
-        val (sealedB64, mode) = session.transport.execute(
+        val (sealedB64, mode) = session.transport.executeCaptureAndSeal(
             HostCommand.CaptureAndSeal(
                 pkCaptureB64 = started.pkCaptureB64,
                 ttlMs = started.expiresInMs,
+                notifyArmed = true,
             ),
+            onArmed = onArmed,
         ).requireSealedCapture()
 
         val stored = session.transport.executeEnclave(
@@ -493,35 +537,41 @@ class EnclaveClient(private val project: Project) : Disposable {
 
     fun reconfigureCredentialsOffEdt() {
         assertOffEdt()
-        val session = synchronized(lock) { managedProcess } ?: return
+        val session = managedProcessRef.get() ?: return
         pushBootstrapCredentials(session.transport)
     }
 
     fun restartSessionOffEdt() {
         assertOffEdt()
-        val detached = synchronized(lock) { detachLocked() }
+        val detached = synchronized(lock) { detachAtomically() }
         teardownProcessOffEdt(detached)
         ensureRunningSession()
     }
 
     private fun ensureRunningSession(): ManagedHostProcess {
+        if (disposed) {
+            throw ProcessCanceledException()
+        }
         synchronized(lock) {
-            val existing = managedProcess
+            if (disposed) {
+                throw ProcessCanceledException()
+            }
+            val existing = managedProcessRef.get()
             if (existing != null && existing.process.isAlive) {
                 return existing
             }
-            val stale = detachLocked()
+            val stale = detachAtomically()
             teardownProcessOffEdt(stale)
 
             val settings = BridgeSettings.getInstance()
             val settingsState = settings.state
             val mode = HostBackendMode.fromWire(settingsState.backendMode)
-            val pinnedPub32 = try {
-                settingsState.resolvePinnedEnclavePubkey32()
+            val configuredPinnedPub32 = try {
+                settingsState.resolvePinnedEnclavePubkey32OrNull()
             } catch (e: IllegalArgumentException) {
                 throw EnclaveBridgeException(
                     "validation",
-                    e.message ?: "Pinned enclave Noise static public key is required",
+                    e.message ?: "Invalid enclave Noise static public key configuration",
                 )
             }
 
@@ -529,7 +579,7 @@ class EnclaveClient(private val project: Project) : Disposable {
                 try {
                     settings.acquireManagedGuestCidLease()
                 } catch (e: Exception) {
-                    pinnedPub32.fill(0)
+                    configuredPinnedPub32?.fill(0)
                     throw EnclaveBridgeException(
                         "transport_failure",
                         e.message ?: "Unable to acquire host-wide AF_VSOCK guest CID lease",
@@ -542,7 +592,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             val (clientPriv32, clientPub32) = try {
                 settings.loadOrCreateClientNoiseKeypairOffEdt()
             } catch (e: Exception) {
-                pinnedPub32.fill(0)
+                configuredPinnedPub32?.fill(0)
                 cidLease?.close()
                 throw e
             }
@@ -551,7 +601,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             val runtimeDir = try {
                 createPrivateSocketDirectory()
             } catch (e: Exception) {
-                pinnedPub32.fill(0)
+                configuredPinnedPub32?.fill(0)
                 clientPriv32.fill(0)
                 cidLease?.close()
                 throw e
@@ -567,7 +617,7 @@ class EnclaveClient(private val project: Project) : Disposable {
                     effectiveGuestCid = cidLease?.cid ?: settingsState.guestCid,
                 )
             } catch (e: IllegalArgumentException) {
-                pinnedPub32.fill(0)
+                configuredPinnedPub32?.fill(0)
                 clientPriv32.fill(0)
                 cidLease?.close()
                 cleanupRuntimeDir(runtimeDir)
@@ -588,7 +638,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             val proc = try {
                 pb.start()
             } catch (e: Exception) {
-                pinnedPub32.fill(0)
+                configuredPinnedPub32?.fill(0)
                 clientPriv32.fill(0)
                 cidLease?.close()
                 cleanupRuntimeDir(runtimeDir)
@@ -616,7 +666,7 @@ class EnclaveClient(private val project: Project) : Disposable {
 
             val readyChars = readStartupBannerCharsWithTimeout(proc.inputStream, STARTUP_TIMEOUT_MS)
             if (readyChars == null) {
-                pinnedPub32.fill(0)
+                configuredPinnedPub32?.fill(0)
                 clientPriv32.fill(0)
                 proc.destroyForcibly()
                 cidLease?.close()
@@ -628,7 +678,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             val parsedBanner = try {
                 HostSocketTransport.parseReadyBannerChars(readyChars)
             } catch (e: Exception) {
-                pinnedPub32.fill(0)
+                configuredPinnedPub32?.fill(0)
                 clientPriv32.fill(0)
                 proc.destroyForcibly()
                 cidLease?.close()
@@ -638,34 +688,50 @@ class EnclaveClient(private val project: Project) : Disposable {
                 readyChars.fill('\u0000')
             }
 
-            // Fail closed BEFORE opening any Noise_IK tunnel or transmitting bootstrap credentials:
-            // never accept `SB_HOST_READY enckey=` from the untrusted host relay unless it matches `pinnedPub32`.
-            if (
-                parsedBanner.enclavePubkey32.size != 32 ||
-                !NoiseIkSession.constantTimeEquals(pinnedPub32, parsedBanner.enclavePubkey32)
-            ) {
+            // Never connect to an arbitrary banner-reported socket path (`V2-H4`): verify exact match with `ideSock`.
+            if (parsedBanner.socketPath.toAbsolutePath().normalize() != ideSock.toAbsolutePath().normalize()) {
                 parsedBanner.authTokenChars.fill('\u0000')
                 parsedBanner.enclavePubkey32.fill(0)
-                pinnedPub32.fill(0)
+                configuredPinnedPub32?.fill(0)
                 clientPriv32.fill(0)
                 proc.destroyForcibly()
                 cidLease?.close()
                 cleanupRuntimeDir(runtimeDir)
                 throw EnclaveBridgeException(
                     "unauthorized",
-                    "Guest enclave Noise pubkey did not match configured pinned pubkey",
+                    "sb-host reported unexpected Unix socket path in SB_HOST_READY",
                 )
             }
 
+            val bannerPubValid =
+                parsedBanner.enclavePubkey32.size == 32 &&
+                    parsedBanner.enclavePubkey32.any { it != 0.toByte() }
+            val pinMatch = configuredPinnedPub32 == null ||
+                NoiseIkSession.constantTimeEquals(configuredPinnedPub32, parsedBanner.enclavePubkey32)
+            if (!bannerPubValid || !pinMatch) {
+                parsedBanner.authTokenChars.fill('\u0000')
+                parsedBanner.enclavePubkey32.fill(0)
+                configuredPinnedPub32?.fill(0)
+                clientPriv32.fill(0)
+                proc.destroyForcibly()
+                cidLease?.close()
+                cleanupRuntimeDir(runtimeDir)
+                throw EnclaveBridgeException(
+                    "unauthorized",
+                    "Guest enclave Noise pubkey failed verification against configured policy",
+                )
+            }
+
+            val sessionEnclavePub32 = configuredPinnedPub32 ?: parsedBanner.enclavePubkey32.copyOf()
             val transport = HostSocketTransport(
-                socketPath = parsedBanner.socketPath,
+                socketPath = ideSock,
                 authTokenHex = parsedBanner.authTokenChars,
                 clientPrivateKey32 = clientPriv32,
-                expectedEnclavePubkey32 = pinnedPub32,
+                expectedEnclavePubkey32 = sessionEnclavePub32,
             )
             parsedBanner.authTokenChars.fill('\u0000')
             parsedBanner.enclavePubkey32.fill(0)
-            pinnedPub32.fill(0)
+            sessionEnclavePub32.fill(0)
             clientPriv32.fill(0)
 
             val session = ManagedHostProcess(
@@ -683,7 +749,11 @@ class EnclaveClient(private val project: Project) : Disposable {
                 throw e
             }
 
-            managedProcess = session
+            if (disposed) {
+                teardownProcessOffEdt(session)
+                throw ProcessCanceledException()
+            }
+            managedProcessRef.set(session)
             return session
         }
     }
@@ -697,9 +767,8 @@ class EnclaveClient(private val project: Project) : Disposable {
         }
     }
 
-    private fun detachLocked(): ManagedHostProcess? {
-        val current = managedProcess ?: return null
-        managedProcess = null
+    private fun detachAtomically(): ManagedHostProcess? {
+        val current = managedProcessRef.getAndSet(null) ?: return null
         try {
             current.transport.close()
         } catch (_: Exception) {
@@ -727,8 +796,13 @@ class EnclaveClient(private val project: Project) : Disposable {
         cleanupRuntimeDir(session.runtimeDir)
     }
 
+    /**
+     * Lock-free EDT-safe disposal (`V2-H4`): atomically detaches [managedProcessRef] without
+     * acquiring `synchronized(lock)` so project close never freezes the Swing EDT during VM boot.
+     */
     override fun dispose() {
-        val detached = synchronized(lock) { detachLocked() } ?: return
+        disposed = true
+        val detached = detachAtomically() ?: return
         val app = ApplicationManager.getApplication()
         if (app != null && SwingUtilities.isEventDispatchThread()) {
             app.executeOnPooledThread {

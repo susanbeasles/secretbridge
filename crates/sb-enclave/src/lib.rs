@@ -16,8 +16,9 @@ mod tests {
     use crate::service::EnclaveService;
     use crate::templates::escape_hcl_string;
     use crate::vault::{
-        ForeignBytes, InMemoryVaultProvider, RustBuffer, RustCallStatus, UniffiCoreVaultProvider,
-        UniffiSymbolTable, VaultProvider,
+        ForeignBytes, InMemoryVaultProvider, RustBuffer, RustCallStatus, UniffiBufCall,
+        UniffiCoreVaultProvider, UniffiFutureContinuationCallback, UniffiSymbolTable,
+        VaultProvider, unescape_json_string_to_mem_secret,
     };
     use crate::vsock::serve_noise_connection;
     use sb_proto::crypto::{NoiseSession, generate_noise_keypair, seal_base64};
@@ -474,6 +475,7 @@ mod tests {
                 github: true,
                 aws: true,
                 allow_unmanaged_github_delete: false,
+                allow_unmanaged_github_overwrite: false,
             },
         );
         let del_plan_resp = svc.handle(EnclaveRequest::Plan {
@@ -496,10 +498,49 @@ mod tests {
         });
         assert!(del_apply.ok);
 
-        // Verify pre-existing UNMANAGED GitHub secret deletion is refused unless allow_unmanaged_github_delete=true (`H3`)
+        // Verify pre-existing UNMANAGED GitHub secret overwrite is refused unless allow_unmanaged_github_overwrite=true (`V2-M1`)
         let unmanaged_name: SecretName = "LEGACY_CI_TOKEN".parse().unwrap();
         gh.seed_unmanaged_secret(&gh_target, &unmanaged_name, b"preexisting")
             .unwrap();
+        manifest.environments.get_mut(&dev).unwrap().secrets.insert(
+            unmanaged_name.clone(),
+            sb_proto::types::SecretSpec {
+                r#ref: Some("op://vault-dev-01/item-db/url".parse().unwrap()),
+                state: SecretState::Present,
+                group: None,
+                github: true,
+                aws: false,
+                allow_unmanaged_github_delete: false,
+                allow_unmanaged_github_overwrite: false,
+            },
+        );
+        let refused_gh_overwrite = svc.handle(EnclaveRequest::Plan {
+            manifest: manifest.clone(),
+            environment: dev.clone(),
+        });
+        assert!(!refused_gh_overwrite.ok);
+        assert_eq!(
+            refused_gh_overwrite.error.unwrap().code,
+            ErrorCode::OwnershipConflict
+        );
+
+        manifest
+            .environments
+            .get_mut(&dev)
+            .unwrap()
+            .secrets
+            .get_mut(&unmanaged_name)
+            .unwrap()
+            .allow_unmanaged_github_overwrite = true;
+        assert!(
+            svc.handle(EnclaveRequest::Plan {
+                manifest: manifest.clone(),
+                environment: dev.clone(),
+            })
+            .ok
+        );
+
+        // Verify pre-existing UNMANAGED GitHub secret deletion is refused unless allow_unmanaged_github_delete=true (`H3`)
         manifest.environments.get_mut(&dev).unwrap().secrets.insert(
             unmanaged_name.clone(),
             sb_proto::types::SecretSpec {
@@ -509,6 +550,7 @@ mod tests {
                 github: true,
                 aws: false,
                 allow_unmanaged_github_delete: false,
+                allow_unmanaged_github_overwrite: false,
             },
         );
         let refused_gh_del = svc.handle(EnclaveRequest::Plan {
@@ -539,7 +581,7 @@ mod tests {
 
     #[test]
     fn enforces_ssrf_ip_filter_host_binding_and_atomic_session_replacement_closing_c1_c2_h4() {
-        // 1. PublicIpOnlyResolver filter (`C1`, `H4`)
+        // 1. PublicIpOnlyResolver filter (`C1`, `H4`, `V2-H5`)
         for blocked in [
             "127.0.0.1",
             "0.0.0.0",
@@ -554,6 +596,11 @@ mod tests {
             "fc00::1",
             "::ffff:10.0.2.2", // IPv4-mapped SLIRP gateway
             "::ffff:127.0.0.1",
+            "64:ff9b::a9fe:a9fe", // NAT64 Well-Known Prefix
+            "64:ff9b:1::1",       // NAT64 Local-Use Prefix
+            "2002:7f00:1::1",     // 6to4 loopback
+            "2001:0::1",          // Teredo
+            "::0a00:0202",        // IPv4-compatible ::/96
         ] {
             let ip: IpAddr = blocked.parse().unwrap();
             assert!(!is_public_unicast_ip(ip), "{blocked} must be blocked");
@@ -563,7 +610,7 @@ mod tests {
             assert!(is_public_unicast_ip(ip), "{public_ip} must be allowed");
         }
 
-        // 2. Untrusted manifest pointing at `evil.example.com` or unauthorized owner/account (`C1`, `C2`)
+        // 2. Untrusted manifest pointing at `evil.example.com` or unauthorized owner/account (`C1`, `C2`, `V2-H5`)
         let (svc, _, _, _) = build_fixture(true);
         let dev: Slug = "dev".parse().unwrap();
         let mut evil_host_manifest = sample_manifest();
@@ -596,6 +643,74 @@ mod tests {
                 .iter()
                 .any(|e| e.subsystem == "github-target:dev" && e.status == "error")
         );
+
+        // Default-empty owner or AWS account allowlists must fail closed (`V2-H5`)
+        let _ = svc.handle(EnclaveRequest::ConfigureSession {
+            credentials: SessionCredentialsInput {
+                op_service_account_token: Some(dummy_op_token()),
+                github_token: Some(dummy_gh_token()),
+                aws_access_key_id: Some(dummy_aws_ak()),
+                aws_secret_access_key: Some(dummy_aws_sk()),
+                aws_session_token: None,
+                allowed_github_hosts: vec!["github.com".into()],
+                allowed_github_owners: Vec::new(),
+                allowed_aws_account_ids: vec!["123456789012".into()],
+            },
+        });
+        let empty_owner_plan = svc.handle(EnclaveRequest::Plan {
+            manifest: sample_manifest(),
+            environment: dev.clone(),
+        });
+        assert!(!empty_owner_plan.ok);
+        assert_eq!(
+            empty_owner_plan.error.unwrap().code,
+            ErrorCode::Unauthorized
+        );
+
+        // Enterprise GHES session must require explicit action_sha for Workflow1password (`V2-M2`)
+        let _ = svc.handle(EnclaveRequest::ConfigureSession {
+            credentials: SessionCredentialsInput {
+                op_service_account_token: Some(dummy_op_token()),
+                github_token: Some(dummy_gh_token()),
+                aws_access_key_id: None,
+                aws_secret_access_key: None,
+                aws_session_token: None,
+                allowed_github_hosts: vec!["ghe.acme.com".into()],
+                allowed_github_owners: vec!["susanbeasles".into()],
+                allowed_aws_account_ids: Vec::new(),
+            },
+        });
+        let mut ghes_manifest = sample_manifest();
+        ghes_manifest
+            .environments
+            .get_mut(&dev)
+            .unwrap()
+            .github
+            .as_mut()
+            .unwrap()
+            .host = "ghe.acme.com".parse().unwrap();
+        let unpinned_ghes_tpl = svc.handle(EnclaveRequest::Template {
+            manifest: ghes_manifest,
+            environment: dev.clone(),
+            kind: TemplateKind::Workflow1password,
+            action_sha: None,
+        });
+        assert!(!unpinned_ghes_tpl.ok);
+        assert_eq!(unpinned_ghes_tpl.error.unwrap().code, ErrorCode::Validation);
+
+        // Restore valid allowlisted session before testing atomic wipe & key rotation
+        let _ = svc.handle(EnclaveRequest::ConfigureSession {
+            credentials: SessionCredentialsInput {
+                op_service_account_token: Some(dummy_op_token()),
+                github_token: Some(dummy_gh_token()),
+                aws_access_key_id: Some(dummy_aws_ak()),
+                aws_secret_access_key: Some(dummy_aws_sk()),
+                aws_session_token: None,
+                allowed_github_hosts: vec!["github.com".into()],
+                allowed_github_owners: vec!["susanbeasles".into()],
+                allowed_aws_account_ids: vec!["123456789012".into()],
+            },
+        });
 
         // 3. Atomic ConfigureSession wipes omitted tokens and invalidates prior SignedPlans (`C2`)
         let manifest = sample_manifest();
@@ -644,7 +759,15 @@ mod tests {
     fn uniffi_rustbuffer_abi_preserves_allocations_and_splices_secrets_without_heap_strings_closing_c3()
      {
         static ALLOC_LEDGER: Mutex<BTreeMap<usize, (u64, u64)>> = Mutex::new(BTreeMap::new());
+        static FUTURE_LEDGER: Mutex<BTreeMap<u64, (usize, String)>> = Mutex::new(BTreeMap::new());
+        static RELEASED_CLIENTS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
         static MOCK_STORE: Mutex<Option<String>> = Mutex::new(None);
+
+        // Verify malformed `\u` adjacent to 4-byte UTF-8 never panics (`V2-C2`)
+        assert!(unescape_json_string_to_mem_secret("\"\\u12\u{1F510}\"".as_bytes()).is_err());
+        assert!(
+            unescape_json_string_to_mem_secret("\"\\uD83D\\u12\u{1F510}\"".as_bytes()).is_err()
+        );
 
         unsafe extern "C" fn test_rb_from_bytes(
             bytes: ForeignBytes,
@@ -654,8 +777,6 @@ mod tests {
                 (*status).code = 0;
             }
             let len = bytes.len.max(0) as usize;
-            // Deliberately allocate extra capacity (`len + 37`) to prove `zeroize_and_free_rustbuffer`
-            // never clobbers `capacity` or `len` before calling `rustbuffer_free` (`C3`).
             let mut vec = Vec::<u8>::with_capacity(len + 37);
             if len > 0 && !bytes.data.is_null() {
                 let slice = unsafe { std::slice::from_raw_parts(bytes.data, len) };
@@ -704,29 +825,63 @@ mod tests {
             unsafe { test_rb_from_bytes(fb, &raw mut status) }
         }
 
-        unsafe extern "C" fn test_init_client(
-            arg: RustBuffer,
-            status: *mut RustCallStatus,
-        ) -> RustBuffer {
+        // Authentic Mozilla UniFFI async `init_client(RustBuffer) -> u64` (`RustFuture` handle, `V2-C2`)
+        unsafe extern "C" fn test_init_client_async(arg: RustBuffer) -> u64 {
             let slice = unsafe { std::slice::from_raw_parts(arg.data, arg.len as usize) };
             let text = std::str::from_utf8(slice).unwrap();
             assert!(text.contains("\"serviceAccountToken\":"));
-            // UniFFI callee consumes `arg` by value (`C3`).
             let mut free_st = RustCallStatus::default();
             unsafe {
                 test_rb_free(arg, &raw mut free_st);
-                (*status).code = 0;
             }
-            make_ret_buf("77")
+            let mut futs = FUTURE_LEDGER.lock().unwrap();
+            let handle = (futs.len() as u64) + 100;
+            futs.insert(handle, (0, "77".to_string()));
+            handle
         }
 
-        unsafe extern "C" fn test_release_client(arg: RustBuffer, status: *mut RustCallStatus) {
-            let slice = unsafe { std::slice::from_raw_parts(arg.data, arg.len as usize) };
-            let text = std::str::from_utf8(slice).unwrap();
-            assert_eq!(text, "{\"client_id\":77}");
-            let mut free_st = RustCallStatus::default();
+        unsafe extern "C" fn test_future_poll(
+            handle: u64,
+            cb: UniffiFutureContinuationCallback,
+            cb_data: u64,
+        ) {
+            let poll_code = {
+                let mut futs = FUTURE_LEDGER.lock().unwrap();
+                let (polls, _) = futs.get_mut(&handle).expect("valid future handle");
+                *polls += 1;
+                // Exercise multi-step async wakeup (`1 = WAKE` on first poll, `0 = READY` on second poll)
+                if *polls == 1 { 1i8 } else { 0i8 }
+            };
+            thread::spawn(move || {
+                cb(cb_data, poll_code);
+            });
+        }
+
+        unsafe extern "C" fn test_future_complete(
+            handle: u64,
+            status: *mut RustCallStatus,
+        ) -> RustBuffer {
             unsafe {
-                test_rb_free(arg, &raw mut free_st);
+                (*status).code = 0;
+            }
+            let futs = FUTURE_LEDGER.lock().unwrap();
+            let (polls, payload) = futs.get(&handle).expect("valid future handle");
+            assert!(*polls >= 2, "must not complete before READY");
+            make_ret_buf(payload)
+        }
+
+        unsafe extern "C" fn test_future_free(handle: u64) {
+            FUTURE_LEDGER
+                .lock()
+                .unwrap()
+                .remove(&handle)
+                .expect("double-free or unknown UniFFI future handle");
+        }
+
+        unsafe extern "C" fn test_release_client(client_id: u64, status: *mut RustCallStatus) {
+            assert_eq!(client_id, 77);
+            RELEASED_CLIENTS.lock().unwrap().push(client_id);
+            unsafe {
                 (*status).code = 0;
             }
         }
@@ -774,12 +929,19 @@ mod tests {
 
         *MOCK_STORE.lock().unwrap() = None;
         ALLOC_LEDGER.lock().unwrap().clear();
+        FUTURE_LEDGER.lock().unwrap().clear();
+        RELEASED_CLIENTS.lock().unwrap().clear();
 
         let provider = UniffiCoreVaultProvider::from_test_symbol_table(UniffiSymbolTable {
             rustbuffer_from_bytes: test_rb_from_bytes,
             rustbuffer_free: test_rb_free,
-            init_client: test_init_client,
-            invoke_sync: test_invoke_sync,
+            init_client: UniffiBufCall::Async {
+                start: test_init_client_async,
+                poll: test_future_poll,
+                complete: test_future_complete,
+                free: test_future_free,
+            },
+            invoke: UniffiBufCall::Sync(test_invoke_sync),
             release_client: test_release_client,
         });
 
@@ -797,7 +959,6 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.as_bytes(), b"resolved_top_secret_\n_val");
 
-        // Append a new concealed field via byte-span splicing and verify the untouched field's secret survived intact!
         let new_val = MemSecret::from_slice(b"new_spliced_secret_\"quoted\"").unwrap();
         let receipt = provider
             .store_secret(
@@ -820,17 +981,28 @@ mod tests {
         assert_eq!(fields[0]["value"], "keep_existing_secret_untouched");
         assert_eq!(fields[1]["value"], "new_spliced_secret_\"quoted\"");
 
-        // Every single RustBuffer allocated across FFI must have been freed with zero leaks!
+        // Every single RustBuffer and RustFuture handle allocated across FFI must have been freed!
         assert!(
             ALLOC_LEDGER.lock().unwrap().is_empty(),
             "leaked RustBuffers in UniFFI bridge"
         );
+        assert!(
+            FUTURE_LEDGER.lock().unwrap().is_empty(),
+            "leaked RustFuture handles in UniFFI bridge"
+        );
+        assert_eq!(RELEASED_CLIENTS.lock().unwrap().len(), 3);
     }
 
     #[test]
     fn hcl_utf8_escaping_and_template_collision_checks_closing_m2() {
         let escaped = escape_hcl_string("caf\u{00e9}/${aws_var}/%{dir}");
         assert_eq!(escaped, "\"caf\u{00e9}/$${aws_var}/%%{dir}\"");
+
+        // Multi-sigil `$${foo}` / `$$${bar}` / `%%{baz}` must never produce active `${...}` (`V2-M2`)
+        let multi = escape_hcl_string("$${foo} / $$${bar} / %%{baz}");
+        assert_eq!(multi, "\"$$\\u007bfoo} / $$$\\u007bbar} / %%\\u007bbaz}\"");
+        assert!(!multi.contains("${"));
+        assert!(!multi.contains("%{"));
     }
 
     #[test]
@@ -881,13 +1053,13 @@ mod tests {
     }
 
     #[test]
-    fn dhcpv4_cmdline_vsock_port_and_provisioned_enclave_identity() {
+    fn dhcpv4_cmdline_vsock_port_and_ephemeral_memsecret_enclave_identity() {
         use crate::dhcp::{
             DHCP_ACK, DHCP_OFFER, build_dhcpv4_discover, build_dhcpv4_request, parse_dhcpv4_reply,
         };
         use crate::vsock::{
-            cmdline_has_token, extract_cmdline_vsock_port, load_enclave_static_keypair,
-            write_generated_enclave_identity,
+            cmdline_has_token, extract_cmdline_egress_vsock_port, extract_cmdline_vsock_port,
+            generate_ephemeral_enclave_identity,
         };
 
         let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -897,8 +1069,7 @@ mod tests {
         assert_eq!(&discover[28..34], &mac);
         assert_eq!(&discover[236..240], &[99, 130, 83, 99]);
 
-        // Simulate Apple VZNATNetworkDeviceAttachment bootpd DHCPOFFER (192.168.64.2/24, gw/dns 192.168.64.1)
-        let mut reply = vec![0u8; 272];
+        let mut reply = vec![0u8; 280];
         reply[0] = 2; // BOOTREPLY
         reply[1] = 1;
         reply[2] = 6;
@@ -909,6 +1080,7 @@ mod tests {
         let opts = [
             53, 1, DHCP_OFFER, // Msg type = OFFER
             54, 4, 192, 168, 64, 1, // Server ID
+            51, 4, 0, 0, 7, 8, // Lease Time = 1800s
             1, 4, 255, 255, 255, 0, // Subnet mask
             3, 4, 192, 168, 64, 1, // Router
             6, 4, 192, 168, 64, 1, // DNS
@@ -919,6 +1091,7 @@ mod tests {
         let (kind, lease) = parse_dhcpv4_reply(&reply, xid, mac).unwrap();
         assert_eq!(kind, DHCP_OFFER);
         assert_eq!(lease.yiaddr, [192, 168, 64, 2]);
+        assert_eq!(lease.lease_time_secs, 1_800);
         assert_eq!(lease.subnet_mask, [255, 255, 255, 0]);
         assert_eq!(lease.router, Some([192, 168, 64, 1]));
         assert_eq!(lease.dns_servers, vec![[192, 168, 64, 1]]);
@@ -931,9 +1104,13 @@ mod tests {
         assert_eq!(ack_kind, DHCP_ACK);
         assert!(parse_dhcpv4_reply(&reply, xid ^ 1, mac).is_none());
 
-        // Kernel command-line vsock port & QEMU fallback token parsing
-        let cmdline = "console=hvc0 ip=dhcp sb.vsock_port=6222 sb.client_pubkey=aa";
+        let cmdline =
+            "console=hvc0 ip=dhcp sb.vsock_port=6222 sb.egress_vsock_port=6223 sb.client_pubkey=aa";
         assert_eq!(extract_cmdline_vsock_port(cmdline).unwrap(), Some(6222));
+        assert_eq!(
+            extract_cmdline_egress_vsock_port(cmdline).unwrap(),
+            Some(6223)
+        );
         assert!(!cmdline_has_token(cmdline, "sb.net_fallback=qemu_slirp"));
         assert!(cmdline_has_token(
             "console=ttyS0 sb.net_fallback=qemu_slirp",
@@ -943,23 +1120,11 @@ mod tests {
         assert!(extract_cmdline_vsock_port("sb.vsock_port=70000").is_err());
         assert!(extract_cmdline_vsock_port("sb.vsock_port=bad").is_err());
 
-        // Provisioned static enclave identity survives non-PID1 restarts and shreds on PID1-mode request
-        let home = std::env::var("HOME").unwrap();
-        let test_dir = std::path::PathBuf::from(home)
-            .join(".local")
-            .join("run")
-            .join(format!("sb-id-test-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&test_dir).unwrap();
-        let key_path = test_dir.join("enclave.key");
-        let pub_path = test_dir.join("enclave.pub");
-
-        let expected_pub = write_generated_enclave_identity(&key_path, &pub_path).unwrap();
-        let loaded_1 = load_enclave_static_keypair(&key_path, false).unwrap();
-        let loaded_2 = load_enclave_static_keypair(&key_path, true).unwrap();
-        assert_eq!(loaded_1.public, expected_pub);
-        assert_eq!(loaded_2.public, expected_pub);
-        assert!(!key_path.exists(), "shred_after_read must unlink key file");
-        let _ = std::fs::remove_file(&pub_path);
-        let _ = std::fs::remove_dir_all(&test_dir);
+        // Ephemeral guest identity lives strictly inside `MemSecret` (`memfd_secret`/`mlock`)
+        let id_a = generate_ephemeral_enclave_identity().unwrap();
+        let id_b = generate_ephemeral_enclave_identity().unwrap();
+        assert_eq!(id_a.private.len(), 32);
+        assert_ne!(id_a.public, id_b.public);
+        assert_ne!(id_a.public, [0u8; 32]);
     }
 }

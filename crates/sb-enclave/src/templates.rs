@@ -31,23 +31,40 @@ pub fn escape_dotenv_double_quoted(raw: &str) -> String {
     out
 }
 
-/// Escapes a string literal for Terraform HCL2, neutralizing `\` / `"` and `${` / `%{` directives
-/// while preserving multi-byte UTF-8 characters intact (`M2`).
+/// Escapes a string literal for Terraform HCL2, neutralizing `\` / `"` and all `${` / `$${` /
+/// `%{` / `%%{` interpolation/directive prefixes while preserving multi-byte UTF-8 (`M2`).
 pub fn escape_hcl_string(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len() + 2);
+    let mut out = String::with_capacity(raw.len() + 8);
     out.push('"');
     let mut chars = raw.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
-            '$' if chars.peek() == Some(&'{') => {
-                let _ = chars.next();
-                out.push_str("$${");
-            }
-            '%' if chars.peek() == Some(&'{') => {
-                let _ = chars.next();
-                out.push_str("%%{");
+            '$' | '%' => {
+                let sigil = ch;
+                let mut count = 1usize;
+                while chars.peek() == Some(&sigil) {
+                    let _ = chars.next();
+                    count += 1;
+                }
+                if chars.peek() == Some(&'{') {
+                    let _ = chars.next();
+                    if count == 1 {
+                        out.push(sigil);
+                        out.push(sigil);
+                        out.push('{');
+                    } else {
+                        for _ in 0..count {
+                            out.push(sigil);
+                        }
+                        out.push_str("\\u007b");
+                    }
+                } else {
+                    for _ in 0..count {
+                        out.push(sigil);
+                    }
+                }
             }
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
