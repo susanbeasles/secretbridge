@@ -663,6 +663,22 @@ mod tests {
         assert_eq!(rc, 0);
         let err = load_manifest(&fifo_path).unwrap_err();
         assert_eq!(err.code, ErrorCode::Validation);
+
+        // Serialized manifests exceeding 512 KiB must be rejected before writing/renaming
+        let mut oversized = manifest.clone();
+        let dev_env: Slug = "dev".parse().unwrap();
+        let op_ref: OpRef = "op://vault-dev-01/oversized-item-reference-padding/password"
+            .parse()
+            .unwrap();
+        for idx in 0..4500 {
+            let name: SecretName = format!("OVERSIZED_SECRET_KEY_{idx:04}").parse().unwrap();
+            oversized
+                .bind_secret(&dev_env, name, op_ref.clone(), None, Some(true), Some(true))
+                .unwrap();
+        }
+        let save_err = save_manifest_atomic(&manifest_path, &oversized).unwrap_err();
+        assert_eq!(save_err.code, ErrorCode::Validation);
+        assert_eq!(load_manifest(&manifest_path).unwrap(), manifest);
     }
 
     #[test]

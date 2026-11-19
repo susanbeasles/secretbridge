@@ -4,7 +4,9 @@ use sb_proto::error::ErrorCode;
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::{Seek, SeekFrom};
 use std::mem::DropGuard;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -13,7 +15,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_GUEST_CID: u32 = 42;
@@ -1327,7 +1331,7 @@ impl ManagedEnclaveHandle {
             let leased_cid = cid_lease.cid();
             let egress_proxy = HostVsockHttpsEgressProxy::bind_for_guest_cid(leased_cid)?;
             let cmdline = format!(
-                "console={console_dev} reboot=k panic=1 nomodules quiet rdinit=/init ip=dhcp sb.net_fallback=qemu_slirp sb.vsock_port={} sb.egress_vsock_port={} sb.client_pubkey={client_pk_hex}",
+                "console={console_dev} reboot=k panic=1 nomodules quiet rdinit=/init sb.net_fallback=qemu_slirp sb.vsock_port={} sb.egress_vsock_port={} sb.client_pubkey={client_pk_hex}",
                 spec.vsock_port,
                 egress_proxy.port()
             );
@@ -1487,7 +1491,7 @@ impl ManagedEnclaveHandle {
 
         let client_pk_hex = hex::encode(spec.authorized_client_pubkey);
         let cmdline = format!(
-            "console=hvc0 reboot=k panic=1 nomodules quiet rdinit=/init ip=dhcp sb.vsock_port={} sb.client_pubkey={client_pk_hex}",
+            "console=hvc0 reboot=k panic=1 nomodules quiet rdinit=/init sb.vsock_port={} sb.client_pubkey={client_pk_hex}",
             spec.vsock_port
         );
 

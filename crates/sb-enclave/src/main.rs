@@ -6,11 +6,12 @@ use sb_enclave::service::EnclaveService;
 use sb_enclave::vault::{InMemoryVaultProvider, parse_sha256_allowlist_csv};
 use sb_enclave::vault::{UniffiCoreVaultProvider, VaultProvider, compiled_op_core_allowlist};
 use sb_enclave::vsock::{
-    DEFAULT_VSOCK_PORT, cmdline_has_token, extract_cmdline_client_pubkey,
-    extract_cmdline_egress_vsock_port, extract_cmdline_vsock_port,
+    DEFAULT_VSOCK_PORT, extract_cmdline_client_pubkey, extract_cmdline_vsock_port,
     generate_ephemeral_enclave_identity, load_enclave_static_keypair, parse_pubkey_hex,
     serve_unix_listener,
 };
+#[cfg(target_os = "linux")]
+use sb_enclave::vsock::{cmdline_has_token, extract_cmdline_egress_vsock_port};
 use sb_proto::error::ErrorCode;
 use std::io::Write;
 use std::path::PathBuf;
@@ -165,52 +166,53 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
         }
     }
 
-    if !has_default_route {
-        let primary_nic = std::fs::read_dir("/sys/class/net")
-            .ok()
-            .and_then(|entries| {
-                entries
-                    .flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .find(|n| n != "lo")
-            })
-            .unwrap_or_else(|| "eth0".to_string());
+    let primary_nic = std::fs::read_dir("/sys/class/net")
+        .ok()
+        .and_then(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .find(|n| n != "lo")
+        })
+        .unwrap_or_else(|| "eth0".to_string());
 
+    let apply_lease_cfg = |nic: &str, l: &sb_enclave::dhcp::DhcpLease| -> bool {
+        let s_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if s_fd < 0 {
+            return false;
+        }
+        let _s_guard = DropGuard::new(s_fd, |fd| unsafe {
+            let _ = libc::close(fd);
+        });
+        if !set_if_ipv4_up(s_fd, nic, l.yiaddr, l.subnet_mask) {
+            return false;
+        }
+        if let Some(gw) = l.router {
+            add_default_gateway(s_fd, gw);
+        }
+        let mut resolv = String::new();
+        let dns_list = if !l.dns_servers.is_empty() {
+            l.dns_servers.clone()
+        } else if let Some(gw) = l.router {
+            vec![gw]
+        } else {
+            Vec::new()
+        };
+        for ip in dns_list {
+            resolv.push_str(&format!(
+                "nameserver {}.{}.{}.{}\n",
+                ip[0], ip[1], ip[2], ip[3]
+            ));
+        }
+        if !resolv.is_empty() {
+            let _ = std::fs::write("/etc/resolv.conf", resolv);
+        }
+        true
+    };
+
+    if !has_default_route {
         match sb_enclave::dhcp::acquire_dhcpv4_lease(&primary_nic, Duration::from_millis(1_500)) {
             Ok(lease) => {
-                let apply_lease_cfg = |nic: &str, l: &sb_enclave::dhcp::DhcpLease| -> bool {
-                    let s_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-                    if s_fd < 0 {
-                        return false;
-                    }
-                    let _s_guard = DropGuard::new(s_fd, |fd| unsafe {
-                        let _ = libc::close(fd);
-                    });
-                    if !set_if_ipv4_up(s_fd, nic, l.yiaddr, l.subnet_mask) {
-                        return false;
-                    }
-                    if let Some(gw) = l.router {
-                        add_default_gateway(s_fd, gw);
-                    }
-                    let mut resolv = String::new();
-                    let dns_list = if !l.dns_servers.is_empty() {
-                        l.dns_servers.clone()
-                    } else if let Some(gw) = l.router {
-                        vec![gw]
-                    } else {
-                        Vec::new()
-                    };
-                    for ip in dns_list {
-                        resolv.push_str(&format!(
-                            "nameserver {}.{}.{}.{}\n",
-                            ip[0], ip[1], ip[2], ip[3]
-                        ));
-                    }
-                    if !resolv.is_empty() {
-                        let _ = std::fs::write("/etc/resolv.conf", resolv);
-                    }
-                    true
-                };
                 if !apply_lease_cfg(&primary_nic, &lease) {
                     return Err(EnclaveError::new(
                         ErrorCode::TransportFailure,
@@ -236,6 +238,27 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
                 }
             }
         }
+    } else {
+        // Kernel IP autoconfiguration (`ip=dhcp`) does not renew DHCPv4 leases in userspace.
+        // Hand off T1 renewal responsibility asynchronously to userspace without delaying boot.
+        let handoff_nic = primary_nic.clone();
+        let _ = std::thread::Builder::new()
+            .name("sb-dhcp-handoff".into())
+            .spawn(move || {
+                if let Ok(lease) =
+                    sb_enclave::dhcp::acquire_dhcpv4_lease(&handoff_nic, Duration::from_secs(2))
+                {
+                    let _ = apply_lease_cfg(&handoff_nic, &lease);
+                    let renew_nic = handoff_nic.clone();
+                    sb_enclave::dhcp::spawn_dhcpv4_renewal_daemon(
+                        renew_nic.clone(),
+                        lease,
+                        move |l| {
+                            let _ = apply_lease_cfg(&renew_nic, l);
+                        },
+                    );
+                }
+            });
     }
 
     // Reap any orphaned/transient child processes while running as Linux PID 1 (`V2-H2`).

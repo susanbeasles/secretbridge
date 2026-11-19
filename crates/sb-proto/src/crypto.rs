@@ -342,10 +342,28 @@ impl NoiseSession {
                     "empty continuation noise chunk rejected".into(),
                 ));
             }
-            if assembled.len().saturating_add(payload.len()) > MAX_RPC_MESSAGE_BYTES {
+            let required = assembled.len().saturating_add(payload.len());
+            if required > MAX_RPC_MESSAGE_BYTES {
                 return Err(ProtoError::Transport(
                     "assembled RPC message exceeds 1 MiB cap".into(),
                 ));
+            }
+            if required > assembled.capacity() {
+                // Allocate the grown buffer inside a fresh `Zeroizing<Vec<u8>>` and drop the
+                // previous `Zeroizing<Vec<u8>>` so discarded intermediate buffers are wiped immediately.
+                let next_cap = if more == 0x01 {
+                    assembled
+                        .capacity()
+                        .max(PLAINTEXT_CHUNK_BYTES)
+                        .saturating_mul(2)
+                        .max(required)
+                        .min(MAX_RPC_MESSAGE_BYTES)
+                } else {
+                    required
+                };
+                let mut grown = Zeroizing::new(Vec::with_capacity(next_cap));
+                grown.extend_from_slice(&assembled);
+                assembled = grown;
             }
             assembled.extend_from_slice(payload);
             match more {

@@ -1,6 +1,10 @@
+#[cfg(target_os = "linux")]
 use crate::error::EnclaveError;
+#[cfg(target_os = "linux")]
 use rand::RngCore;
+#[cfg(target_os = "linux")]
 use rand::rngs::OsRng;
+#[cfg(target_os = "linux")]
 use sb_proto::error::ErrorCode;
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};

@@ -355,6 +355,12 @@ pub fn save_manifest_atomic(path: &Path, manifest: &Manifest) -> Result<(), Host
         )
     })?;
     payload.push('\n');
+    if (payload.len() as u64) > MAX_MANIFEST_BYTES {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            "serialized secretbridge.json exceeds 512 KiB ceiling",
+        ));
+    }
 
     let tmp_name = format!(".{file_name}.{}.tmp", Uuid::new_v4().simple());
     let tmp_cstr = CString::new(tmp_name.as_bytes())
