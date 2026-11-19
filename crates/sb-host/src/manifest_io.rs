@@ -457,8 +457,14 @@ pub fn save_manifest_atomic(path: &Path, manifest: &Manifest) -> Result<(), Host
 
     let _ = DropGuard::dismiss(tmp_guard);
     // SAFETY: Syncs directory entry durability on the verified parent directory descriptor.
-    unsafe {
-        let _ = libc::fsync(parent_fd.as_raw_fd());
+    if unsafe { libc::fsync(parent_fd.as_raw_fd()) } != 0 {
+        return Err(HostError::new(
+            ErrorCode::ManifestIo,
+            format!(
+                "manifest renamed into place at secretbridge.json, but parent directory fsync failed (update may not be durable across crash): {}",
+                io::Error::last_os_error()
+            ),
+        ));
     }
     Ok(())
 }

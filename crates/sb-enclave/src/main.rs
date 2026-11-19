@@ -142,6 +142,18 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
         }
     }
 
+    fn del_default_gateway(sock: i32, gw: [u8; 4]) {
+        // SAFETY: Zero-initialized `rtentry` populated with valid `AF_INET` sockaddrs.
+        unsafe {
+            let mut rt: libc::rtentry = std::mem::zeroed();
+            rt.rt_dst = make_sin([0, 0, 0, 0]);
+            rt.rt_genmask = make_sin([0, 0, 0, 0]);
+            rt.rt_gateway = make_sin(gw);
+            rt.rt_flags = (libc::RTF_UP | libc::RTF_GATEWAY) as libc::c_ushort;
+            let _ = libc::ioctl(sock, libc::SIOCDELRT as _, &mut rt);
+        }
+    }
+
     let _ = set_if_ipv4_up(sock, "lo", [127, 0, 0, 1], [255, 0, 0, 0]);
 
     // Check if kernel `ip=dhcp` already configured a default route & `/proc/net/pnp`.
@@ -177,7 +189,7 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
         .unwrap_or_else(|| "eth0".to_string());
 
     let apply_lease_cfg = |nic: &str, l: &sb_enclave::dhcp::DhcpLease| -> bool {
-        let s_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        let s_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
         if s_fd < 0 {
             return false;
         }
@@ -210,6 +222,20 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
         true
     };
 
+    let withdraw_lease_cfg = |nic: &str, l: &sb_enclave::dhcp::DhcpLease| {
+        let s_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        if s_fd >= 0 {
+            let _s_guard = DropGuard::new(s_fd, |fd| unsafe {
+                let _ = libc::close(fd);
+            });
+            if let Some(gw) = l.router {
+                del_default_gateway(s_fd, gw);
+            }
+            let _ = set_if_ipv4_up(s_fd, nic, [0, 0, 0, 0], [0, 0, 0, 0]);
+        }
+        let _ = std::fs::write("/etc/resolv.conf", "");
+    };
+
     if !has_default_route {
         match sb_enclave::dhcp::acquire_dhcpv4_lease(&primary_nic, Duration::from_millis(1_500)) {
             Ok(lease) => {
@@ -219,10 +245,18 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
                         format!("failed applying DHCPv4 lease address on {primary_nic}"),
                     ));
                 }
-                let renew_nic = primary_nic.clone();
-                sb_enclave::dhcp::spawn_dhcpv4_renewal_daemon(renew_nic.clone(), lease, move |l| {
-                    let _ = apply_lease_cfg(&renew_nic, l);
-                });
+                let apply_nic = primary_nic.clone();
+                let withdraw_nic = primary_nic.clone();
+                sb_enclave::dhcp::spawn_dhcpv4_renewal_daemon(
+                    primary_nic.clone(),
+                    lease,
+                    move |l| {
+                        let _ = apply_lease_cfg(&apply_nic, l);
+                    },
+                    move |l| {
+                        withdraw_lease_cfg(&withdraw_nic, l);
+                    },
+                );
             }
             Err(dhcp_err) => {
                 let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
@@ -249,12 +283,16 @@ fn init_guest_pid1_environment() -> Result<(), EnclaveError> {
                     sb_enclave::dhcp::acquire_dhcpv4_lease(&handoff_nic, Duration::from_secs(2))
                 {
                     let _ = apply_lease_cfg(&handoff_nic, &lease);
-                    let renew_nic = handoff_nic.clone();
+                    let apply_nic = handoff_nic.clone();
+                    let withdraw_nic = handoff_nic.clone();
                     sb_enclave::dhcp::spawn_dhcpv4_renewal_daemon(
-                        renew_nic.clone(),
+                        handoff_nic.clone(),
                         lease,
                         move |l| {
-                            let _ = apply_lease_cfg(&renew_nic, l);
+                            let _ = apply_lease_cfg(&apply_nic, l);
+                        },
+                        move |l| {
+                            withdraw_lease_cfg(&withdraw_nic, l);
                         },
                     );
                 }
@@ -479,11 +517,37 @@ fn run() -> Result<(), EnclaveError> {
         github_client,
     ));
 
-    // Generate a fresh ephemeral Noise_IK static keypair strictly inside guest `MemSecret`
-    // (`memfd_secret`/`mlock`) RAM on every boot unless an explicit external HSM/volume key path was given (`V2-C1`).
+    // Load enclave Noise_IK static identity strictly into `MemSecret` (`memfd_secret`/`mlock`) RAM (`V2-C1`).
+    // If PID 1 received a per-installation `/run/secretbridge/enclave.key` overlay in guest `tmpfs`,
+    // load it into `MemSecret` and immediately zero-scrub + unlink the `tmpfs` file.
     let enclave_kp = match &cfg.enclave_key_file {
         Some(path) => load_enclave_static_keypair(path)?,
-        None => generate_ephemeral_enclave_identity()?,
+        None => {
+            #[cfg(target_os = "linux")]
+            let pid1_overlay_kp = {
+                use std::os::unix::fs::PermissionsExt;
+                let overlay_path = std::path::Path::new("/run/secretbridge/enclave.key");
+                if std::process::id() == 1 && overlay_path.exists() {
+                    let loaded = load_enclave_static_keypair(overlay_path)?;
+                    let _ = std::fs::set_permissions(
+                        overlay_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                    let _ = std::fs::write(overlay_path, [0u8; 32]);
+                    let _ = std::fs::remove_file(overlay_path);
+                    Some(loaded)
+                } else {
+                    None
+                }
+            };
+            #[cfg(not(target_os = "linux"))]
+            let pid1_overlay_kp: Option<sb_enclave::vsock::MlockedNoiseIdentity> = None;
+
+            match pid1_overlay_kp {
+                Some(kp) => kp,
+                None => generate_ephemeral_enclave_identity()?,
+            }
+        }
     };
     let pubkey_hex = hex::encode(enclave_kp.public);
     println!("SB_ENCLAVE_NOISE_PUBKEY={pubkey_hex}");

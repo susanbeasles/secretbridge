@@ -90,15 +90,15 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
         var pinnedEnclavePubkeyHex: String = "",
     ) {
         /**
-         * Resolves the expected 32-byte guest enclave `Noise_IK` static public key (`C2`, `V2-C1`):
-         * - In `EXISTING_VSOCK`: strictly requires `enclavePubkeyHex` (non-zero 64-hex).
-         * - In `KVM_MICROVM` / `LOCAL_ENCLAVE_PROCESS`: `sb-enclave` generates an ephemeral per-boot
-         *   keypair strictly inside guest `MemSecret` (`memfd_secret`/`mlock`) so `initramfs.cpio.gz`
-         *   never embeds a private key on host disk. If `pinnedEnclavePubkeyHex` is configured (e.g.,
-         *   HSM/vTPM identity), validates and returns it; otherwise returns `null` so `EnclaveClient`
-         *   pins the non-zero boot public key from the SHA-256-sealed guest boot session.
+         * Resolves the required 32-byte guest enclave `Noise_IK` static public key (`C2`, `V2-C1`):
+         * - Fails closed in every mode if blank, malformed, or all-zero; the untrusted `sb-host`
+         *   startup banner is never permitted to supply the `Noise_IK` responder trust anchor.
+         * - In `EXISTING_VSOCK`: requires `enclavePubkeyHex` (non-zero 64-hex).
+         * - In `KVM_MICROVM` / `LOCAL_ENCLAVE_PROCESS`: requires `pinnedEnclavePubkeyHex` (non-zero
+         *   64-hex), surviving managed restarts via `--enclave-key-file` (`newc` cpio `MemSecret`
+         *   overlay / mode-`0600` key) or an out-of-band hypervisor/daemon identity.
          */
-        fun resolvePinnedEnclavePubkey32OrNull(): ByteArray? {
+        fun resolvePinnedEnclavePubkey32(): ByteArray {
             val rawHex = when (HostBackendMode.fromWire(backendMode)) {
                 HostBackendMode.EXISTING_VSOCK -> {
                     require(isHex64(enclavePubkeyHex)) {
@@ -108,11 +108,8 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
                 }
                 HostBackendMode.KVM_MICROVM, HostBackendMode.LOCAL_ENCLAVE_PROCESS -> {
                     val trimmed = pinnedEnclavePubkeyHex.trim()
-                    if (trimmed.isEmpty()) {
-                        return null
-                    }
                     require(isHex64(trimmed)) {
-                        "Optional pinned enclave Noise static public key hex must be 64 hex characters when specified"
+                        "64-character pinned enclave Noise static public key hex is required; refusing to trust unauthenticated host banner"
                     }
                     trimmed
                 }
@@ -135,7 +132,7 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
             require(hostBin.isNotEmpty() && !hostBin.startsWith("-") && Paths.get(hostBin).isAbsolute) {
                 "sb-host binary path must be an absolute path and must not start with '-'"
             }
-            resolvePinnedEnclavePubkey32OrNull()?.fill(0)
+            resolvePinnedEnclavePubkey32().fill(0)
 
             val args = ArrayList<String>()
             args.add(hostBin)
@@ -179,6 +176,14 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
                     args.add(initramfsPath.trim())
                     args.add("--initramfs-sha256")
                     args.add(initramfsSha256.trim())
+                    val keyFileTrimmed = enclaveKeyFilePath.trim()
+                    if (keyFileTrimmed.isNotEmpty()) {
+                        require(!keyFileTrimmed.startsWith("-") && Paths.get(keyFileTrimmed).isAbsolute) {
+                            "Enclave Noise key file path must be an absolute path and must not start with '-'"
+                        }
+                        args.add("--enclave-key-file")
+                        args.add(keyFileTrimmed)
+                    }
                     args.add("--authorized-client-pubkey-hex")
                     args.add(authorizedClientPubkeyHex.trim())
                     args.add("--guest-cid")
@@ -200,27 +205,34 @@ class BridgeSettings : PersistentStateComponent<BridgeSettings.StateData> {
                     args.add(enclavePubkeyHex.trim())
                 }
                 HostBackendMode.LOCAL_ENCLAVE_PROCESS -> {
-                    require(isHex64(authorizedClientPubkeyHex)) {
-                        "64-character client Noise static public key hex is required for Local Enclave mode"
-                    }
                     val encBin = enclaveBinaryPath.trim()
-                    require(encBin.isNotEmpty() && !encBin.startsWith("-") && Paths.get(encBin).isAbsolute) {
-                        "sb-enclave binary path must be an absolute path and must not start with '-'"
-                    }
-                    args.add("--enclave-bin")
-                    args.add(encBin)
-                    args.add("--enclave-socket")
-                    args.add(localEnclaveSocketPath)
-                    val keyFileTrimmed = enclaveKeyFilePath.trim()
-                    if (keyFileTrimmed.isNotEmpty()) {
-                        require(!keyFileTrimmed.startsWith("-") && Paths.get(keyFileTrimmed).isAbsolute) {
-                            "Enclave Noise key file path must be an absolute path and must not start with '-'"
+                    if (encBin.isEmpty()) {
+                        args.add("--enclave-socket")
+                        args.add(localEnclaveSocketPath)
+                        args.add("--enclave-pubkey-hex")
+                        args.add(pinnedEnclavePubkeyHex.trim())
+                    } else {
+                        require(isHex64(authorizedClientPubkeyHex)) {
+                            "64-character client Noise static public key hex is required for Local Enclave mode"
                         }
-                        args.add("--enclave-key-file")
-                        args.add(keyFileTrimmed)
+                        require(!encBin.startsWith("-") && Paths.get(encBin).isAbsolute) {
+                            "sb-enclave binary path must be an absolute path and must not start with '-'"
+                        }
+                        args.add("--enclave-bin")
+                        args.add(encBin)
+                        args.add("--enclave-socket")
+                        args.add(localEnclaveSocketPath)
+                        val keyFileTrimmed = enclaveKeyFilePath.trim()
+                        if (keyFileTrimmed.isNotEmpty()) {
+                            require(!keyFileTrimmed.startsWith("-") && Paths.get(keyFileTrimmed).isAbsolute) {
+                                "Enclave Noise key file path must be an absolute path and must not start with '-'"
+                            }
+                            args.add("--enclave-key-file")
+                            args.add(keyFileTrimmed)
+                        }
+                        args.add("--authorized-client-pubkey-hex")
+                        args.add(authorizedClientPubkeyHex.trim())
                     }
-                    args.add("--authorized-client-pubkey-hex")
-                    args.add(authorizedClientPubkeyHex.trim())
                 }
             }
             return args

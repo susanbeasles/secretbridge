@@ -31,6 +31,10 @@ enum BackendMode {
         authorized_client_pubkey: [u8; 32],
         extra_args: Vec<String>,
     },
+    ExistingUnixSocket {
+        enclave_socket: PathBuf,
+        enclave_pubkey: [u8; 32],
+    },
     ExistingVsock {
         cid: u32,
         port: u32,
@@ -207,6 +211,16 @@ fn parse_cli() -> Result<HostCli, HostError> {
     })?;
     let staging_dir = ide_socket.parent().map(|p| p.join(".sb-boot-stage"));
 
+    if let Some(ref kf) = enclave_key_file {
+        let kf_raw = kf.to_string_lossy();
+        if kf_raw.is_empty() || kf_raw.starts_with('-') || !kf.is_absolute() {
+            return Err(HostError::new(
+                ErrorCode::Validation,
+                "--enclave-key-file must be a non-empty absolute path",
+            ));
+        }
+    }
+
     let mode = if let (Some(kp), Some(ks), Some(ip), Some(is)) =
         (kernel_path, kernel_sha256, initramfs_path, initramfs_sha256)
     {
@@ -225,6 +239,7 @@ fn parse_cli() -> Result<HostCli, HostError> {
                 kernel_sha256: ks,
                 initramfs_path: ip,
                 initramfs_sha256: is,
+                enclave_key_file,
                 authorized_client_pubkey: client_pk,
                 guest_cid,
                 vsock_port,
@@ -232,7 +247,7 @@ fn parse_cli() -> Result<HostCli, HostError> {
                 staging_dir,
             },
         }
-    } else if let (Some(bin), Some(sock)) = (enclave_bin, enclave_socket) {
+    } else if let (Some(bin), Some(sock)) = (enclave_bin, enclave_socket.clone()) {
         let client_pk = authorized_client_pubkey.ok_or_else(|| {
             HostError::new(
                 ErrorCode::Validation,
@@ -240,21 +255,19 @@ fn parse_cli() -> Result<HostCli, HostError> {
             )
         })?;
         if let Some(kf) = enclave_key_file {
-            let kf_raw = kf.to_string_lossy();
-            if kf_raw.is_empty() || kf_raw.starts_with('-') || !kf.is_absolute() {
-                return Err(HostError::new(
-                    ErrorCode::Validation,
-                    "--enclave-key-file must be a non-empty absolute path",
-                ));
-            }
             enclave_extra_args.push("--enclave-key-file".to_string());
-            enclave_extra_args.push(kf_raw.into_owned());
+            enclave_extra_args.push(kf.to_string_lossy().into_owned());
         }
         BackendMode::LocalEnclaveProcess {
             enclave_bin: bin,
             enclave_socket: sock,
             authorized_client_pubkey: client_pk,
             extra_args: enclave_extra_args,
+        }
+    } else if let (Some(sock), Some(pk)) = (enclave_socket, enclave_pubkey) {
+        BackendMode::ExistingUnixSocket {
+            enclave_socket: sock,
+            enclave_pubkey: pk,
         }
     } else if let Some(pk) = enclave_pubkey {
         BackendMode::ExistingVsock {
@@ -265,7 +278,7 @@ fn parse_cli() -> Result<HostCli, HostError> {
     } else {
         return Err(HostError::new(
             ErrorCode::Validation,
-            "specify microVM flags (--kernel/--kernel-sha256/--initramfs/--initramfs-sha256/--authorized-client-pubkey-hex), --enclave-bin + --enclave-socket + --authorized-client-pubkey-hex, or --enclave-pubkey-hex",
+            "specify microVM flags (--kernel/--kernel-sha256/--initramfs/--initramfs-sha256/--authorized-client-pubkey-hex), --enclave-bin + --enclave-socket + --authorized-client-pubkey-hex, --enclave-socket + --enclave-pubkey-hex, or --enclave-pubkey-hex",
         ));
     };
 
@@ -303,6 +316,15 @@ fn boot_backend(mode: BackendMode) -> Result<ManagedEnclaveHandle, HostError> {
             authorized_client_pubkey,
             &extra_args,
         ),
+        BackendMode::ExistingUnixSocket {
+            enclave_socket,
+            enclave_pubkey,
+        } => Ok(ManagedEnclaveHandle::connect_existing(
+            EnclaveEndpoint::UnixSocket {
+                path: enclave_socket,
+            },
+            enclave_pubkey,
+        )),
         BackendMode::ExistingVsock {
             cid,
             port,

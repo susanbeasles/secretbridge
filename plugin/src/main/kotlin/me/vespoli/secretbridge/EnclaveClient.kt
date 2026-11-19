@@ -567,7 +567,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             val settingsState = settings.state
             val mode = HostBackendMode.fromWire(settingsState.backendMode)
             val configuredPinnedPub32 = try {
-                settingsState.resolvePinnedEnclavePubkey32OrNull()
+                settingsState.resolvePinnedEnclavePubkey32()
             } catch (e: IllegalArgumentException) {
                 throw EnclaveBridgeException(
                     "validation",
@@ -579,7 +579,7 @@ class EnclaveClient(private val project: Project) : Disposable {
                 try {
                     settings.acquireManagedGuestCidLease()
                 } catch (e: Exception) {
-                    configuredPinnedPub32?.fill(0)
+                    configuredPinnedPub32.fill(0)
                     throw EnclaveBridgeException(
                         "transport_failure",
                         e.message ?: "Unable to acquire host-wide AF_VSOCK guest CID lease",
@@ -592,7 +592,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             val (clientPriv32, clientPub32) = try {
                 settings.loadOrCreateClientNoiseKeypairOffEdt()
             } catch (e: Exception) {
-                configuredPinnedPub32?.fill(0)
+                configuredPinnedPub32.fill(0)
                 cidLease?.close()
                 throw e
             }
@@ -601,7 +601,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             val runtimeDir = try {
                 createPrivateSocketDirectory()
             } catch (e: Exception) {
-                configuredPinnedPub32?.fill(0)
+                configuredPinnedPub32.fill(0)
                 clientPriv32.fill(0)
                 cidLease?.close()
                 throw e
@@ -617,7 +617,7 @@ class EnclaveClient(private val project: Project) : Disposable {
                     effectiveGuestCid = cidLease?.cid ?: settingsState.guestCid,
                 )
             } catch (e: IllegalArgumentException) {
-                configuredPinnedPub32?.fill(0)
+                configuredPinnedPub32.fill(0)
                 clientPriv32.fill(0)
                 cidLease?.close()
                 cleanupRuntimeDir(runtimeDir)
@@ -638,7 +638,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             val proc = try {
                 pb.start()
             } catch (e: Exception) {
-                configuredPinnedPub32?.fill(0)
+                configuredPinnedPub32.fill(0)
                 clientPriv32.fill(0)
                 cidLease?.close()
                 cleanupRuntimeDir(runtimeDir)
@@ -666,7 +666,7 @@ class EnclaveClient(private val project: Project) : Disposable {
 
             val readyChars = readStartupBannerCharsWithTimeout(proc.inputStream, STARTUP_TIMEOUT_MS)
             if (readyChars == null) {
-                configuredPinnedPub32?.fill(0)
+                configuredPinnedPub32.fill(0)
                 clientPriv32.fill(0)
                 proc.destroyForcibly()
                 cidLease?.close()
@@ -678,7 +678,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             val parsedBanner = try {
                 HostSocketTransport.parseReadyBannerChars(readyChars)
             } catch (e: Exception) {
-                configuredPinnedPub32?.fill(0)
+                configuredPinnedPub32.fill(0)
                 clientPriv32.fill(0)
                 proc.destroyForcibly()
                 cidLease?.close()
@@ -692,7 +692,7 @@ class EnclaveClient(private val project: Project) : Disposable {
             if (parsedBanner.socketPath.toAbsolutePath().normalize() != ideSock.toAbsolutePath().normalize()) {
                 parsedBanner.authTokenChars.fill('\u0000')
                 parsedBanner.enclavePubkey32.fill(0)
-                configuredPinnedPub32?.fill(0)
+                configuredPinnedPub32.fill(0)
                 clientPriv32.fill(0)
                 proc.destroyForcibly()
                 cidLease?.close()
@@ -706,32 +706,30 @@ class EnclaveClient(private val project: Project) : Disposable {
             val bannerPubValid =
                 parsedBanner.enclavePubkey32.size == 32 &&
                     parsedBanner.enclavePubkey32.any { it != 0.toByte() }
-            val pinMatch = configuredPinnedPub32 == null ||
-                NoiseIkSession.constantTimeEquals(configuredPinnedPub32, parsedBanner.enclavePubkey32)
+            val pinMatch = NoiseIkSession.constantTimeEquals(configuredPinnedPub32, parsedBanner.enclavePubkey32)
             if (!bannerPubValid || !pinMatch) {
                 parsedBanner.authTokenChars.fill('\u0000')
                 parsedBanner.enclavePubkey32.fill(0)
-                configuredPinnedPub32?.fill(0)
+                configuredPinnedPub32.fill(0)
                 clientPriv32.fill(0)
                 proc.destroyForcibly()
                 cidLease?.close()
                 cleanupRuntimeDir(runtimeDir)
                 throw EnclaveBridgeException(
                     "unauthorized",
-                    "Guest enclave Noise pubkey failed verification against configured policy",
+                    "Guest enclave Noise pubkey failed verification against configured pin",
                 )
             }
 
-            val sessionEnclavePub32 = configuredPinnedPub32 ?: parsedBanner.enclavePubkey32.copyOf()
             val transport = HostSocketTransport(
                 socketPath = ideSock,
                 authTokenHex = parsedBanner.authTokenChars,
                 clientPrivateKey32 = clientPriv32,
-                expectedEnclavePubkey32 = sessionEnclavePub32,
+                expectedEnclavePubkey32 = configuredPinnedPub32,
             )
             parsedBanner.authTokenChars.fill('\u0000')
             parsedBanner.enclavePubkey32.fill(0)
-            sessionEnclavePub32.fill(0)
+            configuredPinnedPub32.fill(0)
             clientPriv32.fill(0)
 
             val session = ManagedHostProcess(

@@ -1055,12 +1055,14 @@ mod tests {
     #[test]
     fn dhcpv4_cmdline_vsock_port_and_ephemeral_memsecret_enclave_identity() {
         use crate::dhcp::{
-            DHCP_ACK, DHCP_OFFER, build_dhcpv4_discover, build_dhcpv4_request, parse_dhcpv4_reply,
+            DHCP_ACK, DHCP_OFFER, DhcpLeaseSchedule, build_dhcpv4_discover, build_dhcpv4_request,
+            parse_dhcpv4_reply,
         };
         use crate::vsock::{
             cmdline_has_token, extract_cmdline_egress_vsock_port, extract_cmdline_vsock_port,
             generate_ephemeral_enclave_identity,
         };
+        use std::time::{Duration, Instant};
 
         let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
         let xid = 0xA1B2_C3D4;
@@ -1096,6 +1098,29 @@ mod tests {
         assert_eq!(lease.router, Some([192, 168, 64, 1]));
         assert_eq!(lease.dns_servers, vec![[192, 168, 64, 1]]);
         assert_eq!(lease.server_id, Some([192, 168, 64, 1]));
+
+        let t0 = Instant::now();
+        let mut sched = DhcpLeaseSchedule::new(lease.clone(), t0);
+        assert_eq!(
+            sched.wait_duration_until_next_action(t0),
+            Duration::from_secs(900)
+        );
+        assert_eq!(sched.t2_at.duration_since(t0), Duration::from_secs(1_575));
+        assert_eq!(
+            sched.expires_at.duration_since(t0),
+            Duration::from_secs(1_800)
+        );
+        // Failure at T1 (+900s) retries halfway to T2 (+1237.5s), not another full 900s (+1800s)
+        assert!(!sched.record_renewal_failure(t0 + Duration::from_secs(900)));
+        assert!(sched.next_attempt_at < sched.t2_at);
+        // Failure during T2 rebinding (+1600s) retries halfway to expiry (+1700s), bounded by expires_at
+        let t_rebind = t0 + Duration::from_secs(1_600);
+        assert!(sched.is_rebinding(t_rebind));
+        assert!(!sched.record_renewal_failure(t_rebind));
+        assert_eq!(sched.next_attempt_at, t0 + Duration::from_secs(1_700));
+        // At or after hard expiry (+1800s), signals immediate stale-config withdrawal
+        assert!(sched.record_renewal_failure(t0 + Duration::from_secs(1_800)));
+        assert!(sched.is_expired(t0 + Duration::from_secs(1_800)));
 
         let req = build_dhcpv4_request(xid, mac, lease.yiaddr, lease.server_id);
         assert_eq!(req[0], 1);

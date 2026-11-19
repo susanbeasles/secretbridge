@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 pub const DEFAULT_GUEST_CID: u32 = 42;
 pub const DEFAULT_VSOCK_PORT: u32 = 5190;
@@ -376,12 +377,151 @@ impl Drop for SealedBootArtifact {
     }
 }
 
+pub fn read_owner_only_enclave_key_32(key_path: &Path) -> Result<Zeroizing<[u8; 32]>, HostError> {
+    let c_path = CString::new(key_path.as_os_str().as_bytes())
+        .map_err(|_| HostError::new(ErrorCode::Validation, "invalid enclave key path"))?;
+    // SAFETY: `c_path` is NUL-terminated; `O_NOFOLLOW | O_NONBLOCK` rejects symlinks and avoids FIFO hangs.
+    let raw_fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            format!(
+                "unable to open enclave static key '{}': {}",
+                key_path.display(),
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    // SAFETY: `raw_fd` is newly opened and owned exclusively by `file`.
+    let mut file = unsafe { File::from_raw_fd(raw_fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0
+        || (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+    {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            "enclave static key file must be a regular file",
+        ));
+    }
+    if (st.st_mode & 0o077) != 0 {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            "refusing to load group/world-accessible enclave static key file (expected 0400 or 0600)",
+        ));
+    }
+    if st.st_size != 32 {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            "enclave static key file must be exactly 32 raw bytes",
+        ));
+    }
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe {
+            let _ = libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+
+    let mut priv_bytes = Zeroizing::new([0u8; 32]);
+    file.read_exact(&mut *priv_bytes).map_err(|e| {
+        HostError::new(
+            ErrorCode::InternalError,
+            format!("failed reading enclave static key file: {e}"),
+        )
+    })?;
+    sb_proto::crypto::derive_noise_keypair_from_private(*priv_bytes).map_err(|e| {
+        HostError::new(
+            ErrorCode::Validation,
+            format!("invalid X25519 enclave static key: {e}"),
+        )
+    })?;
+    Ok(priv_bytes)
+}
+
+/// Builds a 4-byte-aligned SVR4 `newc` (`070701`) `cpio` archive unpacking mode-`0400`
+/// `/run/secretbridge/enclave.key` into guest `rootfs` RAM after verifying the base `initramfs` digest.
+pub fn build_enclave_key_cpio_overlay(base_len: u64, key_bytes: &[u8; 32]) -> Zeroizing<Vec<u8>> {
+    fn append_newc_entry(
+        out: &mut Vec<u8>,
+        ino: u32,
+        mode: u32,
+        nlink: u32,
+        name: &[u8],
+        data: &[u8],
+    ) {
+        let namesize = name.len() + 1;
+        let hdr = format!(
+            "070701{ino:08x}{mode:08x}{uid:08x}{gid:08x}{nlink:08x}{mtime:08x}{filesize:08x}{devmaj:08x}{devmin:08x}{rdevmaj:08x}{rdevmin:08x}{namesize:08x}{check:08x}",
+            uid = 0u32,
+            gid = 0u32,
+            mtime = 0u32,
+            filesize = data.len() as u32,
+            devmaj = 0u32,
+            devmin = 0u32,
+            rdevmaj = 0u32,
+            rdevmin = 0u32,
+            check = 0u32,
+        );
+        debug_assert_eq!(hdr.len(), 110);
+        out.extend_from_slice(hdr.as_bytes());
+        out.extend_from_slice(name);
+        out.push(0);
+        let hdr_pad = (4 - ((110 + namesize) % 4)) % 4;
+        out.resize(out.len() + hdr_pad, 0);
+
+        out.extend_from_slice(data);
+        let data_pad = (4 - (data.len() % 4)) % 4;
+        out.resize(out.len() + data_pad, 0);
+    }
+
+    let mut out = Zeroizing::new(Vec::with_capacity(1024));
+    let lead_pad = (4 - ((base_len as usize) % 4)) % 4;
+    out.resize(lead_pad, 0);
+
+    append_newc_entry(&mut out, 1, 0o040700, 2, b"run", &[]);
+    append_newc_entry(&mut out, 2, 0o040700, 2, b"run/secretbridge", &[]);
+    append_newc_entry(
+        &mut out,
+        3,
+        0o100400,
+        1,
+        b"run/secretbridge/enclave.key",
+        key_bytes,
+    );
+    append_newc_entry(&mut out, 0, 0, 1, b"TRAILER!!!", &[]);
+
+    let tail_pad = (512 - ((out.len() - lead_pad) % 512)) % 512;
+    let new_len = out.len() + tail_pad;
+    out.resize(new_len, 0);
+    out
+}
+
 pub fn open_and_seal_boot_artifact(
     path: &Path,
     expected_sha256: &[u8; 32],
     label: &str,
     staging_dir: Option<&Path>,
 ) -> Result<SealedBootArtifact, HostError> {
+    open_and_seal_boot_artifact_with_enclave_key(path, expected_sha256, label, staging_dir, None)
+}
+
+pub fn open_and_seal_boot_artifact_with_enclave_key(
+    path: &Path,
+    expected_sha256: &[u8; 32],
+    label: &str,
+    staging_dir: Option<&Path>,
+    enclave_key_file: Option<&Path>,
+) -> Result<SealedBootArtifact, HostError> {
+    let loaded_key = match enclave_key_file {
+        Some(kp) => Some(read_owner_only_enclave_key_32(kp)?),
+        None => None,
+    };
+
     let mut src = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -420,12 +560,19 @@ pub fn open_and_seal_boot_artifact(
     #[cfg(target_os = "linux")]
     {
         let _ = staging_dir;
-        open_and_seal_linux_memfd(&mut src, expected_sha256, label)
+        open_and_seal_linux_memfd(&mut src, expected_sha256, label, loaded_key.as_deref())
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        open_and_stage_private_copy(&mut src, expected_sha256, label, path, staging_dir)
+        open_and_stage_private_copy(
+            &mut src,
+            expected_sha256,
+            label,
+            path,
+            staging_dir,
+            loaded_key.as_deref(),
+        )
     }
 }
 
@@ -434,6 +581,7 @@ fn open_and_seal_linux_memfd(
     src: &mut File,
     expected_sha256: &[u8; 32],
     label: &str,
+    enclave_key_32: Option<&[u8; 32]>,
 ) -> Result<SealedBootArtifact, HostError> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -495,6 +643,16 @@ fn open_and_seal_linux_memfd(
         ));
     }
 
+    if let Some(key_bytes) = enclave_key_32 {
+        let overlay = build_enclave_key_cpio_overlay(total, key_bytes);
+        memfd_file.write_all(&overlay).map_err(|e| {
+            HostError::new(
+                ErrorCode::InternalError,
+                format!("failed appending enclave key overlay to {label} memfd: {e}"),
+            )
+        })?;
+    }
+
     memfd_file.seek(SeekFrom::Start(0)).map_err(|e| {
         HostError::new(
             ErrorCode::InternalError,
@@ -529,9 +687,17 @@ fn open_and_stage_private_copy(
     label: &str,
     original_path: &Path,
     staging_dir: Option<&Path>,
+    enclave_key_32: Option<&[u8; 32]>,
 ) -> Result<SealedBootArtifact, HostError> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 32 * 1024];
+
+    if enclave_key_32.is_some() && staging_dir.is_none() {
+        return Err(HostError::new(
+            ErrorCode::Validation,
+            "staging_dir is required when sealing an enclave key overlay on non-memfd hosts",
+        ));
+    }
 
     if let Some(dir) = staging_dir {
         std::fs::create_dir_all(dir).map_err(|e| {
@@ -588,13 +754,6 @@ fn open_and_stage_private_copy(
                 )
             })?;
         }
-        dst.sync_all().map_err(|e| {
-            HostError::new(
-                ErrorCode::InternalError,
-                format!("failed syncing staged {label} copy: {e}"),
-            )
-        })?;
-        drop(dst);
         let actual: [u8; 32] = hasher.finalize().into();
         if !constant_time_eq_32(&actual, expected_sha256) {
             return Err(HostError::new(
@@ -602,6 +761,22 @@ fn open_and_stage_private_copy(
                 format!("{label} SHA-256 verification failed against pinned digest"),
             ));
         }
+        if let Some(key_bytes) = enclave_key_32 {
+            let overlay = build_enclave_key_cpio_overlay(total, key_bytes);
+            dst.write_all(&overlay).map_err(|e| {
+                HostError::new(
+                    ErrorCode::InternalError,
+                    format!("failed appending enclave key overlay to staged {label}: {e}"),
+                )
+            })?;
+        }
+        dst.sync_all().map_err(|e| {
+            HostError::new(
+                ErrorCode::InternalError,
+                format!("failed syncing staged {label} copy: {e}"),
+            )
+        })?;
+        drop(dst);
         let confirmed = DropGuard::dismiss(guard);
         Ok(SealedBootArtifact {
             vmm_path: confirmed.clone(),
@@ -1246,6 +1421,7 @@ pub struct MicroVmLaunchSpec {
     pub kernel_sha256: [u8; 32],
     pub initramfs_path: PathBuf,
     pub initramfs_sha256: [u8; 32],
+    pub enclave_key_file: Option<PathBuf>,
     pub authorized_client_pubkey: [u8; 32],
     pub guest_cid: u32,
     pub vsock_port: u32,
@@ -1294,11 +1470,12 @@ impl ManagedEnclaveHandle {
             "vmlinuz",
             spec.staging_dir.as_deref(),
         )?;
-        let sealed_initramfs = open_and_seal_boot_artifact(
+        let sealed_initramfs = open_and_seal_boot_artifact_with_enclave_key(
             &spec.initramfs_path,
             &spec.initramfs_sha256,
             "initramfs",
             spec.staging_dir.as_deref(),
+            spec.enclave_key_file.as_deref(),
         )?;
 
         if !Path::new("/dev/kvm").exists() {
@@ -1482,11 +1659,12 @@ impl ManagedEnclaveHandle {
             "vmlinuz",
             spec.staging_dir.as_deref(),
         )?;
-        let sealed_initramfs = open_and_seal_boot_artifact(
+        let sealed_initramfs = open_and_seal_boot_artifact_with_enclave_key(
             &spec.initramfs_path,
             &spec.initramfs_sha256,
             "initramfs",
             spec.staging_dir.as_deref(),
+            spec.enclave_key_file.as_deref(),
         )?;
 
         let client_pk_hex = hex::encode(spec.authorized_client_pubkey);

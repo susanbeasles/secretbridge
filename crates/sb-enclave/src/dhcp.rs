@@ -6,7 +6,6 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 #[cfg(target_os = "linux")]
 use sb_proto::error::ErrorCode;
-#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 pub const DHCP_DISCOVER: u8 = 1;
@@ -414,21 +413,150 @@ pub fn acquire_dhcpv4_lease(
     ))
 }
 
+/// RFC 2131 section 4.4.5 lease lifetime tracker managing `T1` (50% renewal), `T2` (87.5% rebinding),
+/// and hard expiration (`100%`) so failed renewals never keep stale IPv4 addresses/routes past expiry.
+#[derive(Debug, Clone)]
+pub struct DhcpLeaseSchedule {
+    pub lease: DhcpLease,
+    pub t1_at: Instant,
+    pub t2_at: Instant,
+    pub expires_at: Instant,
+    pub next_attempt_at: Instant,
+}
+
+impl DhcpLeaseSchedule {
+    pub fn new(lease: DhcpLease, acquired_at: Instant) -> Self {
+        let secs = u64::from(lease.lease_time_secs).max(4);
+        let lease_dur = Duration::from_secs(secs);
+        let t1_at = acquired_at + lease_dur / 2;
+        let t2_at = acquired_at + (lease_dur * 7) / 8;
+        let expires_at = acquired_at + lease_dur;
+        Self {
+            lease,
+            t1_at,
+            t2_at,
+            expires_at,
+            next_attempt_at: t1_at,
+        }
+    }
+
+    pub fn is_expired(&self, now: Instant) -> bool {
+        now >= self.expires_at
+    }
+
+    pub fn is_rebinding(&self, now: Instant) -> bool {
+        now >= self.t2_at && now < self.expires_at
+    }
+
+    pub fn wait_duration_until_next_action(&self, now: Instant) -> Duration {
+        self.next_attempt_at
+            .min(self.expires_at)
+            .saturating_duration_since(now)
+    }
+
+    pub fn attempt_timeout(&self, now: Instant) -> Duration {
+        self.expires_at
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(2_000))
+    }
+
+    /// Schedules the next retry within the remaining `T1..T2` or `T2..expiry` window.
+    /// Returns `true` when the lease has reached `expires_at` and must be withdrawn immediately.
+    pub fn record_renewal_failure(&mut self, now: Instant) -> bool {
+        if now >= self.expires_at {
+            return true;
+        }
+        let target = if now < self.t2_at {
+            self.t2_at
+        } else {
+            self.expires_at
+        };
+        let remaining_to_expiry = self.expires_at.saturating_duration_since(now);
+        let span = target.saturating_duration_since(now);
+        let min_step = Duration::from_secs(1).min(remaining_to_expiry);
+        let delay = (span / 2).max(min_step).min(remaining_to_expiry);
+        self.next_attempt_at = now + delay;
+        false
+    }
+}
+
 #[cfg(target_os = "linux")]
-pub fn spawn_dhcpv4_renewal_daemon<F>(ifname: String, initial_lease: DhcpLease, mut apply_lease: F)
-where
+pub fn spawn_dhcpv4_renewal_daemon<F, W>(
+    ifname: String,
+    initial_lease: DhcpLease,
+    mut apply_lease: F,
+    mut withdraw_lease: W,
+) where
     F: FnMut(&DhcpLease) + Send + 'static,
+    W: FnMut(&DhcpLease) + Send + 'static,
 {
     let _ = std::thread::Builder::new()
         .name("sb-dhcpv4-renew".into())
         .spawn(move || {
-            let mut current = initial_lease;
+            let mut active = Some(DhcpLeaseSchedule::new(initial_lease, Instant::now()));
+            let mut reacquire_backoff = Duration::from_secs(1);
+
             loop {
-                let t1_secs = u64::from(current.lease_time_secs / 2).max(30);
-                std::thread::sleep(Duration::from_secs(t1_secs));
-                if let Ok(renewed) = acquire_dhcpv4_lease(&ifname, Duration::from_millis(2_000)) {
-                    apply_lease(&renewed);
-                    current = renewed;
+                if let Some(mut sched) = active.take() {
+                    let now = Instant::now();
+                    if sched.is_expired(now) {
+                        withdraw_lease(&sched.lease);
+                        reacquire_backoff = Duration::from_secs(1);
+                        continue;
+                    }
+
+                    let sleep_for = sched.wait_duration_until_next_action(now);
+                    if !sleep_for.is_zero() {
+                        std::thread::sleep(sleep_for);
+                    }
+
+                    let attempt_now = Instant::now();
+                    if sched.is_expired(attempt_now) {
+                        withdraw_lease(&sched.lease);
+                        reacquire_backoff = Duration::from_secs(1);
+                        continue;
+                    }
+
+                    let timeout = sched.attempt_timeout(attempt_now);
+                    if timeout.is_zero() {
+                        withdraw_lease(&sched.lease);
+                        reacquire_backoff = Duration::from_secs(1);
+                        continue;
+                    }
+
+                    match acquire_dhcpv4_lease(&ifname, timeout) {
+                        Ok(renewed) => {
+                            let renewed_at = Instant::now();
+                            if sched.lease.router.is_some() && sched.lease.router != renewed.router
+                            {
+                                withdraw_lease(&sched.lease);
+                            }
+                            apply_lease(&renewed);
+                            active = Some(DhcpLeaseSchedule::new(renewed, renewed_at));
+                        }
+                        Err(_) => {
+                            if sched.record_renewal_failure(Instant::now()) {
+                                withdraw_lease(&sched.lease);
+                                reacquire_backoff = Duration::from_secs(1);
+                            } else {
+                                active = Some(sched);
+                            }
+                        }
+                    }
+                } else {
+                    match acquire_dhcpv4_lease(&ifname, Duration::from_millis(2_000)) {
+                        Ok(fresh) => {
+                            let acquired_at = Instant::now();
+                            apply_lease(&fresh);
+                            active = Some(DhcpLeaseSchedule::new(fresh, acquired_at));
+                            reacquire_backoff = Duration::from_secs(1);
+                        }
+                        Err(_) => {
+                            std::thread::sleep(reacquire_backoff);
+                            reacquire_backoff =
+                                (reacquire_backoff.saturating_mul(2)).min(Duration::from_secs(15));
+                        }
+                    }
                 }
             }
         });

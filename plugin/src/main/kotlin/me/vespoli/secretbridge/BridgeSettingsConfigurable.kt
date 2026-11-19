@@ -220,9 +220,9 @@ class BridgeSettingsConfigurable : Configurable {
         }
         vmmSha256Field.emptyText.text = "Optional 64-hex SHA-256 of QEMU binary (Linux KVM)"
         pinnedEnclavePubkeyHexField.emptyText.text =
-            "Optional 64-hex HSM/static pin (blank = ephemeral per-boot guest MemSecret keypair)"
+            "Required 64-hex enclave Noise static public key (never inferred from host banner)"
         enclaveKeyFileField.emptyText.text =
-            "Optional mode-0400 enclave Noise key file (blank = ephemeral MemSecret keypair)"
+            "Optional mode-0400/0600 32-byte enclave Noise key file (survives managed restarts)"
         allowedGithubHostField.emptyText.text = "github.com (single authorized host)"
         allowedGithubOwnersField.emptyText.text = "Required for GitHub sync: comma-separated GitHub orgs/owners"
         allowedAwsAccountsField.emptyText.text = "Required for AWS sync: comma-separated 12-digit AWS account IDs"
@@ -251,9 +251,9 @@ class BridgeSettingsConfigurable : Configurable {
             .addLabeledComponent("Guest AF_VSOCK port:", vsockPortSpinner, 1, false)
             .addLabeledComponent("MicroVM RAM (MiB):", memoryMibSpinner, 1, false)
             .addLabeledComponent("Existing enclave pubkey (64-hex):", enclavePubkeyHexField, 1, false)
-            .addLabeledComponent("Pinned enclave pubkey (64-hex, optional):", pinnedEnclavePubkeyHexField, 1, false)
+            .addLabeledComponent("Pinned enclave pubkey (64-hex, required):", pinnedEnclavePubkeyHexField, 1, false)
             .addLabeledComponent("Local sb-enclave binary:", enclaveBinaryField, 1, false)
-            .addLabeledComponent("Local enclave key file:", enclaveKeyFileField, 1, false)
+            .addLabeledComponent("Enclave Noise key file (optional):", enclaveKeyFileField, 1, false)
             .addSeparator()
             .addLabeledComponent("Authorized GitHub host:", allowedGithubHostField, 1, false)
             .addLabeledComponent("Allowed GitHub owners (CSV):", allowedGithubOwnersField, 1, false)
@@ -302,7 +302,7 @@ class BridgeSettingsConfigurable : Configurable {
         enclavePubkeyHexField.isEnabled = isExistingVsock
         pinnedEnclavePubkeyHexField.isEnabled = isManagedVm || isLocalProc
         enclaveBinaryField.isEnabled = isLocalProc
-        enclaveKeyFileField.isEnabled = isLocalProc
+        enclaveKeyFileField.isEnabled = isManagedVm || isLocalProc
     }
 
     override fun isModified(): Boolean {

@@ -553,7 +553,7 @@ mod tests {
     use crate::capture::MlockedHostBuffer;
     use crate::vmm::{
         EnclaveEndpoint, acquire_host_cid_lease_in_dir, open_and_seal_boot_artifact,
-        verify_boot_artifact_sha256,
+        open_and_seal_boot_artifact_with_enclave_key, verify_boot_artifact_sha256,
     };
     use sb_enclave::aws::InMemoryAwsClient;
     use sb_enclave::github::InMemoryGitHubClient;
@@ -741,6 +741,44 @@ mod tests {
         let link = dir.join("vmlinuz-symlink");
         std::os::unix::fs::symlink(&img, &link).unwrap();
         assert!(verify_boot_artifact_sha256(&link, &digest, "vmlinuz").is_err());
+
+        // Restore verified initramfs bytes and verify `newc` cpio enclave key overlay sealing
+        std::fs::write(&img, original_bytes).unwrap();
+        let key_path = dir.join("enclave.key");
+        let generated = generate_noise_keypair().unwrap();
+        std::fs::write(&key_path, *generated.private).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            open_and_seal_boot_artifact_with_enclave_key(
+                &img,
+                &digest,
+                "initramfs",
+                Some(&dir),
+                Some(&key_path),
+            )
+            .is_err()
+        );
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let sealed_overlay = open_and_seal_boot_artifact_with_enclave_key(
+            &img,
+            &digest,
+            "initramfs",
+            Some(&dir),
+            Some(&key_path),
+        )
+        .unwrap();
+        let overlaid_bytes = std::fs::read(sealed_overlay.vmm_path()).unwrap();
+        assert!(overlaid_bytes.starts_with(original_bytes));
+        assert!(
+            overlaid_bytes
+                .windows(b"run/secretbridge/enclave.key".len())
+                .any(|w| w == b"run/secretbridge/enclave.key")
+        );
+        assert!(
+            overlaid_bytes
+                .windows(b"TRAILER!!!".len())
+                .any(|w| w == b"TRAILER!!!")
+        );
     }
 
     #[test]

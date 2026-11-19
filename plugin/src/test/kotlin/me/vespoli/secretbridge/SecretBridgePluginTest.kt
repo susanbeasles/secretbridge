@@ -325,8 +325,8 @@ class SecretBridgePluginTest {
         } catch (_: IllegalArgumentException) {
         }
 
-        // Malformed or all-zero optional pinned enclave pubkey must fail closed before launching sb-host
-        for (badPin in listOf("short-hex", "0".repeat(64))) {
+        // Blank, malformed, or all-zero pinned enclave pubkey must fail closed before launching sb-host
+        for (badPin in listOf("", "   ", "short-hex", "0".repeat(64))) {
             val badPinnedKvm = missingDigest.copy(
                 kernelSha256 = "a".repeat(64),
                 initramfsSha256 = "b".repeat(64),
@@ -334,23 +334,21 @@ class SecretBridgePluginTest {
             )
             try {
                 badPinnedKvm.buildHostCliArgs("/path/h.sock", "/path/e.sock", validClientPub, 42)
-                fail("Expected IllegalArgumentException for malformed/zero enclave pubkey: '$badPin'")
+                fail("Expected IllegalArgumentException for blank/malformed/zero enclave pubkey: '$badPin'")
+            } catch (_: IllegalArgumentException) {
+            }
+            try {
+                badPinnedKvm.resolvePinnedEnclavePubkey32()
+                fail("Expected resolvePinnedEnclavePubkey32() to fail closed for '$badPin'")
             } catch (_: IllegalArgumentException) {
             }
         }
-
-        // Blank `pinnedEnclavePubkeyHex` is valid in Managed MicroVM mode (`V2-C1` ephemeral guest MemSecret identity)
-        val ephemeralKvm = missingDigest.copy(
-            kernelSha256 = "a".repeat(64),
-            initramfsSha256 = "b".repeat(64),
-            pinnedEnclavePubkeyHex = "",
-        )
-        assertEquals(null, ephemeralKvm.resolvePinnedEnclavePubkey32OrNull())
 
         val validKvm = missingDigest.copy(
             kernelSha256 = "a".repeat(64),
             initramfsSha256 = "b".repeat(64),
             pinnedEnclavePubkeyHex = validPinnedEnclavePub,
+            enclaveKeyFilePath = "/etc/secretbridge/enclave.key",
         )
         val args = validKvm.buildHostCliArgs("/path/h.sock", "/path/e.sock", validClientPub, 77)
         assertEquals("/usr/local/bin/sb-host", args[0])
@@ -511,6 +509,15 @@ class SecretBridgePluginTest {
         val ideSock = runDir.resolve("h.sock")
         val enclaveSock = runDir.resolve("e.sock")
         val manifestFile = runDir.resolve("secretbridge.json")
+        val enclaveKeyFile = runDir.resolve("enclave.key")
+
+        val (enclavePriv, pinnedEnclavePub32) = NoiseIkSession.generateStaticKeypair()
+        Files.write(enclaveKeyFile, enclavePriv)
+        enclavePriv.fill(0)
+        try {
+            Files.setPosixFilePermissions(enclaveKeyFile, PosixFilePermissions.fromString("rw-------"))
+        } catch (_: UnsupportedOperationException) {
+        }
 
         val (clientPriv, clientPub) = NoiseIkSession.generateStaticKeypair()
         val clientPubHex = BridgeSettings.encodeHexString(clientPub)
@@ -520,8 +527,7 @@ class SecretBridgePluginTest {
             append("sa-session")
         }
 
-        // Boot `sb-enclave` with ephemeral `MemSecret` Noise_IK identity (`V2-C1`: zero private keys on host disk)
-        val proc = ProcessBuilder(
+        fun launchBridgeProcess(): Process = ProcessBuilder(
             sbHostBin.toString(),
             "--ide-socket",
             ideSock.toString(),
@@ -529,6 +535,8 @@ class SecretBridgePluginTest {
             sbEnclaveBin.toString(),
             "--enclave-socket",
             enclaveSock.toString(),
+            "--enclave-key-file",
+            enclaveKeyFile.toString(),
             "--authorized-client-pubkey-hex",
             clientPubHex,
             "--enclave-arg",
@@ -537,7 +545,8 @@ class SecretBridgePluginTest {
             runtimeTestToken,
         ).start()
 
-        val bootedEnclavePub32 = ByteArray(32)
+        var proc = launchBridgeProcess()
+        val bootedEnclavePub32 = pinnedEnclavePub32.copyOf()
         try {
             val stdout = BufferedReader(InputStreamReader(proc.inputStream, StandardCharsets.UTF_8))
             val readyLine = stdout.readLine()
@@ -547,12 +556,10 @@ class SecretBridgePluginTest {
             }
             val parsed = HostSocketTransport.parseReadyBanner(readyLine!!)
             assertEquals(ideSock.toAbsolutePath().normalize(), parsed.socketPath.toAbsolutePath().normalize())
-            assertEquals(32, parsed.enclavePubkey32.size)
             assertTrue(
-                "Ephemeral guest MemSecret enclave Noise pubkey must be non-zero",
-                parsed.enclavePubkey32.any { it != 0.toByte() },
+                "Banner enclave Noise pubkey must match pre-pinned enclave identity",
+                NoiseIkSession.constantTimeEquals(pinnedEnclavePub32, parsed.enclavePubkey32),
             )
-            System.arraycopy(parsed.enclavePubkey32, 0, bootedEnclavePub32, 0, 32)
 
             // Verify a mismatched pinned enclave public key fails closed BEFORE sending credentials
             val (_, wrongPinnedPub) = NoiseIkSession.generateStaticKeypair()
@@ -680,11 +687,46 @@ class SecretBridgePluginTest {
                 assertEquals(1_030, batchResults.size)
                 assertTrue((batchResults.last() as EnclaveResult.Capabilities).capabilities.authenticated)
             }
+
+            // Verify pinned enclave Noise identity survives a full managed bridge + enclave restart
+            proc.destroyForcibly()
+            proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
+            Files.deleteIfExists(ideSock)
+            Files.deleteIfExists(enclaveSock)
+
+            proc = launchBridgeProcess()
+            val restartedBanner = HostSocketTransport.parseReadyBanner(
+                BufferedReader(InputStreamReader(proc.inputStream, StandardCharsets.UTF_8)).readLine()!!,
+            )
+            assertTrue(
+                "Restarted enclave Noise pubkey must match pre-pinned identity without re-pinning",
+                NoiseIkSession.constantTimeEquals(pinnedEnclavePub32, restartedBanner.enclavePubkey32),
+            )
+            HostSocketTransport(
+                socketPath = ideSock,
+                authTokenHex = restartedBanner.authTokenChars,
+                clientPrivateKey32 = clientPriv,
+                expectedEnclavePubkey32 = pinnedEnclavePub32,
+            ).use { restartedTransport ->
+                restartedBanner.authTokenChars.fill('\u0000')
+                val reCfg = restartedTransport.executeEnclave(
+                    EnclaveRequest.ConfigureSession(
+                        SessionCredentialsChars(
+                            opServiceAccountToken = runtimeTestToken.toCharArray(),
+                        ),
+                    ),
+                ) as EnclaveResult.SessionConfigured
+                assertTrue(reCfg.hasOpToken)
+                val caps = restartedTransport.executeEnclave(EnclaveRequest.Capabilities) as EnclaveResult.Capabilities
+                assertTrue(caps.capabilities.authenticated)
+            }
         } finally {
+            pinnedEnclavePub32.fill(0)
             bootedEnclavePub32.fill(0)
             clientPriv.fill(0)
             proc.destroyForcibly()
             proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
+            Files.deleteIfExists(enclaveKeyFile)
             Files.deleteIfExists(manifestFile)
             Files.deleteIfExists(runDir.resolve(".secretbridge.json.lock"))
             Files.deleteIfExists(ideSock)
@@ -735,7 +777,7 @@ class SecretBridgePluginTest {
             afterWipe.drop(1).all { it == '\u0000' },
         )
 
-        // 3. V2-C1 + V2-H6: `BridgeSettings.StateData` rejects relative `sb-host` and enforces pin policy
+        // 3. C2 + V2-C1 + V2-H6: `BridgeSettings.StateData` rejects relative `sb-host` and fails closed on blank pins
         val state = BridgeSettings.StateData(
             sbHostBinaryPath = "sb-host",
             backendMode = HostBackendMode.LOCAL_ENCLAVE_PROCESS.wireValue,
@@ -747,13 +789,25 @@ class SecretBridgePluginTest {
         } catch (_: IllegalArgumentException) {
         }
         state.sbHostBinaryPath = "/usr/local/bin/sb-host"
+        try {
+            state.resolvePinnedEnclavePubkey32()
+            fail("Expected LOCAL_ENCLAVE_PROCESS with blank pinnedEnclavePubkeyHex to fail closed")
+        } catch (_: IllegalArgumentException) {
+        }
+        state.pinnedEnclavePubkeyHex = "b".repeat(64)
         val cliArgs = state.buildHostCliArgs("/home/u/h.sock", "/home/u/e.sock", "a".repeat(64))
         assertEquals("/usr/local/bin/sb-host", cliArgs.first())
-        assertEquals(null, state.resolvePinnedEnclavePubkey32OrNull())
+        assertEquals(32, state.resolvePinnedEnclavePubkey32().size)
+
+        // External local enclave socket mode (blank `enclaveBinaryPath`) omits `--enclave-bin`
+        state.enclaveBinaryPath = ""
+        val extLocalArgs = state.buildHostCliArgs("/home/u/h.sock", "/home/u/e.sock", "")
+        assertFalse(extLocalArgs.contains("--enclave-bin"))
+        assertTrue(extLocalArgs.contains("--enclave-pubkey-hex"))
 
         state.backendMode = HostBackendMode.EXISTING_VSOCK.wireValue
         try {
-            state.resolvePinnedEnclavePubkey32OrNull()
+            state.resolvePinnedEnclavePubkey32()
             fail("Expected EXISTING_VSOCK without enclavePubkeyHex to fail closed")
         } catch (_: IllegalArgumentException) {
         }
